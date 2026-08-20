@@ -10,7 +10,9 @@
 - [Permissions](https://antigravity.google/docs/cli/permissions)
 - [Official repository](https://github.com/google-antigravity/antigravity-cli)
 
-API keys в executor не используются. OAuth выполняется через браузер под пользовательским Pro-аккаунтом, а credentials хранит системный keyring Antigravity CLI. Wrapper не читает keyring и не принимает credentials. Не сохраняйте OAuth state, cookies или токены в репозитории, `.env`, логах или MCP response.
+API keys в executor не используются. OAuth выполняется через браузер под пользовательским Pro-аккаунтом, а credentials хранит системный keyring Antigravity CLI. Wrapper не читает keyring, не принимает credentials и не передаёт API-key переменные окружения дочернему процессу. Wrapper не логирует `stderr` CLI. Это снижает риск утечки, но не является абсолютной гарантией: модель может вернуть секрет в обычном model response, поэтому основной агент не должен передавать секреты в task и обязан проверять результат перед принятием.
+
+Не сохраняйте OAuth state, cookies или токены в репозитории, `.env`, логах или MCP response.
 
 Предупреждение о Gemini CLI individual OAuth, отключённом 18 июня 2026 года, относится только к причине миграции. Этот проект использует Antigravity CLI, не Gemini CLI; fallback на API key запрещён.
 
@@ -24,7 +26,14 @@ agy --version
 agy
 ```
 
-Завершите browser OAuth интерактивно. После входа MCP запускает `agy` через `agy_server.py`; напрямую указывать `agy` как MCP server нельзя.
+Перезапустите PowerShell после установки, чтобы обновился `PATH`; до перезапуска запускайте `& "$env:LOCALAPPDATA\agy\bin\agy.exe"`. Завершите browser OAuth интерактивно. После входа MCP запускает `agy` через `agy_server.py`; напрямую указывать `agy` как MCP server нельзя.
+
+Python executor запускайте только из локального `.venv`, созданного по pinned-зависимостям проекта: глобальный MCP (`mcp 1.27`) несовместим с этой веткой и не должен использоваться.
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
 Не используйте неподтверждённые переменные вроде `GEMINI_CLI_HOME` для session isolation: wrapper не меняет расположение keyring, если это не описано официальной документацией Antigravity CLI.
 
@@ -32,7 +41,7 @@ agy
 
 Поддерживаются только `thinking_level`: `low`, `medium`, `high`; default — `medium`. Выбирается модель `gemini-3.7-flash-{level}`. Также поддерживаются режимы `plan` (анализ без изменений) и `accept-edits` (явно разрешённые изменения).
 
-В unattended MCP adapter всегда передаёт `--sandbox` и `--disable-slash-commands`. В `plan` сохраняются штатные permission rules. Явно выбранный `accept-edits` дополнительно включает `--dangerously-skip-permissions`, чтобы headless-агент мог запускать проверки без зависания; этот флаг допустим только вместе с sandbox, в доверенном Git-workspace и с обязательным последующим review основным агентом.
+В unattended MCP adapter всегда передаёт `--sandbox` и `--disable-slash-commands`. `--dangerously-skip-permissions` никогда не используется. `accept-edits` разрешает штатные изменения файлов внутри workspace; shell-команды и операции, требующие подтверждения, в headless режиме soft-denied, если пользователь отдельно не добавил узкое allow-правило в настройках CLI. Проверки результата независимо запускает основной агент.
 
 ## Workspace, permissions и sandbox
 
@@ -40,7 +49,13 @@ agy
 
 Allow rules минимальны: чтение workspace, необходимые редактирования и явно разрешённые проверки. Shell, сеть, parent directories и внешние credentials не разрешаются глобально. `run_command` остаётся OS trust boundary.
 
-`--sandbox` обязателен для host protection. AppContainer/Windows sandbox settings задаются явно по официальной документации. Если sandbox backend недоступен, executor возвращает ошибку и не переключается на неограниченный host execution.
+`--sandbox` обязателен как дополнительная защита host. AppContainer ограничивает процессы, но не гарантирует абсолютную недоступность каждого пути вне workspace (например, отдельные временные каталоги могут быть видимы). Основная граница — permission engine без bypass-флага, проверенный Git-root и последующий diff-review. Если sandbox backend недоступен, executor возвращает ошибку и не переключается на неограниченный host execution.
+
+## MCP-контракт
+
+Входы tool: `task`, необязательные `context` и `verification`, `thinking_level` (`low|medium|high`, default `medium`) и `mode` (`plan|accept-edits`, default `accept-edits`).
+
+Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`.
 
 ## MCP-конфигурация Windows
 
@@ -50,14 +65,14 @@ command = "<ABSOLUTE_PATH_TO_PYTHON>"
 args = ["<ABSOLUTE_PATH_TO_REPO>\\agy_server.py"]
 ```
 
-Используйте абсолютные пути и placeholders. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts.
+Используйте абсолютные пути и placeholders. Указывайте Python из `.venv`; не подставляйте глобальный `python` или глобальный MCP. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts.
 
 ## Smoke и тесты
 
 ```powershell
 agy --version
-python -m unittest discover -v
-python <ABSOLUTE_PATH_TO_REPO>\\smoke_agy.py
+.\.venv\Scripts\python.exe -m unittest discover -v
+.\.venv\Scripts\python.exe "<ABSOLUTE_PATH_TO_REPO>\smoke_agy.py"
 ```
 
 Acceptance criteria:
@@ -67,8 +82,8 @@ Acceptance criteria:
 3. Adapter передаёт `--sandbox` и `--disable-slash-commands`.
 4. stdout JSON, malformed JSON, non-zero exit и timeout дают безопасный структурированный ответ.
 5. Timeout завершает процесс (`terminate`/`kill` + `wait`) и очищает временное состояние.
-6. OAuth/access tokens отсутствуют в argv, env-дампах, stderr, логах и MCP response.
-7. Sandbox блокирует доступ за пределы workspace.
+6. Wrapper не передаёт API-key переменные окружения и не логирует `stderr`; основной агент не передаёт секреты в task и проверяет model response на случайно возвращённые секреты.
+7. Permission engine работает без bypass-флага; sandbox активен как дополнительное, но не абсолютное ограничение host.
 8. Diff независимо проверяется основным Codex-агентом.
 
 Тесты используют subprocess injection/mock и не требуют сети или browser login. Реальный OAuth smoke выполняется отдельно после ручного входа.

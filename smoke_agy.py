@@ -15,8 +15,20 @@ MARKER = "AGY_SMOKE_READONLY_MARKER"
 
 def git_root() -> Path:
     root = Path.cwd().resolve()
-    marker = root / ".git"
-    if not root.is_dir() or not (marker.is_dir() or marker.is_file()):
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+            shell=False,
+        )
+        git_root_path = Path(completed.stdout.strip()).resolve()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise RuntimeError("current directory is not a Git repository root") from None
+    if git_root_path != root:
         raise RuntimeError("current directory is not a Git repository root")
     return root
 

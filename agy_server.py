@@ -7,8 +7,10 @@ wrapper deliberately does not read .env files or API-key environment values.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -17,6 +19,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Literal
+
+from ctypes import wintypes
 
 from mcp.server import MCPServer
 
@@ -37,7 +41,8 @@ DEFAULT_TIMEOUT_SECONDS = 840
 MAX_TIMEOUT_SECONDS = 3600
 MAX_RESULT_CHARS = 30_000
 MAX_STDOUT_CHARS = 1_000_000
-MAX_PROMPT_CHARS = 60_000
+MAX_STDERR_CHARS = 16_384
+MAX_PROMPT_CHARS = 24_000
 EXECUTION_LOCK = asyncio.Lock()
 _SAFE_CONVERSATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _SENSITIVE_ENV_NAME = re.compile(
@@ -50,6 +55,47 @@ _USAGE_FIELDS = (
     "cache_read_tokens",
     "total_tokens",
 )
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
 
 
 def _timeout_seconds() -> int:
@@ -158,19 +204,84 @@ def _child_environment() -> dict[str, str]:
     }
 
 
-def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
+def _create_windows_job(pid: int) -> wintypes.HANDLE | None:
+    if os.name != "nt":
+        return None
+    job: wintypes.HANDLE | None = None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        create_job.restype = wintypes.HANDLE
+        set_info = kernel32.SetInformationJobObject
+        set_info.argtypes = [wintypes.HANDLE, wintypes.INT, wintypes.LPVOID, wintypes.DWORD]
+        set_info.restype = wintypes.BOOL
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        assign = kernel32.AssignProcessToJobObject
+        assign.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        assign.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        job = create_job(None, None)
+        if not job:
+            return None
+        limits = _JobObjectExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not set_info(
+            job,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            close_handle(job)
+            return None
+        process_handle = open_process(
+            _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid
+        )
+        if not process_handle:
+            close_handle(job)
+            return None
+        try:
+            if not assign(job, process_handle):
+                close_handle(job)
+                return None
+        finally:
+            close_handle(process_handle)
+        return job
+    except (AttributeError, OSError, TypeError, ValueError, ctypes.ArgumentError):
+        _close_windows_job(job)
+        return None
+
+
+def _close_windows_job(job: wintypes.HANDLE | None) -> None:
+    if job is None or os.name != "nt":
         return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        close_handle(job)
+    except (AttributeError, OSError, TypeError, ValueError, ctypes.ArgumentError):
+        pass
+
+
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
     if os.name == "nt":
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 capture_output=True,
                 timeout=10,
                 check=False,
                 shell=False,
             )
-            return
+            if completed.returncode == 0:
+                return
         except (OSError, subprocess.SubprocessError):
             pass
     else:
@@ -179,25 +290,26 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
             return
         except (OSError, ProcessLookupError):
             pass
-    try:
-        process.kill()
-    except ProcessLookupError:
-        pass
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
 
 
 async def _finish_killed_process(
     process: asyncio.subprocess.Process,
-    communication: asyncio.Task[tuple[bytes, bytes]],
+    communication: asyncio.Task[tuple[bytes, bool, bytes]],
 ) -> None:
     """Best-effort reap/close for a child whose tree was forcibly killed."""
     try:
         await asyncio.wait_for(asyncio.shield(communication), timeout=2)
-    except (asyncio.TimeoutError, OSError):
+    except Exception:
         if not communication.done():
             communication.cancel()
         try:
             await communication
-        except (asyncio.CancelledError, OSError):
+        except BaseException:
             pass
     try:
         await asyncio.wait_for(process.wait(), timeout=2)
@@ -206,6 +318,63 @@ async def _finish_killed_process(
     transport = getattr(process, "_transport", None)
     if transport is not None:
         transport.close()
+
+
+async def _read_bounded(
+    stream: asyncio.StreamReader | None, limit: int
+) -> tuple[bytes, bool]:
+    if stream is None:
+        return b"", False
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        data = await stream.read(min(65_536, limit - size + 1))
+        if not data:
+            return b"".join(chunks), False
+        if size + len(data) > limit:
+            return b"".join(chunks), True
+        chunks.append(data)
+        size += len(data)
+
+
+async def _collect_output(
+    process: asyncio.subprocess.Process,
+) -> tuple[bytes, bool, bytes]:
+    """Drain both pipes with fixed bounds while the process is running."""
+    stdout_task = asyncio.create_task(_read_bounded(process.stdout, MAX_STDOUT_CHARS))
+    stderr_task = asyncio.create_task(_read_bounded(process.stderr, MAX_STDERR_CHARS))
+    wait_task = asyncio.create_task(process.wait())
+    pending = {stdout_task, stderr_task, wait_task}
+    stdout = b""
+    stderr = b""
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                if task is wait_task:
+                    continue
+                data, exceeded = task.result()
+                if task is stdout_task:
+                    stdout = data
+                    if exceeded:
+                        return stdout, True, stderr
+                else:
+                    stderr = data
+                    if exceeded:
+                        return stdout, True, stderr
+            if wait_task in done:
+                await wait_task
+                stdout, stdout_exceeded = await stdout_task
+                stderr, stderr_exceeded = await stderr_task
+                return stdout, stdout_exceeded or stderr_exceeded, stderr
+        return stdout, False, stderr
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def _run_cli(
@@ -228,19 +397,30 @@ async def _run_cli(
     except (OSError, ValueError):
         return None, "", False
 
-    communication = asyncio.create_task(process.communicate())
+    job = _create_windows_job(process.pid)
+    communication = asyncio.create_task(_collect_output(process))
     try:
-        # Shield the pipe-draining task: cancelling communicate() on Windows
-        # can leave Proactor pipe transports behind after taskkill.
-        stdout, _stderr = await asyncio.wait_for(
+        # Shield the pipe-draining task: cancelling it on Windows can leave
+        # Proactor pipe transports behind after taskkill.
+        stdout, exceeded, _stderr = await asyncio.wait_for(
             asyncio.shield(communication), timeout=timeout_seconds or _timeout_seconds()
         )
+        if exceeded:
+            _close_windows_job(job)
+            job = None
+            await asyncio.to_thread(_kill_process_tree, process)
+            await _finish_killed_process(process, communication)
+            return process.returncode, "", False
         return process.returncode, stdout.decode("utf-8", errors="replace"), False
     except asyncio.TimeoutError:
+        _close_windows_job(job)
+        job = None
         await asyncio.to_thread(_kill_process_tree, process)
         try:
-            stdout, _stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=10)
-        except (asyncio.TimeoutError, OSError):
+            stdout, _exceeded, _stderr = await asyncio.wait_for(
+                asyncio.shield(communication), timeout=10
+            )
+        except Exception:
             try:
                 process.kill()
             except ProcessLookupError:
@@ -250,9 +430,19 @@ async def _run_cli(
         await _finish_killed_process(process, communication)
         return process.returncode, stdout.decode("utf-8", errors="replace"), True
     except asyncio.CancelledError:
+        _close_windows_job(job)
+        job = None
         await asyncio.to_thread(_kill_process_tree, process)
         await _finish_killed_process(process, communication)
         raise
+    except Exception:
+        _close_windows_job(job)
+        job = None
+        await asyncio.to_thread(_kill_process_tree, process)
+        await _finish_killed_process(process, communication)
+        return process.returncode, "", False
+    finally:
+        _close_windows_job(job)
 
 
 def _usage(payload: dict[str, Any]) -> dict[str, int | float]:
@@ -262,7 +452,13 @@ def _usage(payload: dict[str, Any]) -> dict[str, int | float]:
     clean: dict[str, int | float] = {}
     for field in _USAGE_FIELDS:
         value = raw.get(field)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if finite:
             clean[field] = value
     return clean
 
@@ -317,8 +513,6 @@ def _build_argv(
         "--add-dir",
         str(workspace),
     ]
-    if mode == "accept-edits":
-        argv.append("--dangerously-skip-permissions")
     return argv
 
 
