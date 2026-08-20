@@ -59,6 +59,17 @@ Allow rules минимальны: чтение workspace, необходимые
 
 ## MCP-конфигурация Windows
 
+Рекомендуемый способ — официальный CLI Codex:
+
+```powershell
+codex.cmd mcp add antigravity_cli_executor -- "<ABSOLUTE_PATH_TO_REPO>\.venv\Scripts\python.exe" "<ABSOLUTE_PATH_TO_REPO>\agy_server.py"
+codex.cmd mcp get antigravity_cli_executor
+```
+
+После добавления перезапустите Codex CLI, IDE extension или desktop app. Они используют общую MCP-конфигурацию. Для локального STDIO server поле MCP `Auth` может отображаться как `Unsupported`: OAuth выполняет вложенный `agy` через Windows Credential Manager, а не MCP-транспорт.
+
+Эквивалентная ручная конфигурация:
+
 ```toml
 [mcp_servers.antigravity_cli_executor]
 command = "<ABSOLUTE_PATH_TO_PYTHON>"
