@@ -1,0 +1,2 @@
+google-antigravity==0.1.12
+mcp[cli]==2.0.0
