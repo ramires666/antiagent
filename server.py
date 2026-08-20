@@ -31,6 +31,9 @@ mcp = MCPServer("Antigravity Coding Executor")
 
 DEFAULT_TASK_TIMEOUT_SEC = 840
 DEFAULT_MAX_RESULT_CHARS = 30_000
+ENV_FILE_PATH = Path(__file__).resolve().with_name(".env")
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GEMINI_API_KEY_ALIAS = "GEMINI_APIKEY"
 ThinkingLevelName = Literal["low", "medium", "high"]
 ALLOWED_THINKING_LEVELS = ("low", "medium", "high")
 EXECUTOR_ALLOWED_TOOLS = (
@@ -57,12 +60,74 @@ def read_positive_int_env(name: str, default: int) -> int:
     return default
 
 
+def _clean_env_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1].strip()
+    return value
+
+
+def _read_wrapper_env() -> dict[str, str]:
+    """Read only the two supported keys from the wrapper-adjacent .env file."""
+    try:
+        lines = ENV_FILE_PATH.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return {}
+    values: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        name = name.strip()
+        if name not in (GEMINI_API_KEY_ENV, GEMINI_API_KEY_ALIAS):
+            continue
+        value = _clean_env_value(value)
+        if value:
+            values[name] = value
+    return values
+
+
+def resolve_gemini_api_key() -> str | None:
+    """Resolve the key without exposing it in logs or returned error data."""
+    canonical = _clean_env_value(os.environ.get(GEMINI_API_KEY_ENV, ""))
+    if canonical:
+        return canonical
+    alias = _clean_env_value(os.environ.get(GEMINI_API_KEY_ALIAS, ""))
+    if alias:
+        logger.warning("Using deprecated environment variable %s", GEMINI_API_KEY_ALIAS)
+        return alias
+
+    values = _read_wrapper_env()
+    canonical = values.get(GEMINI_API_KEY_ENV, "")
+    if canonical:
+        return canonical
+    alias = values.get(GEMINI_API_KEY_ALIAS, "")
+    if alias:
+        logger.warning("Using deprecated .env variable %s", GEMINI_API_KEY_ALIAS)
+        return alias
+    return None
+
+
+def require_gemini_api_key() -> str:
+    api_key = resolve_gemini_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Gemini API key is not configured; set GEMINI_API_KEY in the environment "
+            "or in the wrapper .env file."
+        )
+    return api_key
+
+
 TASK_TIMEOUT_SEC = read_positive_int_env(
     "ANTIGRAVITY_TASK_TIMEOUT_SEC", DEFAULT_TASK_TIMEOUT_SEC
 )
 MAX_RESULT_CHARS = read_positive_int_env(
     "ANTIGRAVITY_MAX_RESULT_CHARS", DEFAULT_MAX_RESULT_CHARS
 )
+# Keep the model explicit: ModelTarget(endpoint=...) leaves the SDK target
+# unnamed and the local harness rejects it with "model is empty".
+DEFAULT_MODEL_NAME = "gemini-3.7-flash"
 EXECUTION_LOCK = asyncio.Lock()
 
 SYSTEM_INSTRUCTIONS = """
@@ -111,11 +176,15 @@ def truncate_result(text: str) -> tuple[str, bool]:
 
 def build_model_target(
     thinking_level: ThinkingLevelName,
+    *,
+    api_key: str | None = None,
 ) -> ModelTarget:
     if thinking_level not in ALLOWED_THINKING_LEVELS:
         raise ValueError("thinking_level must be low, medium, or high")
     return ModelTarget(
+        name=DEFAULT_MODEL_NAME,
         endpoint=GeminiAPIEndpoint(
+            api_key=api_key,
             options=GeminiModelOptions(thinking_level=ThinkingLevel(thinking_level))
         )
     )
@@ -125,6 +194,7 @@ async def execute_with_antigravity(
     *, workspace: Path, prompt: str, thinking_level: ThinkingLevelName
 ) -> str:
     async with EXECUTION_LOCK:
+        api_key = require_gemini_api_key()
         config = LocalAgentConfig(
             system_instructions=SYSTEM_INSTRUCTIONS,
             capabilities=CapabilitiesConfig(
@@ -135,7 +205,7 @@ async def execute_with_antigravity(
                 policy.deny_all(),
                 *[policy.allow(tool.value) for tool in EXECUTOR_ALLOWED_TOOLS],
             ],
-            model=build_model_target(thinking_level),
+            model=build_model_target(thinking_level, api_key=api_key),
         )
         async with Agent(config) as agent:
             response = await agent.chat(prompt)

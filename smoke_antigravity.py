@@ -3,7 +3,7 @@ import asyncio
 from google.antigravity import Agent, BuiltinTools, CapabilitiesConfig, LocalAgentConfig
 from google.antigravity.hooks import policy
 
-from server import build_model_target, get_workspace
+from server import build_model_target, get_workspace, require_gemini_api_key
 
 
 SMOKE_ALLOWED_TOOLS = (
@@ -17,6 +17,7 @@ SMOKE_ALLOWED_TOOLS = (
 
 async def main() -> None:
     workspace = get_workspace()
+    api_key = require_gemini_api_key()
     config = LocalAgentConfig(
         system_instructions="Inspect repository access. Do not modify anything.",
         capabilities=CapabilitiesConfig(
@@ -27,7 +28,7 @@ async def main() -> None:
             policy.deny_all(),
             *[policy.allow(tool.value) for tool in SMOKE_ALLOWED_TOOLS],
         ],
-        model=build_model_target("medium"),
+        model=build_model_target("medium", api_key=api_key),
     )
     async with Agent(config) as agent:
         response = await agent.chat(

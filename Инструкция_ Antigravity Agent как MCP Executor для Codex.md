@@ -473,42 +473,55 @@ Imports OK
 
 # 12. Настраиваем Gemini API key
 
-Antigravity Quickstart использует переменную окружения:
+Antigravity использует переменную окружения с каноническим именем:
 
 ```text
 GEMINI_API_KEY
 ```
 
+Wrapper сначала использует уже установленную process environment. Это главный
+и рекомендуемый путь: в Codex укажите `env_vars = ["GEMINI_API_KEY"]`, а сам
+Codex запускайте из environment, где ключ уже задан. Если переменной нет,
+wrapper безопасно пытается прочитать `.env` только из собственной директории
+wrapper-а (не из target repository) стандартными средствами Python. Для этого
+не нужен и не устанавливается `python-dotenv`.
 
+Приоритет источников:
 
-На Linux/macOS:
+1. `GEMINI_API_KEY` в process environment — всегда побеждает `.env`;
+2. `.env` рядом с `server.py` — fallback для локального запуска;
+3. иначе credentials считаются отсутствующими.
+
+В `.env` допустима простая запись `NAME=value`; комментарии и пустые строки
+игнорируются. Значение никогда не выводится в лог, stdout или диагностический
+отчёт. Файл `.env` должен оставаться в `.gitignore`.
+
+На Linux/macOS можно задать ключ явно:
 
 ```bash
 export GEMINI_API_KEY="ВАШ_КЛЮЧ"
 ```
 
-Проверять сам ключ через `echo` нежелательно.
-
-Лучше:
+Проверять сам ключ через `echo` нежелательно. Проверяйте только наличие:
 
 ```bash
 python - <<'PY'
 import os
-
-value = os.environ.get("GEMINI_API_KEY")
-
-if value:
-    print("GEMINI_API_KEY is configured")
-else:
-    print("GEMINI_API_KEY is NOT configured")
+print(bool(os.environ.get("GEMINI_API_KEY")))
 PY
 ```
 
-Нужно получить:
+Ожидаемый результат:
 
 ```text
-GEMINI_API_KEY is configured
+True
 ```
+
+Историческое имя `GEMINI_APIKEY` принимается только как deprecated
+compatibility alias, если каноническое имя не задано. При его использовании
+wrapper выдаёт предупреждение, но никогда не печатает значение. Новые `.env`,
+shell-команды и config должны использовать только `GEMINI_API_KEY`; alias
+нужно постепенно удалить.
 
 ---
 
@@ -530,7 +543,8 @@ README
 git repository
 ```
 
-Ключ будем передавать через environment.
+Ключ передаётся через process environment или локальный `.env` fallback,
+описанный выше. `.env` остаётся локальным и игнорируется Git.
 
 ---
 
@@ -923,6 +937,10 @@ def build_model_target(
     if thinking_level not in ALLOWED_THINKING_LEVELS:
         raise ValueError("thinking_level must be low, medium, or high")
     return ModelTarget(
+        # google-antigravity 0.1.12 does not reliably infer a model from the
+        # endpoint options. Without this explicit name runtime fails with:
+        # tModel: model is empty.
+        name="gemini-3.7-flash",
         endpoint=GeminiAPIEndpoint(
             options=GeminiModelOptions(
                 thinking_level=ThinkingLevel(thinking_level)
@@ -1484,6 +1502,11 @@ cd /home/alex/projects/my-project
     /home/alex/tools/antigravity-mcp-wrapper/smoke_antigravity.py
 ```
 
+Smoke script и helper/tests используют тот же secure loader, что и `server.py`:
+process environment имеет приоритет, затем читается `.env` рядом с wrapper-ом.
+Секрет не нужно экспортировать вручную, если локальный `.env` уже создан и
+остался вне Git. Smoke выводит только статус/результат проверки, но не key.
+
 Antigravity должен:
 
 1. запуститься;
@@ -1497,7 +1520,7 @@ Antigravity должен:
 GEMINI_API_KEY
 ```
 
-значит key не попал в environment.
+значит key не попал ни в process environment, ни в `.env` wrapper-а.
 
 В этом terminal:
 
@@ -1506,6 +1529,12 @@ export GEMINI_API_KEY="..."
 ```
 
 и повторить.
+
+Либо проверьте только наличие файла (не печатая его содержимое):
+
+```bash
+test -f /home/alex/tools/antigravity-mcp-wrapper/.env
+```
 
 ---
 
@@ -1601,6 +1630,12 @@ high
 Это уровень внутреннего thinking Antigravity/Gemini. Он не меняет
 `model_reasoning_effort` внешнего Codex: reasoning самого Codex настраивается
 отдельно через профиль или CLI.
+
+В `google-antigravity==0.1.12` имя модели нужно передавать явно в
+`ModelTarget(name="gemini-3.7-flash", endpoint=...)`. Одних `endpoint` options
+с `thinking_level` недостаточно: при пустом имени runtime завершается ошибкой
+`tModel: model is empty`. Поэтому выбранный уровень thinking управляет только
+параметрами endpoint, а `name` всегда должен оставаться непустым.
 
 ---
 
@@ -1767,6 +1802,10 @@ env_vars = [
 ANTIGRAVITY_TASK_TIMEOUT_SEC = "840"
 ANTIGRAVITY_MAX_RESULT_CHARS = "30000"
 ```
+
+`env_vars` — предпочтительный способ для Codex. Если Codex запускается без
+этой переменной, wrapper использует `.env` в своей директории как локальный
+fallback; это не заменяет `env_vars` в production-like конфигурации.
 
 ---
 
@@ -2038,7 +2077,8 @@ env_vars = [
 
 Codex умеет передавать выбранные переменные environment stdio MCP process.
 
-Но переменная должна существовать в environment самого Codex.
+Это предпочтительный production-like путь: переменная должна существовать в
+environment самого Codex.
 
 То есть сначала:
 
@@ -2051,6 +2091,16 @@ export GEMINI_API_KEY="..."
 ```bash
 codex
 ```
+
+Для локального запуска wrapper также поддерживает fallback `.env` рядом с
+`server.py`. Поэтому после клонирования wrapper можно положить секрет в
+локальный, игнорируемый Git файл `.env`, и запускать smoke/helper без ручного
+`export`. Process environment всё равно имеет приоритет над `.env`; `env_vars`
+оставляйте в Codex config, чтобы явно прокинуть переменную в MCP process.
+
+Загрузчик написан на стандартной библиотеке Python. Не добавляйте
+`python-dotenv` и не передавайте секрет через `env` в TOML — это повышает риск
+случайного попадания значения в конфигурацию или диагностику.
 
 ---
 
@@ -2627,6 +2677,19 @@ __pycache__/
 export GEMINI_API_KEY="..."
 ```
 
+Текущая реализация допускает `.env` как локальный fallback для удобства
+разработки. Создайте его только в директории wrapper-а и не коммитьте:
+
+```text
+GEMINI_API_KEY=ВАШ_КЛЮЧ
+```
+
+`GEMINI_API_KEY` в process environment всегда сильнее значения из `.env`.
+Старое имя `GEMINI_APIKEY` разрешено только как временный compatibility alias;
+при обнаружении показывается предупреждение без значения ключа. Новые файлы
+должны использовать каноническое имя. Никаких значений ключа в логах,
+тестовых отчётах и smoke output.
+
 ---
 
 # 61. Проверка перед первым реальным проектом
@@ -2797,6 +2860,66 @@ export GEMINI_API_KEY="..."
 ```bash
 codex
 ```
+
+Если ключ хранится в `.env`, каноническое имя должно быть ровно:
+
+```text
+GEMINI_API_KEY
+```
+
+Старое имя `GEMINI_APIKEY` допускается только как deprecated compatibility
+alias, когда `GEMINI_API_KEY` отсутствует; wrapper выдаёт предупреждение и не
+печатает значение. Не выводите значение ключа в shell или лог; проверяйте только
+наличие канонической переменной (`bool(os.environ.get("GEMINI_API_KEY"))`).
+Process environment имеет приоритет над `.env`. После исправления имени или
+изменения `.env` перезапустите Codex/MCP process, чтобы loader перечитал
+настройки.
+
+---
+
+# 65b. Troubleshooting: quota `429` и временная недоступность `503`
+
+Ошибка `429` обычно означает исчерпанную квоту или rate limit Gemini. На
+бесплатном tier это может быть дневной лимит, ограничение запросов в минуту
+или временно недоступная конкретная модель. Ошибка `503` (`high demand`,
+`overloaded`) означает перегрузку сервиса, а не обязательно неверный ключ.
+
+Проверьте billing/quota в панели провайдера и фактическую модель, затем
+повторите небольшой smoke test. Не настраивайте бесконечные retries: wrapper
+должен завершать вызов с понятной ошибкой после ограниченного числа попыток;
+бесконечный retry создаёт очередь, расходует квоту и скрывает реальную
+проблему. Для `503` допустим короткий ограниченный backoff, после чего нужно
+сообщить об ошибке и повторить позже вручную. Для `429` сначала ждите сброса
+квоты или используйте разрешённый тариф/модель — повтор без изменения условий
+обычно не помогает.
+
+---
+
+# 65a. Troubleshooting: `tModel: model is empty`
+
+Ошибка:
+
+```text
+tModel: model is empty
+```
+
+Проверьте, что builder передаёт имя модели непосредственно в `ModelTarget`, а
+не только `GeminiModelOptions` внутри endpoint:
+
+```python
+ModelTarget(
+    name="gemini-3.7-flash",
+    endpoint=GeminiAPIEndpoint(
+        options=GeminiModelOptions(
+            thinking_level=ThinkingLevel(thinking_level)
+        )
+    ),
+)
+```
+
+Для pinned `google-antigravity==0.1.12` ожидаемое имя —
+`gemini-3.7-flash`; после изменения перезапустите MCP process и повторите
+минимальный smoke test.
 
 ---
 
@@ -3084,7 +3207,16 @@ Wrapper считается готовым только если выполнен
 - [ ] `mcp 2.x` установлен.
 - [ ] `from google.antigravity import Agent` работает.
 - [ ] `from mcp.server import MCPServer` работает.
-- [ ] `GEMINI_API_KEY` передаётся через environment.
+- [ ] `GEMINI_API_KEY` передаётся через process environment, предпочтительно
+      через Codex `env_vars`.
+- [ ] Secure stdlib loader использует process environment перед `.env` рядом с
+      wrapper-ом; `python-dotenv` не установлен и не нужен.
+- [ ] `.env` остаётся в `.gitignore`, значения ключа нигде не логируются.
+- [ ] Новые конфигурации используют точное имя `GEMINI_API_KEY`; alias
+      `GEMINI_APIKEY` допускается только как deprecated compatibility fallback
+      с предупреждением.
+- [ ] `ModelTarget` содержит явное `name="gemini-3.7-flash"` вместе с
+      `GeminiAPIEndpoint(options=...)`; runtime не выдаёт `tModel: model is empty`.
 - [ ] В `server.py` нет stdout `print()`.
 - [ ] MCP server запускается через stdio.
 - [ ] MCP Inspector видит `antigravity_execute`.
@@ -3171,6 +3303,10 @@ cd /ABSOLUTE/PATH/TO/target-repository
 
 codex
 ```
+
+Если ключ хранится в локальном `.env` wrapper-а, отдельный `export` не нужен:
+loader прочитает его при старте MCP process. Всё равно оставляйте
+`env_vars = ["GEMINI_API_KEY"]` в config и не помещайте `.env` в Git.
 
 ---
 

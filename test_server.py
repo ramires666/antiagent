@@ -96,6 +96,55 @@ smoke = importlib.import_module("smoke_antigravity")
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_gemini_key_canonical_env_has_priority_and_quotes_are_trimmed(self):
+        with TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text('GEMINI_API_KEY = "file-secret"\n', encoding="utf-8")
+            with patch.object(server, "ENV_FILE_PATH", env_path), patch.dict(
+                os.environ,
+                {"GEMINI_API_KEY": "  'env-secret'  ", "GEMINI_APIKEY": "alias-secret"},
+                clear=True,
+            ):
+                self.assertEqual(server.resolve_gemini_api_key(), "env-secret")
+
+    def test_gemini_key_alias_warns_without_exposing_value(self):
+        secret = "alias-secret-value"
+        with TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(f"GEMINI_APIKEY = \"{secret}\"\n", encoding="utf-8")
+            with patch.object(server, "ENV_FILE_PATH", env_path), patch.dict(
+                os.environ, {}, clear=True
+            ), self.assertLogs("antigravity-mcp", level="WARNING") as logs:
+                self.assertEqual(server.resolve_gemini_api_key(), secret)
+        output = " ".join(logs.output)
+        self.assertIn(server.GEMINI_API_KEY_ALIAS, output)
+        self.assertNotIn(secret, output)
+        self.assertNotIn(str(len(secret)), output)
+
+    def test_gemini_key_missing_or_blank_is_safe_error(self):
+        with TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text("GEMINI_API_KEY = \"  \"\n", encoding="utf-8")
+            with patch.object(server, "ENV_FILE_PATH", env_path), patch.dict(
+                os.environ, {}, clear=True
+            ):
+                self.assertIsNone(server.resolve_gemini_api_key())
+                with self.assertRaisesRegex(RuntimeError, "Gemini API key is not configured"):
+                    server.require_gemini_api_key()
+
+    def test_missing_key_fails_before_agent_creation_without_reading_real_env(self):
+        with TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            with patch.object(server, "ENV_FILE_PATH", env_path), patch.dict(
+                os.environ, {}, clear=True
+            ), patch.object(server, "get_workspace", return_value=Path("repo")), patch.object(
+                server, "Agent"
+            ) as agent:
+                result = asyncio.run(server.antigravity_execute("task"))
+        self.assertEqual(result["error_type"], "RuntimeError")
+        self.assertEqual(result["message"], "Antigravity execution failed.")
+        agent.assert_not_called()
+
     def test_executor_allowlist_is_explicit_and_subagents_are_disabled(self):
         self.assertEqual(
             tuple(tool.value for tool in server.EXECUTOR_ALLOWED_TOOLS),
@@ -123,6 +172,7 @@ class ServerHelpersTest(unittest.TestCase):
         for level in ("low", "medium", "high"):
             with self.subTest(level=level):
                 target = server.build_model_target(level)
+                self.assertEqual(target.name, server.DEFAULT_MODEL_NAME)
                 self.assertEqual(target.endpoint.options.thinking_level, level)
 
         with self.assertRaisesRegex(ValueError, "thinking_level"):
@@ -178,11 +228,11 @@ class ServerHelpersTest(unittest.TestCase):
             await lock.acquire()
             agent = AsyncMock()
             try:
-                with patch.object(server, "get_workspace", return_value=Path("repo")), patch.object(
-                    server, "EXECUTION_LOCK", lock
-                ), patch.object(server, "TASK_TIMEOUT_SEC", 0.01), patch.object(
-                    server, "Agent", agent
-                ):
+                with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), patch.object(
+                    server, "get_workspace", return_value=Path("repo")
+                ), patch.object(server, "EXECUTION_LOCK", lock), patch.object(
+                    server, "TASK_TIMEOUT_SEC", 0.01
+                ), patch.object(server, "Agent", agent):
                     result = await server.antigravity_execute("task")
             finally:
                 lock.release()
