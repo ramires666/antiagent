@@ -71,3 +71,16 @@
 5. `git diff --check` and repository secret scan succeed.
 6. No child `agy`/test process remains after timeout or cancellation tests.
 7. Optional authenticated live smoke remains read-only and is not part of the deterministic suite.
+
+## 7. Фактический статус на commit `015b21f`
+
+Среда последней проверки: Windows 11 (`10.0.26200.0`), Python `3.13.4`, MCP `2.0.0`, Pydantic `2.13.4`, AnyIO `4.14.2` из `.venv`.
+
+- Всего: **55 тестов, 55 PASS**.
+- Полный discovery прошёл два раза подряд без ошибок.
+- Реальный STDIO-контур проверен через `mcp.ClientSession`: initialize, `tools/list`, input/output schema, успешный `tools/call`, unknown tool, обязательный `task`, неверные типы и enum, не-Git cwd, progress notifications, отмена вызова и повторный вызов в той же сессии.
+- Deterministic STDIO fixture (`_mcp_protocol_fixture.py`) подменяет `_run_cli`; он не запускает настоящий `agy`, не использует OAuth, браузер, API keys или сеть.
+- Проверены ошибки и lifecycle: validation/Git/CLI resolution, spawn/timeout/overflow/reader failure, lock recovery, cancellation/reap, Windows Job Object и tree-kill, bounds/JSON normalization, progress heartbeat и serialization.
+- В Windows descendant regression исправлена прежняя проверка `tasklist`, которая могла дать false-negative при ошибке команды или совпадении строки: теперь тест проверяет exact PID через `OpenProcess`/`GetExitCodeProcess` и закрывает полученный handle.
+
+Матрица отражает проверенные reachable branches, но не является обещанием математического 100% покрытия. Не выполнялись authenticated live OAuth smoke и проверка с реальным `agy`/реальным аккаунтом; это сознательное ограничение deterministic/offline suite.
