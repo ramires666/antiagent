@@ -8,7 +8,7 @@
 |---|---|---|
 | STDIO process start and initialize | Согласована поддерживаемая версия MCP; имя сервера корректно | Real `ClientSession` |
 | `tools/list` | Доступен ровно ожидаемый tool | Real `ClientSession` |
-| Tool schema | `task` required; `thinking_level=low|medium|high`; `mode=plan|accept-edits`; defaults корректны | Real `ClientSession` |
+| Tool schema | `task` required; `thinking_level=low|medium|high`; `mode=plan|accept-edits`; `working_directory` string, default пустой; defaults корректны | Real `ClientSession` |
 | Output schema | Все поля structured response и их типы описаны; неизвестные поля запрещены | Real `ClientSession` |
 | Valid `tools/call` | Структурированный `CallToolResult`; stdout содержит только JSON-RPC | Real `ClientSession` |
 | Unknown tool | Стандартная MCP ошибка без падения server process | Real `ClientSession` |
@@ -24,6 +24,7 @@
 
 - `task`: пустой, whitespace, non-string.
 - `context` и `verification`: non-string.
+- `working_directory`: пустой default использует process cwd; абсолютный или относительный путь после canonical resolve должен быть process cwd или его descendant и точным Git-root (например, `W:\HARDDEV\smartgold` при cwd `W:\HARDDEV`); non-string, несуществующий, non-Git, `..`/symlink/junction наружу и вложенный не-root путь отклоняются.
 - Prompt: ниже лимита, ровно на лимите, выше лимита.
 - Prompt formatting and stripping.
 - Git: success, command exception, timeout/non-zero, empty/invalid output, nested directory, non-repository.

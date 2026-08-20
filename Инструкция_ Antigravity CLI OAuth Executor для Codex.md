@@ -45,7 +45,7 @@ py -m venv .venv
 
 ## Workspace, permissions и sandbox
 
-До запуска проверяется абсолютный Git-root. Trust bypass не добавляется автоматически. Prompt запрещает дочернему агенту использовать MCP, plugins, subagents и сеть; slash/skill expansion дополнительно отключён флагом CLI.
+До запуска проверяется абсолютный Git-root. Необязательный `working_directory` принимает абсолютный путь или путь относительно текущего каталога MCP process и должен указывать точно на Git-root; пустое значение использует текущий каталог process. После canonical resolve разрешён только process cwd или его descendant: `..`, symlink или junction, ведущие наружу, отклоняются. Например, при process cwd `W:\HARDDEV` разрешён `W:\HARDDEV\smartgold`. Trust bypass не добавляется автоматически. Prompt запрещает дочернему агенту использовать MCP, plugins, subagents и сеть; slash/skill expansion дополнительно отключён флагом CLI.
 
 Allow rules минимальны: чтение workspace, необходимые редактирования и явно разрешённые проверки. Shell, сеть, parent directories и внешние credentials не разрешаются глобально. `run_command` остаётся OS trust boundary.
 
@@ -53,7 +53,7 @@ Allow rules минимальны: чтение workspace, необходимые
 
 ## MCP-контракт
 
-Входы tool: `task`, необязательные `context` и `verification`, `thinking_level` (`low|medium|high`, default `medium`) и `mode` (`plan|accept-edits`, default `accept-edits`).
+Входы tool: `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`) и `mode` (`plan|accept-edits`, default `accept-edits`).
 
 Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`.
 
@@ -88,8 +88,8 @@ agy --version
 
 Acceptance criteria:
 
-1. Schema валидирует `low|medium|high`, default `medium`, `plan` и `accept-edits`.
-2. Subprocess получает абсолютный Git-root в `cwd`; каталог без `.git` отклоняется.
+1. Schema валидирует `low|medium|high`, default `medium`, `plan`, `accept-edits` и строковый `working_directory`.
+2. `working_directory` разрешается как абсолютный путь или относительно process cwd; пустой default использует process cwd. После canonical resolve путь обязан быть process cwd или его descendant и точным Git-root; выход через `..`, symlink или junction и остальные каталоги отклоняются. Subprocess получает этот абсолютный Git-root в `cwd`.
 3. Adapter передаёт `--sandbox` и `--disable-slash-commands`.
 4. stdout JSON, malformed JSON, non-zero exit и timeout дают безопасный структурированный ответ.
 5. Timeout завершает процесс (`terminate`/`kill` + `wait`) и очищает временное состояние.

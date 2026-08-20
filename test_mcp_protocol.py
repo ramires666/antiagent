@@ -16,7 +16,14 @@ ROOT = Path(__file__).resolve().parent
 SERVER = ROOT / "agy_server.py"
 FIXTURE = ROOT / "_mcp_protocol_fixture.py"
 TOOL_NAME = "antigravity_cli_execute"
-INPUT_FIELDS = {"task", "context", "verification", "thinking_level", "mode"}
+INPUT_FIELDS = {
+    "task",
+    "context",
+    "verification",
+    "thinking_level",
+    "mode",
+    "working_directory",
+}
 OUTPUT_FIELDS = {
     "status",
     "result",
@@ -73,6 +80,9 @@ class MCPProtocolTest(unittest.TestCase):
                         self.assertEqual(schema["properties"]["task"]["type"], "string")
                         self.assertEqual(schema["properties"]["context"]["default"], "")
                         self.assertEqual(schema["properties"]["verification"]["default"], "")
+                        self.assertEqual(
+                            schema["properties"]["working_directory"]["default"], ""
+                        )
                         self.assertEqual(
                             schema["properties"]["thinking_level"]["enum"],
                             ["low", "medium", "high"],
@@ -208,6 +218,29 @@ class MCPProtocolTest(unittest.TestCase):
                             TOOL_NAME, {"task": "fast protocol probe", "mode": "plan"}
                         )
                         self.assertFalse(result.is_error)
+                        self.assertEqual(result.structured_content["result"], "fixture-ok")
+
+        asyncio.run(scenario())
+
+    def test_real_stdio_accepts_explicit_working_directory(self):
+        async def scenario():
+            params = self._server_parameters(ROOT.parent, trust_repo=True)
+            with open(os.devnull, "w", encoding="utf-8") as errlog:
+                async with stdio_client(params, errlog=errlog) as (read, write):
+                    async with ClientSession(
+                        read, write, read_timeout_seconds=5.0
+                    ) as session:
+                        await session.initialize()
+                        result = await session.call_tool(
+                            TOOL_NAME,
+                            {
+                                "task": "explicit workspace protocol probe",
+                                "mode": "plan",
+                                "working_directory": str(ROOT),
+                            },
+                        )
+                        self.assertFalse(result.is_error)
+                        self.assertEqual(result.structured_content["status"], "SUCCESS")
                         self.assertEqual(result.structured_content["result"], "fixture-ok")
 
         asyncio.run(scenario())

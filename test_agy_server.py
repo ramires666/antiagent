@@ -140,6 +140,64 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(result["result"], "current working directory must be a Git root")
         execute.assert_not_awaited()
 
+    def test_explicit_git_root_absolute_relative_and_rejections(self):
+        process_cwd = Path.cwd().resolve()
+        with tempfile.TemporaryDirectory(
+            prefix="agy-workspace-", dir=process_cwd
+        ) as directory:
+            base = Path(directory).resolve()
+            repo = base / "repo"
+            nested = repo / "nested"
+            non_git = base / "non-git"
+            file_path = base / "file.txt"
+            nested.mkdir(parents=True)
+            non_git.mkdir()
+            file_path.write_text("not a directory", encoding="utf-8")
+
+            def git_root(*_args, cwd, **_kwargs):
+                candidate = Path(cwd).resolve()
+                self.assertTrue(candidate.is_dir())
+                if candidate == non_git:
+                    raise subprocess.CalledProcessError(128, "git")
+                root = repo if candidate == nested else candidate
+                return type("Completed", (), {"stdout": f"{root}\n"})()
+
+            with patch("agy_server.subprocess.run", side_effect=git_root):
+                self.assertEqual(server._git_root(str(repo)), repo)
+                self.assertEqual(
+                    server._git_root(str(repo.relative_to(process_cwd))), repo
+                )
+                for value in (
+                    str(base / "missing"), str(file_path), str(nested), str(non_git)
+                ):
+                    with self.subTest(working_directory=value):
+                        self.assertIsNone(server._git_root(value))
+
+    def test_explicit_canonical_path_outside_process_cwd_is_rejected_before_git(self):
+        process_cwd = Path.cwd().resolve()
+        with tempfile.TemporaryDirectory(prefix="agy-outside-") as directory:
+            outside = Path(directory).resolve()
+            self.assertFalse(outside.is_relative_to(process_cwd))
+            with patch("agy_server.subprocess.run") as git:
+                self.assertIsNone(server._git_root(str(outside)))
+            git.assert_not_called()
+
+    def test_handler_rejects_explicit_invalid_working_directory_before_cli(self):
+        working_directory = str(Path.cwd() / "missing-workspace")
+        with patch("agy_server._git_root", return_value=None) as git_root, patch(
+            "agy_server.execute_with_antigravity_cli", new=AsyncMock()
+        ) as execute, patch("agy_server._resolve_cli") as resolve_cli:
+            result = asyncio.run(server.antigravity_cli_execute(
+                "x", working_directory=working_directory
+            ))
+        git_root.assert_called_once_with(working_directory)
+        execute.assert_not_awaited()
+        resolve_cli.assert_not_called()
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(
+            result["result"], "working_directory must be an existing Git root"
+        )
+
     def test_empty_git_stdout_is_rejected(self):
         for stdout in ("", " \t\r\n"):
             completed = type("Completed", (), {"stdout": stdout})()
@@ -159,6 +217,16 @@ class AgyServerTest(unittest.TestCase):
                 result = asyncio.run(server.antigravity_cli_execute(**arguments))
             self.assertEqual(result["result"], expected)
             root.assert_not_called()
+
+        with patch("agy_server._git_root") as root, patch(
+            "agy_server.execute_with_antigravity_cli", new=AsyncMock()
+        ) as execute:
+            result = asyncio.run(server.antigravity_cli_execute(
+                "x", working_directory=123
+            ))
+        self.assertEqual(result["status"], "ERROR")
+        root.assert_not_called()
+        execute.assert_not_awaited()
 
         expected_prompt = (
             "You are a coding subagent operating in the current Git repository.\n"

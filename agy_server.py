@@ -198,10 +198,18 @@ def _resolve_cli() -> Path | None:
     return None
 
 
-def _git_root() -> Path | None:
-    """Return cwd only when cwd itself is the repository's top-level root."""
-    cwd = Path.cwd().resolve()
+def _git_root(directory: str | Path | None = None) -> Path | None:
+    """Return directory only when it is the repository's top-level root."""
     try:
+        base = Path.cwd().resolve()
+        cwd = base if directory is None else Path(directory)
+        if not cwd.is_absolute():
+            cwd = base / cwd
+        cwd = cwd.resolve()
+        if directory is not None and (
+            not cwd.is_relative_to(base) or not cwd.is_dir()
+        ):
+            return None
         completed = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=str(cwd),
@@ -211,7 +219,7 @@ def _git_root() -> Path | None:
             check=True,
             shell=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
         return None
     try:
         raw_root = completed.stdout.strip()
@@ -632,6 +640,7 @@ async def antigravity_cli_execute(
     task: str,
     context: str = "",
     verification: str = "",
+    working_directory: str = "",
     thinking_level: ThinkingLevel = "medium",
     mode: Mode = "accept-edits",
     ctx: Context | None = None,
@@ -641,6 +650,8 @@ async def antigravity_cli_execute(
         return _empty_result("ERROR", "task must be a non-empty string", thinking_level, mode)
     if not isinstance(context, str) or not isinstance(verification, str):
         return _empty_result("ERROR", "context and verification must be strings", thinking_level, mode)
+    if not isinstance(working_directory, str):
+        return _empty_result("ERROR", "working_directory must be an existing Git root", thinking_level, mode)
     if thinking_level not in THINKING_LEVELS:
         return _empty_result("ERROR", "thinking_level must be low, medium, or high", None, mode)
     if mode not in MODES:
@@ -652,9 +663,14 @@ async def antigravity_cli_execute(
             "ERROR", "task context is too large", thinking_level, mode
         )
 
-    workspace = _git_root()
+    workspace = _git_root(working_directory or None)
     if workspace is None:
-        return _empty_result("ERROR", "current working directory must be a Git root", thinking_level, mode)
+        message = (
+            "working_directory must be an existing Git root"
+            if working_directory
+            else "current working directory must be a Git root"
+        )
+        return _empty_result("ERROR", message, thinking_level, mode)
 
     progress_count = 0
     progress_lock = asyncio.Lock()
