@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ctypes import wintypes
+from pydantic import BaseModel, ConfigDict
 
 from mcp.server import MCPServer
 
@@ -96,6 +97,19 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
         ("PeakProcessMemoryUsed", ctypes.c_size_t),
         ("PeakJobMemoryUsed", ctypes.c_size_t),
     ]
+
+
+class AntigravityCliOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["SUCCESS", "ERROR"]
+    result: str
+    model: str | None
+    thinking_level: ThinkingLevel | None
+    mode: Mode | None
+    usage: dict[str, int | float]
+    conversation_id: str | None
+    result_truncated: bool
 
 
 def _timeout_seconds() -> int:
@@ -578,7 +592,7 @@ async def antigravity_cli_execute(
     verification: str = "",
     thinking_level: ThinkingLevel = "medium",
     mode: Mode = "accept-edits",
-) -> dict[str, Any]:
+) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
     if not isinstance(task, str) or not task.strip():
         return _empty_result("ERROR", "task must be a non-empty string", thinking_level, mode)
