@@ -9,10 +9,12 @@ from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import MCPError
 
 
 ROOT = Path(__file__).resolve().parent
 SERVER = ROOT / "agy_server.py"
+FIXTURE = ROOT / "_mcp_protocol_fixture.py"
 TOOL_NAME = "antigravity_cli_execute"
 INPUT_FIELDS = {"task", "context", "verification", "thinking_level", "mode"}
 OUTPUT_FIELDS = {
@@ -42,7 +44,7 @@ class MCPProtocolTest(unittest.TestCase):
             })
         return StdioServerParameters(
             command=sys.executable,
-            args=[str(SERVER)],
+            args=[str(FIXTURE)],
             cwd=str(cwd),
             env=env,
         )
@@ -53,7 +55,7 @@ class MCPProtocolTest(unittest.TestCase):
             with open(os.devnull, "w", encoding="utf-8") as errlog:
                 async with stdio_client(params, errlog=errlog) as (read, write):
                     async with ClientSession(
-                        read, write, read_timeout_seconds=5
+                        read, write, read_timeout_seconds=5.0
                     ) as session:
                         initialized = await session.initialize()
                         self.assertEqual(
@@ -114,16 +116,32 @@ class MCPProtocolTest(unittest.TestCase):
                             ["plan", "accept-edits"],
                         )
 
+                        progress_events = []
+
+                        async def on_progress(progress, total, message):
+                            progress_events.append((progress, total, message))
+
                         arguments = {"task": "protocol probe", "mode": "plan"}
-                        valid = await session.call_tool(TOOL_NAME, arguments)
+                        valid = await session.call_tool(
+                            TOOL_NAME,
+                            arguments,
+                            progress_callback=on_progress,
+                        )
                         self.assertFalse(valid.is_error)
-                        self.assertEqual(valid.structured_content["status"], "ERROR")
+                        self.assertEqual(valid.structured_content["status"], "SUCCESS")
                         self.assertEqual(
                             set(valid.structured_content), OUTPUT_FIELDS
                         )
                         self.assertEqual(
                             valid.structured_content["result"],
-                            "Antigravity CLI returned invalid JSON",
+                            "fixture-ok",
+                        )
+                        self.assertEqual(
+                            progress_events,
+                            [
+                                (1.0, None, "Antigravity CLI request queued"),
+                                (2.0, None, "Antigravity CLI is running"),
+                            ],
                         )
 
                         unknown = await session.call_tool("missing", {})
@@ -140,6 +158,12 @@ class MCPProtocolTest(unittest.TestCase):
                         self.assertTrue(wrong_type.is_error)
                         self.assertIn("valid string", wrong_type.content[0].text)
 
+                        wrong_context = await session.call_tool(
+                            TOOL_NAME, {"task": "x", "context": 123}
+                        )
+                        self.assertTrue(wrong_context.is_error)
+                        self.assertIn("context", wrong_context.content[0].text)
+
                         invalid_enum = await session.call_tool(
                             TOOL_NAME,
                             {"task": "x", "thinking_level": "minimal"},
@@ -149,12 +173,82 @@ class MCPProtocolTest(unittest.TestCase):
                         self.assertIn("medium", invalid_enum.content[0].text)
                         self.assertIn("high", invalid_enum.content[0].text)
 
+                        invalid_mode = await session.call_tool(
+                            TOOL_NAME,
+                            {"task": "x", "mode": "unrestricted"},
+                        )
+                        self.assertTrue(invalid_mode.is_error)
+                        self.assertIn("plan", invalid_mode.content[0].text)
+                        self.assertIn("accept-edits", invalid_mode.content[0].text)
+
                         repeated = await session.call_tool(TOOL_NAME, arguments)
                         self.assertFalse(repeated.is_error)
                         self.assertEqual(
                             repeated.structured_content,
                             valid.structured_content,
                         )
+
+    def test_read_timeout_does_not_corrupt_session(self):
+        async def scenario():
+            params = self._server_parameters(ROOT, trust_repo=True)
+            with open(os.devnull, "w", encoding="utf-8") as errlog:
+                async with stdio_client(params, errlog=errlog) as (read, write):
+                    async with ClientSession(
+                        read, write, read_timeout_seconds=5.0
+                    ) as session:
+                        await session.initialize()
+                        with self.assertRaises(MCPError):
+                            await session.call_tool(
+                                TOOL_NAME,
+                                {"task": "slow protocol probe", "mode": "plan"},
+                                read_timeout_seconds=0.1,
+                            )
+                        await asyncio.sleep(0.4)
+                        result = await session.call_tool(
+                            TOOL_NAME, {"task": "fast protocol probe", "mode": "plan"}
+                        )
+                        self.assertFalse(result.is_error)
+                        self.assertEqual(result.structured_content["result"], "fixture-ok")
+
+        asyncio.run(scenario())
+
+    def test_cancelled_call_does_not_corrupt_same_session(self):
+        async def scenario():
+            params = self._server_parameters(ROOT, trust_repo=True)
+            started = asyncio.Event()
+
+            async def on_progress(_progress, _total, message):
+                if message == "Antigravity CLI is running":
+                    started.set()
+
+            with open(os.devnull, "w", encoding="utf-8") as errlog:
+                async with stdio_client(params, errlog=errlog) as (read, write):
+                    async with ClientSession(
+                        read, write, read_timeout_seconds=5.0
+                    ) as session:
+                        await session.initialize()
+                        pending = asyncio.create_task(
+                            session.call_tool(
+                                TOOL_NAME,
+                                {"task": "slow protocol probe", "mode": "plan"},
+                                progress_callback=on_progress,
+                            )
+                        )
+                        await asyncio.wait_for(started.wait(), timeout=2)
+                        pending.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await pending
+                        started_at = asyncio.get_running_loop().time()
+                        result = await session.call_tool(
+                            TOOL_NAME,
+                            {"task": "cancellation state probe", "mode": "plan"},
+                        )
+                        elapsed = asyncio.get_running_loop().time() - started_at
+                        self.assertFalse(result.is_error)
+                        self.assertEqual(
+                            result.structured_content["result"], "cancelled-seen"
+                        )
+                        self.assertLess(elapsed, 1.5)
 
         asyncio.run(scenario())
 
@@ -165,7 +259,7 @@ class MCPProtocolTest(unittest.TestCase):
                 with open(os.devnull, "w", encoding="utf-8") as errlog:
                     async with stdio_client(params, errlog=errlog) as (read, write):
                         async with ClientSession(
-                            read, write, read_timeout_seconds=5
+                            read, write, read_timeout_seconds=5.0
                         ) as session:
                             await session.initialize()
                             result = await session.call_tool(

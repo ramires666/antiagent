@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,6 +25,7 @@ from ctypes import wintypes
 from pydantic import BaseModel, ConfigDict
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 
 
 logging.basicConfig(
@@ -61,6 +63,7 @@ _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
+ProgressCallback = Callable[[str], Awaitable[None]]
 
 
 class _IoCounters(ctypes.Structure):
@@ -127,6 +130,28 @@ def _timeout_seconds() -> int:
     return min(value, MAX_TIMEOUT_SECONDS)
 
 
+async def _emit_progress(
+    progress: ProgressCallback | None, message: str
+) -> None:
+    if progress is None:
+        return
+    try:
+        await asyncio.wait_for(progress(message), timeout=1)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("MCP progress notification failed")
+
+
+async def _progress_heartbeat(progress: ProgressCallback) -> None:
+    try:
+        while True:
+            await asyncio.sleep(12)
+            await _emit_progress(progress, "Antigravity CLI request is still in progress")
+    except asyncio.CancelledError:
+        return
+
+
 def _model_for(level: str) -> str:
     return f"gemini-3.7-flash-{level}"
 
@@ -189,8 +214,11 @@ def _git_root() -> Path | None:
     except (OSError, subprocess.SubprocessError):
         return None
     try:
-        root = Path(completed.stdout.strip()).resolve()
-    except (OSError, ValueError):
+        raw_root = completed.stdout.strip()
+        if not raw_root:
+            return None
+        root = Path(raw_root).resolve()
+    except (AttributeError, OSError, ValueError):
         return None
     return cwd if root == cwd else None
 
@@ -472,7 +500,7 @@ def _usage(payload: dict[str, Any]) -> dict[str, int | float]:
             finite = math.isfinite(value)
         except OverflowError:
             finite = False
-        if finite:
+        if finite and value >= 0:
             clean[field] = value
     return clean
 
@@ -531,7 +559,12 @@ def _build_argv(
 
 
 async def execute_with_antigravity_cli(
-    *, workspace: Path, prompt: str, thinking_level: ThinkingLevel, mode: Mode
+    *,
+    workspace: Path,
+    prompt: str,
+    thinking_level: ThinkingLevel,
+    mode: Mode,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Execute one authenticated CLI process; also used by the live smoke."""
     cli = _resolve_cli()
@@ -546,15 +579,24 @@ async def execute_with_antigravity_cli(
 
     async def run_serialized() -> tuple[int | None, str, bool]:
         async with EXECUTION_LOCK:
+            await _emit_progress(progress, "Antigravity CLI is running")
             return await _run_cli(argv, workspace, timeout_seconds)
 
+    heartbeat: asyncio.Task[None] | None = None
     try:
+        await _emit_progress(progress, "Antigravity CLI request queued")
+        if progress is not None:
+            heartbeat = asyncio.create_task(_progress_heartbeat(progress))
         returncode, stdout, timed_out = await asyncio.wait_for(
             run_serialized(), timeout=timeout_seconds
         )
     except asyncio.TimeoutError:
         logger.warning("Antigravity CLI timed out")
         return _empty_result("ERROR", "Antigravity CLI timed out", thinking_level, mode)
+    finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
     if timed_out:
         logger.warning("Antigravity CLI timed out")
@@ -592,6 +634,7 @@ async def antigravity_cli_execute(
     verification: str = "",
     thinking_level: ThinkingLevel = "medium",
     mode: Mode = "accept-edits",
+    ctx: Context | None = None,
 ) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
     if not isinstance(task, str) or not task.strip():
@@ -612,11 +655,24 @@ async def antigravity_cli_execute(
     workspace = _git_root()
     if workspace is None:
         return _empty_result("ERROR", "current working directory must be a Git root", thinking_level, mode)
+
+    progress_count = 0
+    progress_lock = asyncio.Lock()
+
+    async def report_progress(message: str) -> None:
+        nonlocal progress_count
+        if ctx is None:
+            return
+        async with progress_lock:
+            progress_count += 1
+            await ctx.report_progress(progress_count, None, message)
+
     return await execute_with_antigravity_cli(
         workspace=workspace,
         prompt=prompt,
         thinking_level=thinking_level,
         mode=mode,
+        progress=report_progress if ctx is not None else None,
     )
 
 
