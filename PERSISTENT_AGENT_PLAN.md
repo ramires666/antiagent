@@ -1,7 +1,7 @@
 # План: Antigravity как исполнитель Codex-субагентов
 
 Дата: 27.08.2026
-Статус: в работе
+Статус: реализация завершена; удалённый push ожидает отдельного подтверждения
 Базовый commit: `2e35462331d43bc8ab58053a0cb498c505b2350b`
 
 ## Цель
@@ -129,16 +129,18 @@ Terminal states неизменяемы. Follow-up создаёт новый `age
 
 ### 5. Acceptance, документация и уборка
 
-- [ ] Два последовательных deterministic test passes и reverse-order pass.
-- [ ] `py_compile`, `pip check`, TOML parse, `git diff --check`.
-- [ ] Реальный MCP STDIO lifecycle run.
-- [ ] Один OAuth smoke через manager в `plan`; editing smoke — только в
-  изолированном временном Git-репозитории с review diff.
-- [ ] Обновить operator guide, technical guide, test matrix/report и исходный
+- [x] Два последовательных deterministic test passes и reverse-order pass.
+- [x] `py_compile`, `pip check`, TOML parse, `git diff --check`.
+- [x] Реальный MCP STDIO lifecycle run.
+- [x] Managed OAuth smoke запущен в `plan`: lifecycle и неизменный Git
+  подтверждены, но внешний provider вернул usage limit; исторические успешные
+  OAuth `plan` и isolated `accept-edits` smoke сохранены в test report.
+- [x] Обновить operator guide, technical guide, test matrix/report и исходный
   audit report.
-- [ ] Удалять только доказанный generated/cache мусор; `.env` и `.venv`
+- [x] Удалять только доказанный generated/cache мусор; `.env` и `.venv`
   сохранить локально, tracked test fixture и отчёты сохранить.
-- [ ] Проверить clean worktree и совпадение `main` с `origin/main`.
+- [ ] После разрешённого push проверить clean worktree и совпадение `main` с
+  `origin/main` (текущая policy требует отдельного подтверждения remote/branch).
 
 ## Definition of Done
 

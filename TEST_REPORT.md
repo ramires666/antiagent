@@ -1,7 +1,7 @@
 # Финальный отчёт тестирования
 
 Дата отчёта: 27 августа 2026 г.
-Baseline: `cd41f44`
+Code/config baseline: `fb9441c`
 
 ## Среда
 
@@ -14,7 +14,7 @@ Baseline: `cd41f44`
 
 ## Итог
 
-После удаления legacy-ветки deterministic suite содержит **73 теста**, включая **5 тестов MCP STDIO**. Два последовательных discovery и отдельный прогон targeted suites в обратном порядке завершились `OK`; также прошли `py_compile`, `pip check` и `git diff --check`.
+После добавления persistent manager deterministic suite содержит **90 тестов**, включая **6 тестов MCP STDIO**. На Windows один POSIX-only permission test ожидаемо отмечен `skipped`. Два последовательных discovery и отдельный прогон targeted suites в обратном порядке завершились `OK`; также прошли `py_compile`, `pip check`, TOML parse и `git diff --check`.
 
 Проверка не заявляет математическое 100% покрытие: тестируются reachable и критические error/lifecycle ветки.
 
@@ -27,15 +27,19 @@ Baseline: `cd41f44`
 - Git preflight/postflight для `accept-edits`: bounded status snapshot, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`; persistent review marker и явный `acknowledge_review`; destructive rollback не выполняется.
 - Codex MCP timeout настроен на `900` секунд при wrapper timeout `840` секунд.
 - Удалены legacy SDK-файлы и зависимость `google-antigravity`; остался один production path через OAuth CLI.
+- Добавлен stdlib SQLite `AgentStore`: persistence между process instances, условные transitions, terminal immutability, stale reconciliation, capacity 32, terminal history 1000 и output limit 256 KiB; prompt/context/verification не сохраняются.
+- Добавлены lifecycle tools `spawn/list/status/wait/followup/interrupt`; follow-up использует валидированный UUID `--conversation`, wait ограничен 60 секундами на call, interrupt работает через общий SQLite cancel flag между store/process instances.
+- Добавлен project-scoped `.codex/agents/antigravity_worker.toml` и обязательное правило cost-first routing в `AGENTS.md`; Codex остаётся владельцем UI/lifecycle, review и тестов.
 
 ## Реальный STDIO MCP-контур
 
-`test_mcp_protocol.py` запускает отдельный STDIO process и настоящий `mcp.ClientSession`: initialize, `tools/list`, схемы, успешный call, unknown/missing/wrong arguments, invalid enums, non-Git cwd, progress, cancellation и последовательный call после ошибки. Fixture подменяет только CLI response, поэтому deterministic tests offline и не требуют OAuth.
+`test_mcp_protocol.py` запускает отдельный STDIO process и настоящий `mcp.ClientSession`: initialize, семь tools в `tools/list`, схемы, synchronous call, полный lifecycle `spawn/wait/followup/list/interrupt`, unknown/missing/wrong arguments, redaction, non-Git cwd, progress, cancellation и последовательный call после ошибки. Fixture подменяет только CLI response и использует отдельную временную SQLite БД, поэтому deterministic tests offline и не требуют OAuth.
 
 ## Live smoke
 
 - Authenticated `agy` OAuth smoke в `plan`: **успешно**, контрольный marker найден в ответе, Git не изменён.
 - Изолированный `accept-edits` smoke: **SUCCESS**; изменён только `README.txt`, postflight complete, полный diff просмотрен; временный test repository удалён.
+- Новый managed lifecycle smoke был повторно запущен после реализации manager: lifecycle дошёл до terminal `failed`, Git остался неизменным; внешний Antigravity provider в это время вернул usage limit. Это внешний лимит, поэтому новый OAuth success не заявляется и повторный запрос автоматически не выполнялся.
 
 Это единственная проверка, зависящая от внешней OAuth-сессии и реального CLI; она не входит в deterministic count.
 
@@ -58,9 +62,9 @@ git ls-files | Select-String -Pattern '(^|/)(\.env($|\.)|.*\.(pem|key|p12|pfx|lo
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -v
 .\.venv\Scripts\python.exe -m unittest discover -q
-.\.venv\Scripts\python.exe -m unittest -v test_mcp_protocol.py test_agy_server.py
-.\.venv\Scripts\python.exe -m unittest -v test_agy_server.py test_mcp_protocol.py
-.\.venv\Scripts\python.exe -m py_compile agy_server.py smoke_agy.py test_agy_server.py test_mcp_protocol.py _mcp_protocol_fixture.py
+.\.venv\Scripts\python.exe -m unittest -v test_mcp_protocol.py test_agy_server.py test_agent_manager.py
+.\.venv\Scripts\python.exe -m unittest -v test_agent_manager.py test_agy_server.py test_mcp_protocol.py
+.\.venv\Scripts\python.exe -m py_compile agy_server.py agent_manager.py smoke_agy.py test_agy_server.py test_agent_manager.py test_mcp_protocol.py _mcp_protocol_fixture.py
 .\.venv\Scripts\python.exe -m pip check
 git diff --check
 ```

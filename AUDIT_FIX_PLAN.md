@@ -228,7 +228,7 @@ enabled_tools = ["antigravity_cli_execute"]
 - [x] legacy SDK path удалён, dependency и устаревшие команды убраны;
 - [x] тесты и документация обновлены.
 
-Результат: 73 deterministic теста, включая 5 STDIO MCP тестов; authenticated live OAuth smoke успешен. Filename-only tracked-secret scan вернул 0 файлов. Ограничения: postflight использует status и file metadata без content hashes, автоматического rollback нет.
+Результат после следующего persistent-manager этапа: 90 deterministic тестов, включая 6 STDIO MCP тестов; один POSIX-only permission test ожидаемо skipped на Windows. Добавлены durable SQLite lifecycle, conversation follow-up, cross-process cancellation и project-agent `antigravity_worker`. Исторический authenticated live OAuth smoke успешен; повторный managed smoke дошёл до terminal state без Git-изменений, но внешний provider вернул usage limit. Filename-only tracked-secret scan вернул 0 файлов. Ограничения: postflight использует status и file metadata без content hashes, автоматического rollback и отдельного crash-surviving daemon нет.
 
 - Ни один executable не разрешается через недоверенный current directory.
 - Codex timeout больше общего wrapper timeout.

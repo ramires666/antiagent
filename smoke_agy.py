@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import io
 import json
+import tempfile
 from pathlib import Path
 
 
@@ -32,20 +33,36 @@ def git_status(root: Path) -> object:
 
 async def run_smoke() -> dict[str, object]:
     # Keep the import inside the smoke path so importing this module has no side effects.
-    from agy_server import execute_with_antigravity_cli
+    import agy_server
+    from agent_manager import AgentStore
 
     root = git_root()
-    prompt = (
+    task = (
         "Read-only smoke test. Do not edit, create, delete, or run commands. "
         f"Inspect only the repository root and return exactly this marker: {MARKER}"
     )
     before = git_status(root)
-    result = await execute_with_antigravity_cli(
-        workspace=root,
-        prompt=prompt,
-        thinking_level="low",
-        mode="plan",
-    )
+    with tempfile.TemporaryDirectory(prefix="antiagent-managed-smoke-") as directory:
+        store = AgentStore(Path(directory) / "agents.sqlite3", owner_id="live-smoke")
+        previous_store = agy_server._AGENT_STORE
+        agy_server._AGENT_STORE = store
+        try:
+            spawned = await agy_server.antigravity_agent_spawn(
+                task,
+                working_directory=str(root),
+                thinking_level="low",
+                mode="plan",
+            )
+            agent_id = spawned["agent"]["agent_id"]
+            while True:
+                waited = await agy_server.antigravity_agent_wait(agent_id, 60)
+                agent = waited["agent"]
+                if agent["status"] in ("completed", "failed", "interrupted"):
+                    break
+            result = agent.get("output") or {}
+        finally:
+            agy_server._AGENT_STORE = previous_store
+            store.close()
     after = git_status(root)
     text = result.get("result", "") if isinstance(result, dict) else ""
     completed = isinstance(result, dict) and result.get("status") == "SUCCESS"
@@ -54,6 +71,7 @@ async def run_smoke() -> dict[str, object]:
         "marker_found": MARKER in text,
         "git_status_unchanged": before == after,
         "workspace_is_git_root": True,
+        "managed_lifecycle": True,
         "thinking_level": "low",
         "mode": "plan",
     }

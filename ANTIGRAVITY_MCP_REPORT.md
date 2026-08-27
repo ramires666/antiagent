@@ -261,13 +261,15 @@ Antigravity отказал именно из-за dirty tree. Требуется
 
 План реализован на baseline `cd41f44` (27 августа 2026 г.). Исправлены запуск процессов и UTF-16 budget, process-tree cleanup, межпроцессный workspace lock, MCP error semantics/redaction и default `plan`, typed diagnostics/version/metadata, Git pre/postflight с persistent review marker и явным acknowledgement, а также Codex timeout 900 секунд при wrapper timeout 840 секунд. Legacy SDK-ветка и `google-antigravity` удалены.
 
-Актуальная проверка: 73 deterministic теста после удаления legacy-файлов, включая 5 тестов реального MCP STDIO harness. Authenticated live OAuth smoke в `plan` успешен: контрольный marker найден в ответе, Git не изменён. В изолированном `accept-edits` smoke успешно изменён только `README.txt`; postflight завершён, полный diff просмотрен, временный репозиторий удалён. Filename-only tracked-secret scan вернул 0 файлов.
+Актуальная проверка после persistent-manager этапа: 90 deterministic тестов, включая 6 тестов реального MCP STDIO harness; один POSIX-only permission test ожидаемо skipped на Windows. Authenticated live OAuth smoke до этого этапа в `plan` успешен: контрольный marker найден в ответе, Git не изменён. В изолированном `accept-edits` smoke успешно изменён только `README.txt`; postflight завершён, полный diff просмотрен, временный репозиторий удалён. Повторный managed smoke подтвердил terminal lifecycle и неизменный Git, но внешний provider вернул usage limit, поэтому новый OAuth success не заявляется. Filename-only tracked-secret scan вернул 0 файлов.
 
 Устаревшие рекомендации о необходимости принимать любой committed temporary repo, возвращать raw stderr или считать dirty tree причиной отказа заменены фактическим typed preflight/postflight поведением. Исторические evidence и hypotheses выше сохранены как исходные наблюдения, а не как текущие утверждения.
 
 Ограничение: postflight fingerprint основан на `git status` и метаданных файлов, не на content hashes; автоматического rollback нет. Authenticated smoke зависит от внешней OAuth-сессии и поэтому не входит в deterministic count.
 
-Lifecycle нативных Codex children, потоковая выдача результатов независимых children и UI thread identity не реализуются этим single-tool MCP wrapper: это отдельный слой оркестрации клиента. Текущий проект исправляет безопасное выполнение одного leaf-agent вызова и не выдаётся за полную замену native subagents.
+Wrapper теперь является persistent agent manager: stdlib SQLite сохраняет bounded terminal history/result, а MCP предоставляет `spawn/list/status/wait/followup/interrupt` поверх прежнего synchronous executor. Project-scoped `antigravity_worker` сохраняет нативный Codex thread/UI, но передаёт leaf coding work Gemini. Реализованы background lifecycle, lineage, conversation resume, bounded wait, immediate/cross-store cancellation, active/history/output limits и stale `manager_lost` reconciliation.
+
+Полностью заменить нативный runtime Codex публичным MCP всё равно нельзя: forked transcript, thread identity/UI, sandbox/approval ownership и сам lifecycle custom subagent остаются у клиента Codex. После падения MCP process уже запущенный OS-процесс нельзя присоединить к новому process; для этого нужен отдельный supervisor/daemon. Достигнут практический максимум без такого daemon: Codex управляет жизненным циклом и проверкой, Antigravity выполняет coding-задачу.
 
 ## Acceptance criteria
 
