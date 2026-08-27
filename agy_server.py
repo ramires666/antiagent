@@ -56,6 +56,9 @@ MAX_RESULT_CHARS = 30_000
 TRUNCATION_MARKER = "\n\n[Antigravity result truncated by MCP wrapper]"
 MAX_STDOUT_CHARS = 1_000_000
 MAX_STDERR_CHARS = 16_384
+MAX_GIT_STATUS_BYTES = 1_000_000
+MAX_GIT_STATUS_PATH_LENGTH = 4_096
+MAX_GIT_STATUS_PATHS = 10_000
 MAX_PROMPT_CHARS = 24_000
 MAX_WINDOWS_COMMAND_LINE_UNITS = 32_767
 _LOCK_DIRECTORY = Path(tempfile.gettempdir()) / "antiagent-workspace-locks"
@@ -95,6 +98,8 @@ ErrorType = Literal[
     "invalid_payload",
     "invalid_response",
     "cli_error",
+    "review_required",
+    "review_state_unavailable",
 ]
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 
@@ -143,6 +148,24 @@ class CliRunResult:
 class GitPreflight(NamedTuple):
     root: Path | None
     error_type: ErrorType | None
+
+
+class GitStatusSnapshot(NamedTuple):
+    entries: dict[str, object]
+
+
+class PostflightInfo(NamedTuple):
+    preexisting_dirty: bool | None
+    worktree_changed: bool | None
+    changed_paths: list[str]
+    postflight_complete: bool
+    requires_review: bool
+
+
+class ReviewStateError(RuntimeError):
+    def __init__(self, error_type: Literal["review_required", "review_state_unavailable"]):
+        super().__init__(error_type)
+        self.error_type = error_type
 
 
 class WorkspaceLockError(RuntimeError):
@@ -318,6 +341,11 @@ class AntigravityCliOutput(BaseModel):
     metadata_complete: bool
     usage_available: bool
     conversation_id_available: bool
+    preexisting_dirty: bool | None
+    worktree_changed: bool | None
+    changed_paths: list[str]
+    postflight_complete: bool
+    requires_review: bool
 
 
 def _timeout_seconds() -> int:
@@ -377,6 +405,7 @@ def _empty_result(
     metadata_complete: bool = False,
     usage_available: bool = False,
     conversation_id_available: bool = False,
+    postflight: PostflightInfo | None = None,
 ) -> dict[str, Any]:
     run = run_info or RunInfo()
     run.finish()
@@ -391,6 +420,7 @@ def _empty_result(
         tail = result[-tail_size:] if tail_size else ""
         safe_result = result[:head_size] + TRUNCATION_MARKER + tail
         truncated = True
+    postflight = postflight or PostflightInfo(None, None, [], False, False)
     return {
         "status": status,
         "result": safe_result,
@@ -411,6 +441,11 @@ def _empty_result(
         "metadata_complete": metadata_complete,
         "usage_available": usage_available,
         "conversation_id_available": conversation_id_available,
+        "preexisting_dirty": postflight.preexisting_dirty,
+        "worktree_changed": postflight.worktree_changed,
+        "changed_paths": postflight.changed_paths,
+        "postflight_complete": postflight.postflight_complete,
+        "requires_review": postflight.requires_review,
     }
 
 
@@ -529,6 +564,188 @@ def _git_preflight(directory: str | Path | None = None) -> GitPreflight:
 def _git_root(directory: str | Path | None = None) -> Path | None:
     """Compatibility helper returning only a valid repository root."""
     return _git_preflight(directory).root
+
+
+def _parse_git_status(raw: bytes) -> GitStatusSnapshot | None:
+    if raw and not raw.endswith(b"\0"):
+        return None
+    entries: dict[str, str] = {}
+    fields = raw.split(b"\0")
+    index = 0
+    while index < len(fields):
+        record = fields[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            return None
+        try:
+            status = record[:2].decode("ascii")
+            path = record[3:].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if not path or len(path) > MAX_GIT_STATUS_PATH_LENGTH:
+            return None
+        entries[path] = status
+        if "R" in status or "C" in status:
+            if index >= len(fields) or not fields[index]:
+                return None
+            try:
+                previous_path = fields[index].decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            index += 1
+            if not previous_path or len(previous_path) > MAX_GIT_STATUS_PATH_LENGTH:
+                return None
+            entries[previous_path] = status
+        if len(entries) > MAX_GIT_STATUS_PATHS:
+            return None
+    return GitStatusSnapshot(entries)
+
+
+def _git_status_snapshot(workspace: Path) -> GitStatusSnapshot | None:
+    """Return bounded porcelain status without exposing command output."""
+    git = _resolve_executable("git")
+    if git is None:
+        return None
+    try:
+        with tempfile.TemporaryFile() as output:
+            completed = subprocess.run(
+                [str(git), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                cwd=str(workspace),
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+                shell=False,
+                env=_child_environment(),
+            )
+            if getattr(completed, "returncode", 1) != 0:
+                return None
+            output.seek(0, os.SEEK_END)
+            if output.tell() > MAX_GIT_STATUS_BYTES:
+                return None
+            output.seek(0)
+            raw = output.read()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    snapshot = _parse_git_status(raw)
+    if snapshot is None:
+        return None
+    entries: dict[str, object] = {}
+    for path, status in snapshot.entries.items():
+        try:
+            file_stat = (workspace / path).lstat()
+            # ponytail: metadata fingerprints avoid hashing a potentially huge dirty
+            # tree; add bounded content hashes only if timestamp-preserving writers
+            # become part of the threat model.
+            fingerprint = (
+                file_stat.st_mode,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            )
+        except OSError:
+            fingerprint = None
+        entries[path] = (status, fingerprint)
+    return GitStatusSnapshot(entries)
+
+
+def _postflight_info(
+    before: GitStatusSnapshot | None,
+    after: GitStatusSnapshot | None,
+    *,
+    execution_failed: bool,
+    mode: str,
+) -> PostflightInfo:
+    if mode != "accept-edits":
+        return PostflightInfo(None, False, [], True, False)
+    if before is None or after is None:
+        return PostflightInfo(
+            None if before is None else bool(before.entries),
+            None,
+            [],
+            False,
+            True,
+        )
+    paths = sorted(
+        path for path in set(before.entries) | set(after.entries)
+        if before.entries.get(path) != after.entries.get(path)
+    )
+    changed = bool(paths)
+    return PostflightInfo(
+        bool(before.entries),
+        changed,
+        paths,
+        True,
+        mode == "accept-edits" and changed and execution_failed,
+    )
+
+
+def _review_marker_path(workspace: Path) -> Path:
+    return _workspace_lock_path(workspace).with_suffix(".review")
+
+
+def _prepare_review_marker(workspace: Path, acknowledge_review: bool) -> Path:
+    try:
+        marker = _review_marker_path(workspace)
+        if marker.exists():
+            if not acknowledge_review:
+                raise ReviewStateError("review_required")
+            marker.unlink()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(marker, flags | no_follow, 0o600)
+        try:
+            payload = b"review-required\n"
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("review marker write failed")
+                view = view[written:]
+        finally:
+            os.close(fd)
+        return marker
+    except ReviewStateError:
+        raise
+    except (OSError, UnicodeError, WorkspaceLockError):
+        raise ReviewStateError("review_state_unavailable") from None
+
+
+def _clear_review_marker(marker: Path) -> bool:
+    try:
+        marker.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _cli_result_failed_for_review(cli_result: object) -> bool:
+    if isinstance(cli_result, CliRunResult):
+        returncode, stdout, timed_out = (
+            cli_result.returncode,
+            cli_result.stdout,
+            cli_result.timed_out,
+        )
+        if cli_result.command_line_too_long or cli_result.output_limit:
+            return True
+    else:
+        try:
+            returncode, stdout, timed_out = cli_result  # type: ignore[misc]
+        except (TypeError, ValueError):
+            return True
+    if timed_out or returncode != 0:
+        return True
+    try:
+        payload = json.loads(str(stdout).strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return True
+    return not (
+        isinstance(payload, dict)
+        and payload.get("status") == "SUCCESS"
+        and isinstance(payload.get("response", ""), str)
+    )
 
 
 def _probe_cli_version(cli: Path) -> str | None:
@@ -945,6 +1162,7 @@ async def execute_with_antigravity_cli(
     mode: Mode,
     progress: ProgressCallback | None = None,
     run_info: RunInfo | None = None,
+    acknowledge_review: bool = False,
 ) -> dict[str, Any]:
     """Execute one authenticated CLI process; also used by the live smoke."""
     run = run_info or RunInfo()
@@ -961,7 +1179,7 @@ async def execute_with_antigravity_cli(
         cli, workspace, prompt, thinking_level, mode, timeout_seconds
     )
 
-    async def run_serialized() -> CliRunResult:
+    async def run_serialized() -> tuple[object, PostflightInfo]:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise WorkspaceLockTimeout
@@ -975,7 +1193,39 @@ async def execute_with_antigravity_cli(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise WorkspaceLockTimeout
-            return await _run_cli(argv, workspace, remaining)
+            before = _git_status_snapshot(workspace) if mode == "accept-edits" else None
+            if mode == "accept-edits" and before is None:
+                raise ReviewStateError("review_state_unavailable")
+            marker = (
+                _prepare_review_marker(workspace, acknowledge_review)
+                if mode == "accept-edits"
+                else None
+            )
+            cli_result: object | None = None
+            postflight: PostflightInfo | None = None
+            execution_failed = True
+            try:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise WorkspaceLockTimeout
+                cli_result = await _run_cli(argv, workspace, remaining)
+                execution_failed = _cli_result_failed_for_review(cli_result)
+            finally:
+                after = _git_status_snapshot(workspace) if mode == "accept-edits" else None
+                postflight = _postflight_info(
+                    before,
+                    after,
+                    execution_failed=execution_failed,
+                    mode=mode,
+                )
+                if marker is not None and postflight.postflight_complete and not postflight.requires_review:
+                    if not _clear_review_marker(marker):
+                        postflight = postflight._replace(
+                            postflight_complete=False, requires_review=True
+                        )
+            assert postflight is not None
+            assert cli_result is not None
+            return cli_result, postflight
 
     heartbeat: asyncio.Task[None] | None = None
     try:
@@ -986,7 +1236,7 @@ async def execute_with_antigravity_cli(
             )
         # The lock and CLI share one deadline.  _run_cli owns its cancellation
         # cleanup, so a second outer wait_for would race the typed lock error.
-        cli_result = await run_serialized()
+        cli_result, postflight = await run_serialized()
         if isinstance(cli_result, CliRunResult):
             returncode = cli_result.returncode
             stdout = cli_result.stdout
@@ -1020,6 +1270,18 @@ async def execute_with_antigravity_cli(
             error_type="workspace_lock_unavailable", run_info=run,
             cli_version=cli_version,
         )
+    except ReviewStateError as exc:
+        message = (
+            "Review of previous edits is required before the next edit"
+            if exc.error_type == "review_required"
+            else "Git review state could not be recorded"
+        )
+        return _empty_result(
+            "ERROR", message, thinking_level, mode,
+            error_type=exc.error_type, retryable=False, run_info=run,
+            cli_version=cli_version,
+            postflight=PostflightInfo(None, None, [], False, True),
+        )
     finally:
         if heartbeat is not None:
             heartbeat.cancel()
@@ -1032,6 +1294,7 @@ async def execute_with_antigravity_cli(
             "ERROR", "Antigravity CLI timed out", thinking_level, mode,
             error_type="timeout", run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
+            postflight=postflight,
         )
     if returncode is None:
         error_type: ErrorType = (
@@ -1046,7 +1309,7 @@ async def execute_with_antigravity_cli(
         )
         return _empty_result(
             "ERROR", message, thinking_level, mode, error_type=error_type,
-            run_info=run, cli_version=cli_version,
+            run_info=run, cli_version=cli_version, postflight=postflight,
         )
     if len(stdout) > MAX_STDOUT_CHARS or output_limit:
         logger.warning("Antigravity CLI response exceeded the wrapper limit")
@@ -1054,6 +1317,7 @@ async def execute_with_antigravity_cli(
             "ERROR", "Antigravity CLI response was too large", thinking_level, mode,
             error_type="output_limit", run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
+            postflight=postflight,
         )
     try:
         payload = json.loads(stdout.strip())
@@ -1063,12 +1327,14 @@ async def execute_with_antigravity_cli(
             "ERROR", "Antigravity CLI returned invalid JSON", thinking_level, mode,
             error_type="invalid_json", run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
+            postflight=postflight,
         )
     if not isinstance(payload, dict):
         return _empty_result(
             "ERROR", "Antigravity CLI returned an invalid response", thinking_level, mode,
             error_type="invalid_payload", run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
+            postflight=postflight,
         )
     if returncode != 0 or payload.get("status") != "SUCCESS":
         logger.warning("Antigravity CLI task failed")
@@ -1076,11 +1342,18 @@ async def execute_with_antigravity_cli(
             "ERROR", "Antigravity CLI task failed", thinking_level, mode,
             error_type="cli_error", run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
+            postflight=postflight,
         )
     return _success_result(
         payload, thinking_level, mode, run_info=run,
         cli_version=cli_version, exit_code=_safe_exit_code(returncode),
-    )
+    ) | {
+        "preexisting_dirty": postflight.preexisting_dirty,
+        "worktree_changed": postflight.worktree_changed,
+        "changed_paths": postflight.changed_paths,
+        "postflight_complete": postflight.postflight_complete,
+        "requires_review": postflight.requires_review,
+    }
 
 
 @mcp.tool()
@@ -1091,6 +1364,7 @@ async def antigravity_cli_execute(
     working_directory: Annotated[str, SkipValidation] = "",
     thinking_level: Annotated[ThinkingLevel, SkipValidation] = "medium",
     mode: Annotated[Mode, SkipValidation] = "plan",
+    acknowledge_review: Annotated[bool, SkipValidation] = False,
     ctx: Context | None = None,
 ) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
@@ -1127,6 +1401,13 @@ async def antigravity_cli_execute(
         return _tool_result(
             _empty_result(
                 "ERROR", "mode must be plan or accept-edits", thinking_level, None,
+                error_type="invalid_request", run_info=run,
+            )
+        )
+    if not isinstance(acknowledge_review, bool):
+        return _tool_result(
+            _empty_result(
+                "ERROR", "acknowledge_review must be a boolean", thinking_level, mode,
                 error_type="invalid_request", run_info=run,
             )
         )
@@ -1173,6 +1454,7 @@ async def antigravity_cli_execute(
         mode=mode,
         progress=report_progress if ctx is not None else None,
         run_info=run,
+        acknowledge_review=acknowledge_review,
     )
     return _tool_result(result)
 

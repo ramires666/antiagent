@@ -23,6 +23,8 @@ OUTPUT_FIELDS = {
     "retryable", "run_id", "started_at", "finished_at", "duration_seconds",
     "cli_version", "metadata_complete", "usage_available",
     "conversation_id_available",
+    "preexisting_dirty", "worktree_changed", "changed_paths",
+    "postflight_complete", "requires_review",
 }
 
 
@@ -227,7 +229,10 @@ class AgyServerTest(unittest.TestCase):
             return_value=server.GitPreflight(Path("C:/repo"), None),
         ), patch(
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
-        ), patch("agy_server._run_cli", new=fake_run):
+        ), patch("agy_server._run_cli", new=fake_run), patch(
+            "agy_server._git_status_snapshot",
+            return_value=server.GitStatusSnapshot({}),
+        ):
             result = asyncio.run(server.antigravity_cli_execute(
                 "inspect only", thinking_level=level, mode=mode
             ))
@@ -381,6 +386,214 @@ class AgyServerTest(unittest.TestCase):
             with patch("agy_server.subprocess.run") as git:
                 self.assertIsNone(server._git_root(str(outside)))
             git.assert_not_called()
+
+    def test_git_status_parser_handles_rename_and_rejects_unbounded_paths(self):
+        snapshot = server._parse_git_status(
+            b" M changed.py\0R  renamed.py\0old.py\0"
+        )
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.entries, {
+            "changed.py": " M",
+            "renamed.py": "R ",
+            "old.py": "R ",
+        })
+        self.assertIsNone(server._parse_git_status(b"bad\0"))
+        self.assertIsNone(server._parse_git_status(b" M truncated.py"))
+
+    def test_git_status_snapshot_rejects_oversized_output_without_exposing_it(self):
+        def run(*_args, stdout, **kwargs):
+            self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+            stdout.write(b"x" * (server.MAX_GIT_STATUS_BYTES + 1))
+            return type("Completed", (), {"returncode": 0})()
+
+        with patch("agy_server._resolve_executable", return_value=Path("C:/git.exe")), patch(
+            "agy_server.subprocess.run", side_effect=run
+        ):
+            self.assertIsNone(server._git_status_snapshot(Path("C:/repo")))
+
+    def test_postflight_detects_another_edit_to_preexisting_dirty_file(self):
+        with tempfile.TemporaryDirectory(prefix="agy-dirty-") as directory:
+            base = Path(directory)
+            workspace = base / "repo"
+            workspace.mkdir()
+            tracked = workspace / "tracked.txt"
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            tracked.write_text("base-value\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=workspace, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "-qm", "initial"],
+                cwd=workspace,
+                check=True,
+            )
+            tracked.write_text("dirty-one\n", encoding="utf-8")
+
+            async def run(*_args):
+                time.sleep(0.01)
+                tracked.write_text("dirty-two\n", encoding="utf-8")
+                return 0, '{"status":"SUCCESS","response":"ok"}', False
+
+            with patch("agy_server._LOCK_DIRECTORY", base / "locks"), patch(
+                "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+            ), patch("agy_server._probe_cli_version", return_value="1.1.22"), patch(
+                "agy_server._run_cli", new=run
+            ):
+                result = asyncio.run(server.execute_with_antigravity_cli(
+                    workspace=workspace, prompt="x", thinking_level="low",
+                    mode="accept-edits",
+                ))
+            self.assertTrue(result["preexisting_dirty"])
+            self.assertTrue(result["worktree_changed"])
+            self.assertEqual(result["changed_paths"], ["tracked.txt"])
+
+    def test_unknown_postflight_requires_review(self):
+        with tempfile.TemporaryDirectory(prefix="agy-review-") as directory:
+            workspace = Path(directory)
+            statuses = iter((server.GitStatusSnapshot({}), None))
+            with patch("agy_server._LOCK_DIRECTORY", workspace / "locks"), patch(
+                "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+            ), patch("agy_server._probe_cli_version", return_value="1.1.22"), patch(
+                "agy_server._git_status_snapshot", side_effect=lambda _root: next(statuses)
+            ), patch(
+                "agy_server._run_cli",
+                new=AsyncMock(return_value=(0, '{"status":"SUCCESS","response":"ok"}', False)),
+            ):
+                result = asyncio.run(server.execute_with_antigravity_cli(
+                    workspace=workspace, prompt="x", thinking_level="low",
+                    mode="accept-edits",
+                ))
+            self.assertFalse(result["postflight_complete"])
+            self.assertTrue(result["requires_review"])
+            self.assertTrue(any((workspace / "locks").glob("*.review")))
+
+    def test_accept_edits_postflight_records_changes_and_clears_marker(self):
+        with tempfile.TemporaryDirectory(prefix="agy-review-") as directory:
+            workspace = Path(directory)
+            lock_directory = workspace / "locks"
+            statuses = iter((
+                server.GitStatusSnapshot({"preexisting.py": " M"}),
+                server.GitStatusSnapshot({"edited.py": "??"}),
+            ))
+            with patch("agy_server._LOCK_DIRECTORY", lock_directory), patch(
+                "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+            ), patch("agy_server._probe_cli_version", return_value="1.1.22"), patch(
+                "agy_server._git_status_snapshot", side_effect=lambda _root: next(statuses)
+            ), patch(
+                "agy_server._run_cli",
+                new=AsyncMock(return_value=(
+                    0, '{"status":"SUCCESS","response":"ok"}', False
+                )),
+            ):
+                result = asyncio.run(server.execute_with_antigravity_cli(
+                    workspace=workspace,
+                    prompt="x",
+                    thinking_level="low",
+                    mode="accept-edits",
+                ))
+            self.assertTrue(result["preexisting_dirty"])
+            self.assertTrue(result["worktree_changed"])
+            self.assertEqual(result["changed_paths"], ["edited.py", "preexisting.py"])
+            self.assertTrue(result["postflight_complete"])
+            self.assertFalse(result["requires_review"])
+            self.assertFalse(server._review_marker_path(workspace).exists())
+
+    def test_failed_accept_edits_requires_review_before_next_edit(self):
+        with tempfile.TemporaryDirectory(prefix="agy-review-") as directory:
+            workspace = Path(directory)
+            lock_directory = workspace / "locks"
+            statuses = iter((
+                server.GitStatusSnapshot({}),
+                server.GitStatusSnapshot({"partial.py": " M"}),
+                server.GitStatusSnapshot({"partial.py": " M"}),
+            ))
+            run = AsyncMock(return_value=(1, '{"status":"FAIL"}', False))
+            with patch("agy_server._LOCK_DIRECTORY", lock_directory), patch(
+                "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+            ), patch("agy_server._probe_cli_version", return_value="1.1.22"), patch(
+                "agy_server._git_status_snapshot", side_effect=lambda _root: next(statuses)
+            ), patch("agy_server._run_cli", new=run):
+                first = asyncio.run(server.execute_with_antigravity_cli(
+                    workspace=workspace, prompt="x", thinking_level="low",
+                    mode="accept-edits",
+                ))
+                second = asyncio.run(server.execute_with_antigravity_cli(
+                    workspace=workspace, prompt="x", thinking_level="low",
+                    mode="accept-edits",
+                ))
+            self.assertTrue(first["requires_review"])
+            self.assertEqual(first["changed_paths"], ["partial.py"])
+            self.assertEqual(second["error_type"], "review_required")
+            self.assertTrue(second["requires_review"])
+            run.assert_awaited_once()
+
+    def test_acknowledge_review_allows_next_edit_and_clears_marker(self):
+        with tempfile.TemporaryDirectory(prefix="agy-review-") as directory:
+            workspace = Path(directory)
+            lock_directory = workspace / "locks"
+            statuses = iter((
+                server.GitStatusSnapshot({}),
+                server.GitStatusSnapshot({"partial.py": " M"}),
+                server.GitStatusSnapshot({"partial.py": " M"}),
+                server.GitStatusSnapshot({"partial.py": " M"}),
+            ))
+            run = AsyncMock(side_effect=(
+                (1, '{"status":"FAIL"}', False),
+                (0, '{"status":"SUCCESS","response":"ok"}', False),
+            ))
+            with patch("agy_server._LOCK_DIRECTORY", lock_directory), patch(
+                "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+            ), patch("agy_server._probe_cli_version", return_value="1.1.22"), patch(
+                "agy_server._git_status_snapshot", side_effect=lambda _root: next(statuses)
+            ), patch("agy_server._run_cli", new=run):
+                first = asyncio.run(server.execute_with_antigravity_cli(
+                    workspace=workspace, prompt="x", thinking_level="low",
+                    mode="accept-edits",
+                ))
+                second = asyncio.run(server.execute_with_antigravity_cli(
+                    workspace=workspace, prompt="x", thinking_level="low",
+                    mode="accept-edits", acknowledge_review=True,
+                ))
+            self.assertTrue(first["requires_review"])
+            self.assertEqual(second["status"], "SUCCESS")
+            self.assertFalse(second["requires_review"])
+            self.assertFalse(server._review_marker_path(workspace).exists())
+            self.assertEqual(run.await_count, 2)
+
+    def test_cancelled_accept_edit_runs_postflight_and_leaves_marker(self):
+        with tempfile.TemporaryDirectory(prefix="agy-review-") as directory:
+            workspace = Path(directory)
+            lock_directory = workspace / "locks"
+            statuses = iter((
+                server.GitStatusSnapshot({}),
+                server.GitStatusSnapshot({"partial.py": " M"}),
+            ))
+            run = AsyncMock(side_effect=asyncio.CancelledError)
+            with patch("agy_server._LOCK_DIRECTORY", lock_directory), patch(
+                "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+            ), patch("agy_server._probe_cli_version", return_value="1.1.22"), patch(
+                "agy_server._git_status_snapshot", side_effect=lambda _root: next(statuses)
+            ), patch("agy_server._run_cli", new=run) as cli:
+                with self.assertRaises(asyncio.CancelledError):
+                    asyncio.run(server.execute_with_antigravity_cli(
+                        workspace=workspace, prompt="x", thinking_level="low",
+                        mode="accept-edits",
+                    ))
+            self.assertEqual(cli.await_count, 1)
+            self.assertTrue(any(lock_directory.glob("*.review")))
+
+    def test_cli_output_limit_is_typed_error(self):
+        with patch("agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")), patch(
+            "agy_server._probe_cli_version", return_value="1.1.22"
+        ), patch(
+            "agy_server._run_cli",
+            new=AsyncMock(return_value=server.CliRunResult(0, "", False, output_limit=True)),
+        ):
+            result = asyncio.run(server.execute_with_antigravity_cli(
+                workspace=Path("C:/repo"), prompt="x", thinking_level="low", mode="plan"
+            ))
+        self.assertEqual(result["error_type"], "output_limit")
+        self.assertEqual(result["exit_code"], 0)
 
     def test_handler_rejects_explicit_invalid_working_directory_before_cli(self):
         working_directory = str(Path.cwd() / "missing-workspace")

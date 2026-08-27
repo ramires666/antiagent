@@ -23,6 +23,7 @@ INPUT_FIELDS = {
     "thinking_level",
     "mode",
     "working_directory",
+    "acknowledge_review",
 }
 OUTPUT_FIELDS = {
     "status",
@@ -44,6 +45,11 @@ OUTPUT_FIELDS = {
     "metadata_complete",
     "usage_available",
     "conversation_id_available",
+    "preexisting_dirty",
+    "worktree_changed",
+    "changed_paths",
+    "postflight_complete",
+    "requires_review",
 }
 
 
@@ -109,6 +115,9 @@ class MCPProtocolTest(unittest.TestCase):
                         self.assertEqual(
                             schema["properties"]["mode"]["default"],
                             "plan",
+                        )
+                        self.assertFalse(
+                            schema["properties"]["acknowledge_review"]["default"]
                         )
                         self.assertIsNotNone(tool.output_schema)
                         assert tool.output_schema is not None
@@ -226,6 +235,7 @@ class MCPProtocolTest(unittest.TestCase):
                             {"task": "x", "context": {"secret": secret}},
                             {"task": "x", "thinking_level": secret},
                             {"task": "x", "working_directory": {"secret": secret}},
+                            {"task": "x", "acknowledge_review": {"secret": secret}},
                         ):
                             with self.subTest(arguments=redacted_arguments):
                                 redacted = await session.call_tool(
