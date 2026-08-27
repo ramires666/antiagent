@@ -106,9 +106,9 @@ Terminal states неизменяемы. Follow-up создаёт новый `age
 ### 2. Conversation resume и durable store
 
 - [x] Добавить безопасный optional `conversation_id` в общий execution path.
-- [ ] Добавить stdlib SQLite store с атомарными transitions и bounded reads.
-- [ ] Не сохранять исходный prompt/context/verification.
-- [ ] Покрыть schema, transitions, persistence и stale reconciliation тестами.
+- [x] Добавить stdlib SQLite store с атомарными transitions и bounded reads.
+- [x] Не сохранять исходный prompt/context/verification.
+- [x] Покрыть schema, transitions, persistence и stale reconciliation тестами.
 
 ### 3. Lifecycle MCP API
 
