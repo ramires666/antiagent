@@ -120,12 +120,12 @@ Terminal states неизменяемы. Follow-up создаёт новый `age
 
 ### 4. Codex custom agent и правила маршрутизации
 
-- [ ] Добавить `.codex/agents/antigravity_worker.toml`.
-- [ ] Разрешить worker только Antigravity lifecycle/execute MCP tools.
-- [ ] Обновить `AGENTS.md`: дешёвые ограниченные coding-задачи сначала
+- [x] Добавить `.codex/agents/antigravity_worker.toml`.
+- [x] Разрешить worker только Antigravity lifecycle/execute MCP tools.
+- [x] Обновить `AGENTS.md`: дешёвые ограниченные coding-задачи сначала
   делегируются `antigravity_worker`; архитектура, security, destructive work,
   секреты и final review остаются у Codex.
-- [ ] Обновить `.codex/config.toml` allowlist.
+- [x] Обновить `.codex/config.toml` allowlist.
 
 ### 5. Acceptance, документация и уборка
 
