@@ -33,6 +33,17 @@ OUTPUT_FIELDS = {
     "usage",
     "conversation_id",
     "result_truncated",
+    "error_type",
+    "exit_code",
+    "retryable",
+    "run_id",
+    "started_at",
+    "finished_at",
+    "duration_seconds",
+    "cli_version",
+    "metadata_complete",
+    "usage_available",
+    "conversation_id_available",
 }
 
 
@@ -147,12 +158,19 @@ class MCPProtocolTest(unittest.TestCase):
                             "fixture-ok",
                         )
                         self.assertEqual(
-                            progress_events,
+                            [event[:2] for event in progress_events],
+                            [(1.0, None), (2.0, None)],
+                        )
+                        run_id = valid.structured_content["run_id"]
+                        self.assertEqual(
+                            [event[2] for event in progress_events],
                             [
-                                (1.0, None, "Antigravity CLI request queued"),
-                                (2.0, None, "Antigravity CLI is running"),
+                                f"run_id={run_id} state=queued",
+                                f"run_id={run_id} state=running",
                             ],
                         )
+                        self.assertEqual(valid.structured_content["cli_version"], "1.1.22")
+                        self.assertTrue(valid.structured_content["metadata_complete"])
 
                         default_mode = await session.call_tool(
                             TOOL_NAME, {"task": "default mode protocol probe"}
@@ -244,9 +262,10 @@ class MCPProtocolTest(unittest.TestCase):
 
                         repeated = await session.call_tool(TOOL_NAME, arguments)
                         self.assertFalse(repeated.is_error)
-                        self.assertEqual(
-                            repeated.structured_content,
-                            valid.structured_content,
+                        self.assertEqual(repeated.structured_content["result"], "fixture-ok")
+                        self.assertNotEqual(
+                            repeated.structured_content["run_id"],
+                            valid.structured_content["run_id"],
                         )
 
     def test_read_timeout_does_not_corrupt_session(self):
@@ -302,7 +321,7 @@ class MCPProtocolTest(unittest.TestCase):
             started = asyncio.Event()
 
             async def on_progress(_progress, _total, message):
-                if message == "Antigravity CLI is running":
+                if message.endswith("state=running"):
                     started.set()
 
             with open(os.devnull, "w", encoding="utf-8") as errlog:

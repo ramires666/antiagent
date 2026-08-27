@@ -17,6 +17,15 @@ import agy_server as server
 from mcp.types import CallToolResult
 
 
+OUTPUT_FIELDS = {
+    "status", "result", "model", "thinking_level", "mode", "usage",
+    "conversation_id", "result_truncated", "error_type", "exit_code",
+    "retryable", "run_id", "started_at", "finished_at", "duration_seconds",
+    "cli_version", "metadata_complete", "usage_available",
+    "conversation_id_available",
+}
+
+
 def result_data(result):
     return result.structured_content if isinstance(result, CallToolResult) else result
 
@@ -136,6 +145,69 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(result_data(bad_level)["status"], "ERROR")
         self.assertEqual(result_data(bad_mode)["status"], "ERROR")
 
+    def test_preflight_errors_are_typed_and_have_run_metadata(self):
+        errors = (
+            "path_not_found",
+            "path_outside_allowed_root",
+            "workspace_not_git",
+            "workspace_not_root",
+            "git_trust_denied",
+            "git_unavailable",
+        )
+        for error_type in errors:
+            with self.subTest(error_type=error_type), patch(
+                "agy_server._git_preflight",
+                return_value=server.GitPreflight(None, error_type),
+            ), patch(
+                "agy_server.execute_with_antigravity_cli", new=AsyncMock()
+            ) as execute:
+                result = asyncio.run(server.antigravity_cli_execute("x"))
+            data = result_data(result)
+            self.assertEqual(data["error_type"], error_type)
+            self.assertRegex(data["run_id"], r"^[0-9a-f]{32}$")
+            self.assertTrue(data["started_at"].endswith("Z"))
+            self.assertTrue(data["finished_at"].endswith("Z"))
+            self.assertGreaterEqual(data["duration_seconds"], 0)
+            execute.assert_not_awaited()
+
+    def test_success_reports_cli_version_and_metadata_completeness(self):
+        payload = json.dumps({
+            "status": "SUCCESS",
+            "response": "ok",
+            "usage": {"total_tokens": 3},
+            "conversation_id": "conversation-1",
+        })
+        with patch(
+            "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+        ), patch(
+            "agy_server._probe_cli_version", return_value="1.1.22"
+        ), patch(
+            "agy_server._run_cli", new=AsyncMock(return_value=(0, payload, False))
+        ):
+            data = asyncio.run(server.execute_with_antigravity_cli(
+                workspace=Path("C:/repo"), prompt="x",
+                thinking_level="medium", mode="plan",
+            ))
+        self.assertEqual(data["status"], "SUCCESS")
+        self.assertIsNone(data["error_type"])
+        self.assertEqual(data["exit_code"], 0)
+        self.assertEqual(data["cli_version"], "1.1.22")
+        self.assertTrue(data["usage_available"])
+        self.assertTrue(data["conversation_id_available"])
+        self.assertTrue(data["metadata_complete"])
+
+    def test_cli_version_probe_is_bounded_and_uses_sanitized_environment(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": "1.1.22\n"})()
+        with patch.dict(os.environ, {"TEST_API_KEY": "secret"}, clear=False), patch(
+            "agy_server.subprocess.run", return_value=completed
+        ) as run:
+            self.assertEqual(server._probe_cli_version(Path("C:/bin/agy.exe")), "1.1.22")
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["cwd"], str(Path("C:/bin")))
+        self.assertEqual(kwargs["timeout"], 5)
+        self.assertFalse(kwargs["shell"])
+        self.assertNotIn("TEST_API_KEY", kwargs["env"])
+
     def _execute(
         self, *, level="low", mode="plan", stdout=None, returncode=0,
         timed_out=False,
@@ -150,7 +222,10 @@ class AgyServerTest(unittest.TestCase):
                 "status": "SUCCESS", "response": "marker",
             }), timed_out
 
-        with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
         ), patch("agy_server._run_cli", new=fake_run):
             result = asyncio.run(server.antigravity_cli_execute(
@@ -255,7 +330,10 @@ class AgyServerTest(unittest.TestCase):
         ):
             self.assertIsNone(server._git_root())
 
-        with patch("agy_server._git_root", return_value=None), patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(None, "workspace_not_git"),
+        ), patch(
             "agy_server.execute_with_antigravity_cli", new=AsyncMock()
         ) as execute:
             result = asyncio.run(server.antigravity_cli_execute("x"))
@@ -306,13 +384,16 @@ class AgyServerTest(unittest.TestCase):
 
     def test_handler_rejects_explicit_invalid_working_directory_before_cli(self):
         working_directory = str(Path.cwd() / "missing-workspace")
-        with patch("agy_server._git_root", return_value=None) as git_root, patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(None, "path_not_found"),
+        ) as git_preflight, patch(
             "agy_server.execute_with_antigravity_cli", new=AsyncMock()
         ) as execute, patch("agy_server._resolve_cli") as resolve_cli:
             result = asyncio.run(server.antigravity_cli_execute(
                 "x", working_directory=working_directory
             ))
-        git_root.assert_called_once_with(working_directory)
+        git_preflight.assert_called_once_with(working_directory)
         execute.assert_not_awaited()
         resolve_cli.assert_not_called()
         self.assertEqual(result_data(result)["status"], "ERROR")
@@ -335,19 +416,21 @@ class AgyServerTest(unittest.TestCase):
             ({"task": "x", "verification": []}, "context and verification must be strings"),
         )
         for arguments, expected in cases:
-            with self.subTest(arguments=arguments), patch("agy_server._git_root") as root:
+            with self.subTest(arguments=arguments), patch(
+                "agy_server._git_preflight"
+            ) as preflight:
                 result = asyncio.run(server.antigravity_cli_execute(**arguments))
             self.assertEqual(result_data(result)["result"], expected)
-            root.assert_not_called()
+            preflight.assert_not_called()
 
-        with patch("agy_server._git_root") as root, patch(
+        with patch("agy_server._git_preflight") as preflight, patch(
             "agy_server.execute_with_antigravity_cli", new=AsyncMock()
         ) as execute:
             result = asyncio.run(server.antigravity_cli_execute(
                 "x", working_directory=123
             ))
         self.assertEqual(result_data(result)["status"], "ERROR")
-        root.assert_not_called()
+        preflight.assert_not_called()
         execute.assert_not_awaited()
 
         expected_prompt = (
@@ -359,7 +442,10 @@ class AgyServerTest(unittest.TestCase):
             "TASK:\ntask\n\nCONTEXT:\ncontext\n\nVERIFICATION:\nverify"
         )
         self.assertEqual(server._prompt("task", "context", "verify"), expected_prompt)
-        with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
             "agy_server.execute_with_antigravity_cli",
             new=AsyncMock(return_value={"status": "SUCCESS"}),
         ) as execute:
@@ -386,10 +472,7 @@ class AgyServerTest(unittest.TestCase):
                 result = asyncio.run(server.antigravity_cli_execute(**arguments))
                 self.assertIsInstance(result, CallToolResult)
                 self.assertTrue(result.is_error)
-                self.assertEqual(set(result.structured_content), {
-                    "status", "result", "model", "thinking_level", "mode",
-                    "usage", "conversation_id", "result_truncated",
-                })
+                self.assertEqual(set(result.structured_content), OUTPUT_FIELDS)
                 self.assertNotIn(secret, repr(result.content))
                 self.assertNotIn(secret, repr(result.structured_content))
 
@@ -834,21 +917,21 @@ class AgyServerTest(unittest.TestCase):
                 emitted.set()
 
             with patch("agy_server.asyncio.sleep", new=sleep):
-                task = asyncio.create_task(server._progress_heartbeat(progress))
+                task = asyncio.create_task(server._progress_heartbeat(progress, "run-1"))
                 await asyncio.wait_for(emitted.wait(), 1)
                 task.cancel()
                 await task
             return messages, task.done()
 
         messages, done = asyncio.run(heartbeat_emits())
-        self.assertEqual(messages, ["Antigravity CLI request is still in progress"])
+        self.assertEqual(messages, ["run_id=run-1 state=running"])
         self.assertTrue(done)
 
         async def lifecycle(timeout):
             started = asyncio.Event()
             reaped = asyncio.Event()
 
-            async def heartbeat(_progress):
+            async def heartbeat(_progress, _run_id):
                 started.set()
                 try:
                     await asyncio.Event().wait()
@@ -904,12 +987,18 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(missing_response["result"], "")
 
     def test_malformed_and_nonzero_output_are_generic(self):
-        with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
         ), patch("agy_server._run_cli", new=AsyncMock(return_value=(0, "TOKEN=secret", False))):
             malformed = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
         self.assertEqual(result_data(malformed)["result"], "Antigravity CLI returned invalid JSON")
-        with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
         ), patch("agy_server._run_cli", new=AsyncMock(return_value=(1, '{"status":"FAIL","response":"secret"}', False))):
             failed = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
@@ -950,39 +1039,42 @@ class AgyServerTest(unittest.TestCase):
         self.assertNotIn("PAYLOAD_SECRET", "\n".join(logs.output))
 
     def test_empty_result_from_output_overflow_is_safe_error(self):
-        with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
         ), patch(
             "agy_server._run_cli", new=AsyncMock(return_value=(-9, "", False))
         ):
             result = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
-        self.assertEqual(result_data(result), {
-            "status": "ERROR",
-            "result": "Antigravity CLI returned invalid JSON",
-            "model": "gemini-3.7-flash-medium",
-            "thinking_level": "medium",
-            "mode": "plan",
-            "usage": {},
-            "conversation_id": None,
-            "result_truncated": False,
-        })
+        data = result_data(result)
+        self.assertEqual(data["status"], "ERROR")
+        self.assertEqual(data["result"], "Antigravity CLI returned invalid JSON")
+        self.assertEqual(data["error_type"], "invalid_json")
+        self.assertEqual(data["exit_code"], -9)
+        self.assertFalse(data["retryable"])
+        self.assertEqual(set(data), OUTPUT_FIELDS)
 
     def test_prompt_size_validation_happens_before_git_or_cli(self):
-        with patch("agy_server._git_root") as git_root, patch(
+        with patch("agy_server._git_preflight") as git_preflight, patch(
             "agy_server.execute_with_antigravity_cli"
         ) as execute:
             result = asyncio.run(server.antigravity_cli_execute(
                 "x", context="c" * server.MAX_PROMPT_CHARS
             ))
         self.assertEqual(result_data(result)["result"], "task context is too large")
-        git_root.assert_not_called()
+        git_preflight.assert_not_called()
         execute.assert_not_called()
 
     def test_prompt_at_maximum_size_is_accepted(self):
         base_prompt = server._prompt("x", "", "")
         context = "c" * (server.MAX_PROMPT_CHARS - len(base_prompt))
         expected = {"status": "SUCCESS", "result": "ok"}
-        with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
         ), patch("agy_server.execute_with_antigravity_cli", return_value=expected) as execute:
             result = asyncio.run(server.antigravity_cli_execute("x", context=context))
@@ -1589,7 +1681,10 @@ class AgyServerTest(unittest.TestCase):
             return {"status": "SUCCESS"}
 
         ctx = FakeContext()
-        with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
             "agy_server.execute_with_antigravity_cli", new=execute
         ):
             result = asyncio.run(server.antigravity_cli_execute("x", ctx=ctx))
@@ -1633,7 +1728,10 @@ class AgyServerTest(unittest.TestCase):
                 await asyncio.gather(first, second)
                 return {"status": "SUCCESS"}
 
-            with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
+            with patch(
+                "agy_server._git_preflight",
+                return_value=server.GitPreflight(Path("C:/repo"), None),
+            ), patch(
                 "agy_server.execute_with_antigravity_cli", new=execute
             ):
                 result = await server.antigravity_cli_execute("x", ctx=ctx)

@@ -21,10 +21,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, NamedTuple, cast
 
 from ctypes import wintypes
 from mcp.types import CallToolResult, TextContent
@@ -72,6 +76,73 @@ _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 ProgressCallback = Callable[[str], Awaitable[None]]
+ErrorType = Literal[
+    "invalid_request",
+    "path_not_found",
+    "path_outside_allowed_root",
+    "workspace_not_git",
+    "workspace_not_root",
+    "git_trust_denied",
+    "git_unavailable",
+    "cli_unavailable",
+    "workspace_lock_timeout",
+    "workspace_lock_unavailable",
+    "command_line_too_long",
+    "spawn_failed",
+    "timeout",
+    "output_limit",
+    "invalid_json",
+    "invalid_payload",
+    "invalid_response",
+    "cli_error",
+]
+_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+@dataclass
+class RunInfo:
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    started_at: str = field(default_factory=_timestamp)
+    _started_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    finished_at: str | None = None
+    duration_seconds: float | None = None
+
+    def finish(self) -> None:
+        if self.finished_at is None:
+            self.finished_at = _timestamp()
+            self.duration_seconds = round(time.monotonic() - self._started_monotonic, 3)
+
+
+@dataclass
+class CliRunResult:
+    returncode: int | None
+    stdout: str
+    timed_out: bool
+    command_line_too_long: bool = False
+    output_limit: bool = False
+
+    def __iter__(self):
+        yield self.returncode
+        yield self.stdout
+        yield self.timed_out
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, tuple):
+            return tuple(self) == other
+        if isinstance(other, CliRunResult):
+            return self.__dict__ == other.__dict__
+        return NotImplemented
+
+
+class GitPreflight(NamedTuple):
+    root: Path | None
+    error_type: ErrorType | None
 
 
 class WorkspaceLockError(RuntimeError):
@@ -236,6 +307,17 @@ class AntigravityCliOutput(BaseModel):
     usage: dict[str, int | float]
     conversation_id: str | None
     result_truncated: bool
+    error_type: ErrorType | None
+    exit_code: int | None
+    retryable: bool
+    run_id: str
+    started_at: str
+    finished_at: str
+    duration_seconds: float
+    cli_version: str | None
+    metadata_complete: bool
+    usage_available: bool
+    conversation_id_available: bool
 
 
 def _timeout_seconds() -> int:
@@ -253,9 +335,7 @@ def _timeout_seconds() -> int:
     return min(value, MAX_TIMEOUT_SECONDS)
 
 
-async def _emit_progress(
-    progress: ProgressCallback | None, message: str
-) -> None:
+async def _emit_progress(progress: ProgressCallback | None, message: str) -> None:
     if progress is None:
         return
     try:
@@ -266,11 +346,13 @@ async def _emit_progress(
         logger.debug("MCP progress notification failed")
 
 
-async def _progress_heartbeat(progress: ProgressCallback) -> None:
+async def _progress_heartbeat(progress: ProgressCallback, run_id: str = "") -> None:
     try:
         while True:
             await asyncio.sleep(12)
-            await _emit_progress(progress, "Antigravity CLI request is still in progress")
+            await _emit_progress(
+                progress, f"run_id={run_id} state=running"
+            )
     except asyncio.CancelledError:
         return
 
@@ -286,7 +368,18 @@ def _empty_result(
     mode: str | None,
     conversation_id: str | None = None,
     usage: dict[str, int | float] | None = None,
+    *,
+    error_type: ErrorType | None = None,
+    exit_code: int | None = None,
+    retryable: bool = False,
+    run_info: RunInfo | None = None,
+    cli_version: str | None = None,
+    metadata_complete: bool = False,
+    usage_available: bool = False,
+    conversation_id_available: bool = False,
 ) -> dict[str, Any]:
+    run = run_info or RunInfo()
+    run.finish()
     if len(result) <= MAX_RESULT_CHARS:
         safe_result, truncated = result, False
     elif MAX_RESULT_CHARS <= len(TRUNCATION_MARKER):
@@ -307,6 +400,17 @@ def _empty_result(
         "usage": usage or {},
         "conversation_id": conversation_id,
         "result_truncated": truncated,
+        "error_type": error_type,
+        "exit_code": exit_code,
+        "retryable": retryable,
+        "run_id": run.run_id,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "duration_seconds": run.duration_seconds,
+        "cli_version": cli_version,
+        "metadata_complete": metadata_complete,
+        "usage_available": usage_available,
+        "conversation_id_available": conversation_id_available,
     }
 
 
@@ -371,40 +475,80 @@ def _resolve_cli() -> Path | None:
     return None
 
 
-def _git_root(directory: str | Path | None = None) -> Path | None:
-    """Return directory only when it is the repository's top-level root."""
+def _git_preflight(directory: str | Path | None = None) -> GitPreflight:
     try:
         base = Path.cwd().resolve()
         cwd = base if directory is None else Path(directory)
         if not cwd.is_absolute():
             cwd = base / cwd
         cwd = cwd.resolve()
-        if directory is not None and (
-            not cwd.is_relative_to(base) or not cwd.is_dir()
-        ):
-            return None
+        if directory is not None and not cwd.is_relative_to(base):
+            return GitPreflight(None, "path_outside_allowed_root")
+        if directory is not None and not cwd.is_dir():
+            return GitPreflight(None, "path_not_found")
         git = _resolve_executable("git")
         if git is None:
-            return None
+            return GitPreflight(None, "git_unavailable")
         completed = subprocess.run(
             [str(git), "rev-parse", "--show-toplevel"],
             cwd=str(cwd),
             capture_output=True,
             text=True,
             timeout=5,
-            check=True,
+            check=False,
             shell=False,
+            env=_child_environment(),
         )
+    except subprocess.CalledProcessError as exc:
+        stderr = str(getattr(exc, "stderr", "") or "").lower()
+        if "dubious ownership" in stderr or "safe.directory" in stderr:
+            return GitPreflight(None, "git_trust_denied")
+        return GitPreflight(None, "workspace_not_git")
+    except subprocess.TimeoutExpired:
+        return GitPreflight(None, "git_unavailable")
     except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
-        return None
+        return GitPreflight(None, "git_unavailable")
+
+    if getattr(completed, "returncode", 0) != 0:
+        stderr = str(getattr(completed, "stderr", "") or "").lower()
+        if "dubious ownership" in stderr or "safe.directory" in stderr:
+            return GitPreflight(None, "git_trust_denied")
+        return GitPreflight(None, "workspace_not_git")
     try:
         raw_root = completed.stdout.strip()
         if not raw_root:
-            return None
+            return GitPreflight(None, "workspace_not_git")
         root = Path(raw_root).resolve()
     except (AttributeError, OSError, ValueError):
+        return GitPreflight(None, "workspace_not_git")
+    if root != cwd:
+        return GitPreflight(None, "workspace_not_root")
+    return GitPreflight(cwd, None)
+
+
+def _git_root(directory: str | Path | None = None) -> Path | None:
+    """Compatibility helper returning only a valid repository root."""
+    return _git_preflight(directory).root
+
+
+def _probe_cli_version(cli: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            [str(cli), "--version"],
+            cwd=str(cli.parent),
+            env=_child_environment(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            shell=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    return cwd if root == cwd else None
+    if completed.returncode != 0:
+        return None
+    version = completed.stdout.strip()
+    return version if _VERSION_RE.fullmatch(version) else None
 
 
 def _prompt(task: str, context: str, verification: str) -> str:
@@ -611,11 +755,11 @@ async def _collect_output(
 
 async def _run_cli(
     argv: list[str], cwd: Path, timeout_seconds: float | None = None
-) -> tuple[int | None, str, bool]:
+) -> CliRunResult:
     if os.name == "nt":
         command_line = subprocess.list2cmdline(argv)
         if len(command_line.encode("utf-16-le")) // 2 >= MAX_WINDOWS_COMMAND_LINE_UNITS:
-            return None, "", False
+            return CliRunResult(None, "", False, command_line_too_long=True)
     kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "env": _child_environment(),
@@ -631,7 +775,7 @@ async def _run_cli(
     try:
         process = await asyncio.create_subprocess_exec(*argv, **kwargs)
     except (OSError, ValueError):
-        return None, "", False
+        return CliRunResult(None, "", False)
 
     job = _create_windows_job(process.pid)
     communication = asyncio.create_task(_collect_output(process))
@@ -646,8 +790,10 @@ async def _run_cli(
             job = None
             await asyncio.to_thread(_kill_process_tree, process)
             await _finish_killed_process(process, communication)
-            return process.returncode, "", False
-        return process.returncode, stdout.decode("utf-8", errors="replace"), False
+            return CliRunResult(process.returncode, "", False, output_limit=True)
+        return CliRunResult(
+            process.returncode, stdout.decode("utf-8", errors="replace"), False
+        )
     except asyncio.TimeoutError:
         _close_windows_job(job)
         job = None
@@ -662,9 +808,11 @@ async def _run_cli(
             except OSError:
                 pass
             await _finish_killed_process(process, communication)
-            return process.returncode, "", True
+            return CliRunResult(process.returncode, "", True)
         await _finish_killed_process(process, communication)
-        return process.returncode, stdout.decode("utf-8", errors="replace"), True
+        return CliRunResult(
+            process.returncode, stdout.decode("utf-8", errors="replace"), True
+        )
     except asyncio.CancelledError:
         _close_windows_job(job)
         job = None
@@ -676,7 +824,7 @@ async def _run_cli(
         job = None
         await asyncio.to_thread(_kill_process_tree, process)
         await _finish_killed_process(process, communication)
-        return process.returncode, "", False
+        return CliRunResult(process.returncode, "", False)
     finally:
         _close_windows_job(job)
 
@@ -699,6 +847,11 @@ def _usage(payload: dict[str, Any]) -> dict[str, int | float]:
     return clean
 
 
+def _usage_info(payload: dict[str, Any]) -> tuple[dict[str, int | float], bool]:
+    raw = payload.get("usage")
+    return _usage(payload), isinstance(raw, dict)
+
+
 def _conversation_id(payload: dict[str, Any]) -> str | None:
     value = payload.get("conversation_id")
     if isinstance(value, str) and _SAFE_CONVERSATION_ID.fullmatch(value):
@@ -706,19 +859,43 @@ def _conversation_id(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _success_result(payload: dict[str, Any], level: str, mode: str) -> dict[str, Any]:
+def _conversation_id_info(payload: dict[str, Any]) -> tuple[str | None, bool]:
+    value = payload.get("conversation_id")
+    conversation_id = _conversation_id(payload)
+    return conversation_id, conversation_id is not None and isinstance(value, str)
+
+
+def _success_result(
+    payload: dict[str, Any], level: str, mode: str, *,
+    run_info: RunInfo, cli_version: str | None, exit_code: int | None,
+) -> dict[str, Any]:
     response = payload.get("response", "")
     if not isinstance(response, str):
         return _empty_result(
-            "ERROR", "Antigravity CLI returned an invalid response", level, mode
+            "ERROR", "Antigravity CLI returned an invalid response", level, mode,
+            error_type="invalid_response", run_info=run_info,
+            cli_version=cli_version, exit_code=exit_code,
         )
+    usage, usage_available = _usage_info(payload)
+    conversation_id, conversation_id_available = _conversation_id_info(payload)
     return _empty_result(
         "SUCCESS",
         response,
         level,
         mode,
-        conversation_id=_conversation_id(payload),
-        usage=_usage(payload),
+        conversation_id=conversation_id,
+        usage=usage,
+        run_info=run_info,
+        cli_version=cli_version,
+        exit_code=exit_code,
+        metadata_complete=(
+            "response" in payload
+            and usage_available
+            and conversation_id_available
+            and cli_version is not None
+        ),
+        usage_available=usage_available,
+        conversation_id_available=conversation_id_available,
     )
 
 
@@ -752,6 +929,14 @@ def _build_argv(
     return argv
 
 
+def _safe_exit_code(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _retryable(error_type: ErrorType | None, mode: str | None) -> bool:
+    return error_type == "workspace_lock_timeout" and mode == "plan"
+
+
 async def execute_with_antigravity_cli(
     *,
     workspace: Path,
@@ -759,20 +944,24 @@ async def execute_with_antigravity_cli(
     thinking_level: ThinkingLevel,
     mode: Mode,
     progress: ProgressCallback | None = None,
+    run_info: RunInfo | None = None,
 ) -> dict[str, Any]:
     """Execute one authenticated CLI process; also used by the live smoke."""
+    run = run_info or RunInfo()
     cli = _resolve_cli()
     if cli is None:
         return _empty_result(
-            "ERROR", "Antigravity CLI is not installed or unavailable", thinking_level, mode
+            "ERROR", "Antigravity CLI is not installed or unavailable", thinking_level, mode,
+            error_type="cli_unavailable", run_info=run,
         )
+    cli_version = await asyncio.to_thread(_probe_cli_version, cli)
     timeout_seconds = _timeout_seconds()
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     argv = _build_argv(
         cli, workspace, prompt, thinking_level, mode, timeout_seconds
     )
 
-    async def run_serialized() -> tuple[int | None, str, bool]:
+    async def run_serialized() -> CliRunResult:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise WorkspaceLockTimeout
@@ -780,7 +969,9 @@ async def execute_with_antigravity_cli(
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise WorkspaceLockTimeout
-            await _emit_progress(progress, "Antigravity CLI is running")
+            await _emit_progress(
+                progress, f"run_id={run.run_id} state=running"
+            )
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise WorkspaceLockTimeout
@@ -788,53 +979,108 @@ async def execute_with_antigravity_cli(
 
     heartbeat: asyncio.Task[None] | None = None
     try:
-        await _emit_progress(progress, "Antigravity CLI request queued")
+        await _emit_progress(progress, f"run_id={run.run_id} state=queued")
         if progress is not None:
-            heartbeat = asyncio.create_task(_progress_heartbeat(progress))
+            heartbeat = asyncio.create_task(
+                _progress_heartbeat(progress, run.run_id)
+            )
         # The lock and CLI share one deadline.  _run_cli owns its cancellation
         # cleanup, so a second outer wait_for would race the typed lock error.
-        returncode, stdout, timed_out = await run_serialized()
+        cli_result = await run_serialized()
+        if isinstance(cli_result, CliRunResult):
+            returncode = cli_result.returncode
+            stdout = cli_result.stdout
+            timed_out = cli_result.timed_out
+            command_line_too_long = cli_result.command_line_too_long
+            output_limit = cli_result.output_limit
+        else:
+            # Keep small test/integration fakes compatible with the old triple.
+            returncode, stdout, timed_out = cli_result
+            command_line_too_long = False
+            output_limit = False
     except asyncio.TimeoutError:
         logger.warning("Antigravity CLI timed out")
-        return _empty_result("ERROR", "Antigravity CLI timed out", thinking_level, mode)
+        return _empty_result(
+            "ERROR", "Antigravity CLI timed out", thinking_level, mode,
+            error_type="timeout", retryable=False, run_info=run,
+            cli_version=cli_version,
+        )
     except WorkspaceLockTimeout:
         logger.warning("Workspace lock timed out")
-        return _empty_result("ERROR", "Workspace lock timed out", thinking_level, mode)
+        return _empty_result(
+            "ERROR", "Workspace lock timed out", thinking_level, mode,
+            error_type="workspace_lock_timeout",
+            retryable=_retryable("workspace_lock_timeout", mode), run_info=run,
+            cli_version=cli_version,
+        )
     except WorkspaceLockError:
         logger.warning("Workspace lock could not be acquired")
-        return _empty_result("ERROR", "Workspace lock could not be acquired", thinking_level, mode)
+        return _empty_result(
+            "ERROR", "Workspace lock could not be acquired", thinking_level, mode,
+            error_type="workspace_lock_unavailable", run_info=run,
+            cli_version=cli_version,
+        )
     finally:
         if heartbeat is not None:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
+        run.finish()
 
     if timed_out:
         logger.warning("Antigravity CLI timed out")
-        return _empty_result("ERROR", "Antigravity CLI timed out", thinking_level, mode)
-    if returncode is None:
         return _empty_result(
-            "ERROR", "Antigravity CLI could not be started", thinking_level, mode
+            "ERROR", "Antigravity CLI timed out", thinking_level, mode,
+            error_type="timeout", run_info=run, cli_version=cli_version,
+            exit_code=_safe_exit_code(returncode),
         )
-    if len(stdout) > MAX_STDOUT_CHARS:
+    if returncode is None:
+        error_type: ErrorType = (
+            "command_line_too_long"
+            if command_line_too_long
+            else "spawn_failed"
+        )
+        message = (
+            "Antigravity CLI command line is too long"
+            if error_type == "command_line_too_long"
+            else "Antigravity CLI could not be started"
+        )
+        return _empty_result(
+            "ERROR", message, thinking_level, mode, error_type=error_type,
+            run_info=run, cli_version=cli_version,
+        )
+    if len(stdout) > MAX_STDOUT_CHARS or output_limit:
         logger.warning("Antigravity CLI response exceeded the wrapper limit")
         return _empty_result(
-            "ERROR", "Antigravity CLI response was too large", thinking_level, mode
+            "ERROR", "Antigravity CLI response was too large", thinking_level, mode,
+            error_type="output_limit", run_info=run, cli_version=cli_version,
+            exit_code=_safe_exit_code(returncode),
         )
     try:
         payload = json.loads(stdout.strip())
     except (json.JSONDecodeError, TypeError, ValueError):
         logger.warning("Antigravity CLI returned invalid JSON")
         return _empty_result(
-            "ERROR", "Antigravity CLI returned invalid JSON", thinking_level, mode
+            "ERROR", "Antigravity CLI returned invalid JSON", thinking_level, mode,
+            error_type="invalid_json", run_info=run, cli_version=cli_version,
+            exit_code=_safe_exit_code(returncode),
         )
     if not isinstance(payload, dict):
         return _empty_result(
-            "ERROR", "Antigravity CLI returned an invalid response", thinking_level, mode
+            "ERROR", "Antigravity CLI returned an invalid response", thinking_level, mode,
+            error_type="invalid_payload", run_info=run, cli_version=cli_version,
+            exit_code=_safe_exit_code(returncode),
         )
     if returncode != 0 or payload.get("status") != "SUCCESS":
         logger.warning("Antigravity CLI task failed")
-        return _empty_result("ERROR", "Antigravity CLI task failed", thinking_level, mode)
-    return _success_result(payload, thinking_level, mode)
+        return _empty_result(
+            "ERROR", "Antigravity CLI task failed", thinking_level, mode,
+            error_type="cli_error", run_info=run, cli_version=cli_version,
+            exit_code=_safe_exit_code(returncode),
+        )
+    return _success_result(
+        payload, thinking_level, mode, run_info=run,
+        cli_version=cli_version, exit_code=_safe_exit_code(returncode),
+    )
 
 
 @mcp.tool()
@@ -845,37 +1091,57 @@ async def antigravity_cli_execute(
     working_directory: Annotated[str, SkipValidation] = "",
     thinking_level: Annotated[ThinkingLevel, SkipValidation] = "medium",
     mode: Annotated[Mode, SkipValidation] = "plan",
-    ctx: Annotated[Context | None, SkipValidation] = None,
+    ctx: Context | None = None,
 ) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
+    run = RunInfo()
     if not isinstance(task, str) or not task.strip():
         return _tool_result(
-            _empty_result("ERROR", "task must be a non-empty string", thinking_level, mode)
+            _empty_result(
+                "ERROR", "task must be a non-empty string", thinking_level, mode,
+                error_type="invalid_request", run_info=run,
+            )
         )
     if not isinstance(context, str) or not isinstance(verification, str):
         return _tool_result(
-            _empty_result("ERROR", "context and verification must be strings", thinking_level, mode)
+            _empty_result(
+                "ERROR", "context and verification must be strings", thinking_level, mode,
+                error_type="invalid_request", run_info=run,
+            )
         )
     if not isinstance(working_directory, str):
         return _tool_result(
-            _empty_result("ERROR", "working_directory must be an existing Git root", thinking_level, mode)
+            _empty_result(
+                "ERROR", "working_directory must be an existing Git root", thinking_level, mode,
+                error_type="invalid_request", run_info=run,
+            )
         )
     if thinking_level not in THINKING_LEVELS:
         return _tool_result(
-            _empty_result("ERROR", "thinking_level must be low, medium, or high", None, mode)
+            _empty_result(
+                "ERROR", "thinking_level must be low, medium, or high", None, mode,
+                error_type="invalid_request", run_info=run,
+            )
         )
     if mode not in MODES:
         return _tool_result(
-            _empty_result("ERROR", "mode must be plan or accept-edits", thinking_level, None)
+            _empty_result(
+                "ERROR", "mode must be plan or accept-edits", thinking_level, None,
+                error_type="invalid_request", run_info=run,
+            )
         )
 
     prompt = _prompt(task.strip(), context.strip(), verification.strip())
     if len(prompt) > MAX_PROMPT_CHARS:
         return _tool_result(
-            _empty_result("ERROR", "task context is too large", thinking_level, mode)
+            _empty_result(
+                "ERROR", "task context is too large", thinking_level, mode,
+                error_type="invalid_request", run_info=run,
+            )
         )
 
-    workspace = _git_root(working_directory or None)
+    preflight = _git_preflight(working_directory or None)
+    workspace = preflight.root
     if workspace is None:
         message = (
             "working_directory must be an existing Git root"
@@ -883,7 +1149,10 @@ async def antigravity_cli_execute(
             else "current working directory must be a Git root"
         )
         return _tool_result(
-            _empty_result("ERROR", message, thinking_level, mode)
+            _empty_result(
+                "ERROR", message, thinking_level, mode,
+                error_type=preflight.error_type or "workspace_not_git", run_info=run,
+            )
         )
 
     progress_count = 0
@@ -903,6 +1172,7 @@ async def antigravity_cli_execute(
         thinking_level=thinking_level,
         mode=mode,
         progress=report_progress if ctx is not None else None,
+        run_info=run,
     )
     return _tool_result(result)
 
