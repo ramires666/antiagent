@@ -24,11 +24,16 @@ class AgyServerTest(unittest.TestCase):
             "gemini-3.7-flash-high",
         ])
         with patch("agy_server.Path.cwd", return_value=Path("C:/repo")), patch(
+            "agy_server._resolve_executable", return_value=Path("C:/Git/cmd/git.exe")
+        ), patch(
             "agy_server.subprocess.run",
             return_value=type("Completed", (), {"stdout": "C:/repo\n"})(),
         ) as run:
             self.assertEqual(server._git_root(), Path("C:/repo"))
-        self.assertEqual(run.call_args.args[0], ["git", "rev-parse", "--show-toplevel"])
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(Path("C:/Git/cmd/git.exe")), "rev-parse", "--show-toplevel"],
+        )
         self.assertFalse(run.call_args.kwargs["shell"])
 
     def test_validation_happens_before_cli_resolution(self):
@@ -96,29 +101,56 @@ class AgyServerTest(unittest.TestCase):
                 "ANTIGRAVITY_CLI_PATH": str(configured),
                 "LOCALAPPDATA": str(base),
             }, clear=True), patch(
-                "agy_server.shutil.which", return_value=str(discovered)
-            ) as which:
+                "agy_server._resolve_executable", return_value=discovered
+            ) as resolve:
                 self.assertEqual(server._resolve_cli(), configured.resolve())
-            which.assert_not_called()
+            resolve.assert_not_called()
 
             with patch.dict(os.environ, {
                 "ANTIGRAVITY_CLI_PATH": str(base / "missing.exe"),
-                "LOCALAPPDATA": str(base),
+                "LOCALAPPDATA": str(base / "missing-appdata"),
             }, clear=True), patch(
-                "agy_server.shutil.which", return_value=str(discovered)
-            ) as which:
+                "agy_server._resolve_executable", return_value=discovered
+            ) as resolve:
                 self.assertEqual(server._resolve_cli(), discovered.resolve())
-            which.assert_called_once_with("agy")
+            resolve.assert_called_once_with("agy")
 
             with patch.dict(os.environ, {"LOCALAPPDATA": str(base)}, clear=True), patch(
-                "agy_server.shutil.which", return_value=None
-            ):
+                "agy_server._resolve_executable", return_value=discovered
+            ) as resolve:
                 self.assertEqual(server._resolve_cli(), fallback.resolve())
+            resolve.assert_not_called()
 
             with patch.dict(os.environ, {}, clear=True), patch(
-                "agy_server.shutil.which", return_value=None
+                "agy_server._resolve_executable", return_value=None
             ):
                 self.assertIsNone(server._resolve_cli())
+
+    def test_relative_configured_cli_path_is_not_used(self):
+        with patch.dict(
+            os.environ,
+            {"ANTIGRAVITY_CLI_PATH": "agy.exe", "LOCALAPPDATA": ""},
+            clear=True,
+        ), patch("agy_server._resolve_executable", return_value=None) as resolve:
+            self.assertIsNone(server._resolve_cli())
+        resolve.assert_called_once_with("agy")
+
+    def test_windows_executable_resolution_skips_current_directory_and_relative_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            safe = base / "safe"
+            safe.mkdir()
+            (base / "agy.exe").touch()
+            expected = safe / "agy.exe"
+            expected.touch()
+            with patch("agy_server.os.name", "nt"), patch.dict(
+                os.environ,
+                {"PATH": f"{os.pathsep}{safe};relative", "PATHEXT": ".EXE"},
+                clear=False,
+            ), patch("agy_server.Path.cwd", return_value=base):
+                resolved = server._resolve_executable("agy")
+            self.assertEqual(resolved, expected.resolve())
+            self.assertTrue(resolved.is_absolute())
 
     def test_git_failures_and_non_root_are_rejected(self):
         for error in (OSError("missing"), subprocess.TimeoutExpired("git", 5)):
@@ -320,6 +352,24 @@ class AgyServerTest(unittest.TestCase):
                 result = asyncio.run(server._run_cli(["agy"], Path("C:/repo"), 1))
             self.assertEqual(result, (None, "", False))
             create_job.assert_not_called()
+
+    def test_windows_command_line_budget_is_checked_before_spawn(self):
+        argv = ["C:/bin/agy.exe", "-p", chr(0x1F600) * 20_000]
+        with patch("agy_server.os.name", "nt"), patch(
+            "agy_server.asyncio.create_subprocess_exec", new=AsyncMock()
+        ) as create, patch("agy_server._create_windows_job") as create_job:
+            result = asyncio.run(server._run_cli(argv, Path("C:/repo"), 1))
+        self.assertEqual(result, (None, "", False))
+        create.assert_not_awaited()
+        create_job.assert_not_called()
+
+        argv = ["C:/bin/agy.exe", "x" * server.MAX_WINDOWS_COMMAND_LINE_UNITS]
+        with patch("agy_server.os.name", "nt"), patch(
+            "agy_server.asyncio.create_subprocess_exec", new=AsyncMock()
+        ) as create:
+            result = asyncio.run(server._run_cli(argv, Path("C:/repo"), 1))
+        self.assertEqual(result, (None, "", False))
+        create.assert_not_awaited()
 
     def test_argv_has_sandbox_no_shell_and_low_medium_high(self):
         for level in ("low", "medium", "high"):
@@ -1037,12 +1087,16 @@ class AgyServerTest(unittest.TestCase):
         process = FakeProcess()
         completed = type("Completed", (), {"returncode": 1})()
         with patch("agy_server.os.name", "nt"), patch(
+            "agy_server._resolve_executable", return_value=Path("C:/Windows/System32/taskkill.exe")
+        ), patch(
             "agy_server.subprocess.run", return_value=completed
         ) as run:
             server._kill_process_tree(process)
         self.assertTrue(process.killed)
+        taskkill = Path(os.environ["SystemRoot"]) / "System32" / "taskkill.exe"
         self.assertEqual(
-            run.call_args.args[0], ["taskkill", "/PID", "77", "/T", "/F"]
+            run.call_args.args[0],
+            [str(taskkill), "/PID", "77", "/T", "/F"],
         )
         self.assertFalse(run.call_args.kwargs["shell"])
 
@@ -1058,6 +1112,8 @@ class AgyServerTest(unittest.TestCase):
         successful = FakeProcess()
         completed = type("Completed", (), {"returncode": 0})()
         with patch("agy_server.os.name", "nt"), patch(
+            "agy_server._resolve_executable", return_value=Path("C:/Windows/System32/taskkill.exe")
+        ), patch(
             "agy_server.subprocess.run", return_value=completed
         ):
             server._kill_process_tree(successful)
@@ -1065,6 +1121,8 @@ class AgyServerTest(unittest.TestCase):
 
         fallback = FakeProcess()
         with patch("agy_server.os.name", "nt"), patch(
+            "agy_server._resolve_executable", return_value=Path("C:/Windows/System32/taskkill.exe")
+        ), patch(
             "agy_server.subprocess.run", side_effect=OSError("taskkill unavailable")
         ):
             server._kill_process_tree(fallback)
@@ -1075,12 +1133,31 @@ class AgyServerTest(unittest.TestCase):
                 raise ProcessLookupError
 
         with patch("agy_server.os.name", "nt"), patch(
+            "agy_server._resolve_executable", return_value=Path("C:/Windows/System32/taskkill.exe")
+        ), patch(
             "agy_server.subprocess.run", side_effect=OSError
         ):
             server._kill_process_tree(GoneProcess())
         with patch("agy_server.os.name", "posix"), patch("agy_server.ctypes.WinDLL") as windll:
             server._close_windows_job(object())
         windll.assert_not_called()
+
+    def test_taskkill_uses_absolute_systemroot_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            system_root = Path(directory)
+            taskkill = system_root / "System32" / "taskkill.exe"
+            taskkill.parent.mkdir()
+            taskkill.touch()
+            process = type("Process", (), {"pid": 81, "returncode": None})()
+            completed = type("Completed", (), {"returncode": 0})()
+            with patch("agy_server.os.name", "nt"), patch.dict(
+                os.environ, {"SystemRoot": str(system_root)}, clear=False
+            ), patch("agy_server.subprocess.run", return_value=completed) as run:
+                server._kill_process_tree(process)
+            self.assertEqual(
+                run.call_args.args[0],
+                [str(taskkill.resolve()), "/PID", "81", "/T", "/F"],
+            )
 
     def test_taskkill_timeout_falls_back_to_process_kill(self):
         class FakeProcess:
@@ -1093,6 +1170,8 @@ class AgyServerTest(unittest.TestCase):
 
         process = FakeProcess()
         with patch("agy_server.os.name", "nt"), patch(
+            "agy_server._resolve_executable", return_value=Path("C:/Windows/System32/taskkill.exe")
+        ), patch(
             "agy_server.subprocess.run",
             side_effect=subprocess.TimeoutExpired(["taskkill"], 5),
         ) as run:
@@ -1123,6 +1202,15 @@ class AgyServerTest(unittest.TestCase):
         ), patch("agy_server.signal.SIGKILL", 9, create=True):
             server._kill_process_tree(fallback)
         self.assertTrue(fallback.killed)
+
+        class DeniedProcess(FakeProcess):
+            def kill(self):
+                raise OSError("access denied")
+
+        with patch("agy_server.os.name", "posix"), patch(
+            "agy_server.os.killpg", create=True, side_effect=OSError("no process group")
+        ), patch("agy_server.signal.SIGKILL", 9, create=True):
+            server._kill_process_tree(DeniedProcess())
 
     def test_finish_killed_process_swallows_reader_and_wait_failures_and_closes_transport(self):
         class Transport:

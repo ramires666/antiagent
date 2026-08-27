@@ -46,6 +46,7 @@ MAX_RESULT_CHARS = 30_000
 MAX_STDOUT_CHARS = 1_000_000
 MAX_STDERR_CHARS = 16_384
 MAX_PROMPT_CHARS = 24_000
+MAX_WINDOWS_COMMAND_LINE_UNITS = 32_767
 EXECUTION_LOCK = asyncio.Lock()
 _SAFE_CONVERSATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _SENSITIVE_ENV_NAME = re.compile(
@@ -177,24 +178,51 @@ def _empty_result(
     }
 
 
+def _resolve_executable(name: str) -> Path | None:
+    if os.name != "nt":
+        found = shutil.which(name)
+        if found:
+            path = Path(found)
+            if path.is_file():
+                return path.resolve()
+        return None
+
+    # Do not let Windows search the current directory before PATH entries.
+    path_entries = [
+        entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry
+    ]
+    extensions = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+    for entry in path_entries:
+        directory = Path(entry)
+        if not directory.is_absolute():
+            continue
+        candidates = [directory / name]
+        if not Path(name).suffix:
+            candidates.extend(
+                directory / f"{name}{extension}" for extension in extensions
+            )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
 def _resolve_cli() -> Path | None:
     configured = os.environ.get("ANTIGRAVITY_CLI_PATH", "").strip()
     if configured:
         path = Path(configured).expanduser()
-        if path.is_file():
-            return path.resolve()
-
-    found = shutil.which("agy")
-    if found:
-        path = Path(found)
-        if path.is_file():
+        if path.is_absolute() and path.is_file():
             return path.resolve()
 
     local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
     if local_app_data:
         path = Path(local_app_data) / "agy" / "bin" / "agy.exe"
-        if path.is_file():
+        if path.is_absolute() and path.is_file():
             return path.resolve()
+
+    path = _resolve_executable("agy")
+    if path is not None:
+        return path
     return None
 
 
@@ -210,8 +238,11 @@ def _git_root(directory: str | Path | None = None) -> Path | None:
             not cwd.is_relative_to(base) or not cwd.is_dir()
         ):
             return None
+        git = _resolve_executable("git")
+        if git is None:
+            return None
         completed = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+            [str(git), "rev-parse", "--show-toplevel"],
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -323,8 +354,14 @@ def _close_windows_job(job: wintypes.HANDLE | None) -> None:
 def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
     if os.name == "nt":
         try:
+            system_root = (
+                os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot", "")
+            ).strip()
+            taskkill = Path(system_root) / "System32" / "taskkill.exe"
+            if not system_root or not taskkill.is_absolute() or not taskkill.is_file():
+                raise OSError("taskkill unavailable")
             completed = subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
                 capture_output=True,
                 timeout=10,
                 check=False,
@@ -343,7 +380,7 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         try:
             process.kill()
-        except ProcessLookupError:
+        except OSError:
             pass
 
 
@@ -430,6 +467,10 @@ async def _collect_output(
 async def _run_cli(
     argv: list[str], cwd: Path, timeout_seconds: int | None = None
 ) -> tuple[int | None, str, bool]:
+    if os.name == "nt":
+        command_line = subprocess.list2cmdline(argv)
+        if len(command_line.encode("utf-16-le")) // 2 >= MAX_WINDOWS_COMMAND_LINE_UNITS:
+            return None, "", False
     kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "env": _child_environment(),
@@ -473,7 +514,7 @@ async def _run_cli(
         except Exception:
             try:
                 process.kill()
-            except ProcessLookupError:
+            except OSError:
                 pass
             await _finish_killed_process(process, communication)
             return process.returncode, "", True
