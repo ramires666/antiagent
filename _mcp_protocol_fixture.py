@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
+from pathlib import Path
 
 import agy_server
+from agent_manager import AgentStore
 
 CANCEL_SEEN = False
+FIXTURE_STATE = tempfile.TemporaryDirectory(prefix="antiagent-mcp-fixture-")
+agy_server._AGENT_STORE = AgentStore(
+    Path(FIXTURE_STATE.name) / "agents.sqlite3", owner_id="protocol-fixture"
+)
 
 
 async def _fake_run(argv, cwd, timeout_seconds):
@@ -31,7 +38,8 @@ async def _fake_run(argv, cwd, timeout_seconds):
 def _success(response):
     return (
         '{"status":"SUCCESS","response":"' + response
-        + '","usage":{"total_tokens":1},"conversation_id":"fixture-1"}'
+        + '","usage":{"total_tokens":1},'
+        '"conversation_id":"123e4567-e89b-12d3-a456-426614174000"}'
     )
 
 

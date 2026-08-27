@@ -25,7 +25,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple, cast
@@ -36,6 +36,8 @@ from pydantic import BaseModel, ConfigDict, SkipValidation
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+
+from agent_manager import AgentCapacityError, AgentSnapshot, AgentStore
 
 
 logging.basicConfig(
@@ -63,6 +65,7 @@ MAX_PROMPT_CHARS = 24_000
 MAX_WINDOWS_COMMAND_LINE_UNITS = 32_767
 _LOCK_DIRECTORY = Path(tempfile.gettempdir()) / "antiagent-workspace-locks"
 _SAFE_CONVERSATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_SAFE_AGENT_ID = re.compile(r"^[0-9a-f]{32}$")
 _INPUT_CONVERSATION_ID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -106,6 +109,37 @@ ErrorType = Literal[
     "review_state_unavailable",
 ]
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+AgentStatus = Literal["queued", "running", "completed", "failed", "interrupted"]
+AgentManagerErrorType = Literal[
+    "invalid_request",
+    "path_not_found",
+    "path_outside_allowed_root",
+    "workspace_not_git",
+    "workspace_not_root",
+    "git_trust_denied",
+    "git_unavailable",
+    "cli_unavailable",
+    "workspace_lock_timeout",
+    "workspace_lock_unavailable",
+    "command_line_too_long",
+    "spawn_failed",
+    "timeout",
+    "output_limit",
+    "invalid_json",
+    "invalid_payload",
+    "invalid_response",
+    "cli_error",
+    "review_required",
+    "review_state_unavailable",
+    "agent_not_found",
+    "invalid_state",
+    "state_unavailable",
+    "capacity_reached",
+]
+_TERMINAL_AGENT_STATUSES = ("completed", "failed", "interrupted")
+MAX_AGENT_WAIT_SECONDS = 60.0
+_AGENT_STORE: AgentStore | None = None
+_AGENT_TASKS: dict[str, asyncio.Task[None]] = {}
 
 
 def _timestamp() -> str:
@@ -352,6 +386,52 @@ class AntigravityCliOutput(BaseModel):
     requires_review: bool
 
 
+class AgentSnapshotOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str
+    parent_agent_id: str | None
+    workspace: str
+    thinking_level: str
+    mode: str
+    status: AgentStatus
+    cancel_requested: bool
+    conversation_id: str | None
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    updated_at: float
+    output: dict[str, Any] | None
+    manager_error: str | None
+
+
+class AgentOperationOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    agent: AgentSnapshotOutput | None
+    wait_timed_out: bool
+    error_type: AgentManagerErrorType | None
+
+
+class AgentListOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    agents: list[AgentSnapshotOutput]
+    error_type: AgentManagerErrorType | None
+
+
+@dataclass(frozen=True)
+class PreparedExecution:
+    workspace: Path
+    prompt: str
+    thinking_level: ThinkingLevel
+    mode: Mode
+    acknowledge_review: bool
+    conversation_id: str | None
+
+
 def _timeout_seconds() -> int:
     raw = os.environ.get("ANTIGRAVITY_CLI_TIMEOUT_SECONDS", "")
     if not raw:
@@ -464,6 +544,73 @@ def _tool_result(result: dict[str, Any]) -> AntigravityCliOutput:
             is_error=True,
         ),
     )
+
+
+def _agent_operation_result(
+    agent: AgentSnapshot | None = None,
+    *,
+    wait_timed_out: bool = False,
+    error_type: AgentManagerErrorType | None = None,
+    message: str = "",
+) -> AgentOperationOutput:
+    result = {
+        "ok": error_type is None,
+        "agent": asdict(agent) if agent is not None else None,
+        "wait_timed_out": wait_timed_out,
+        "error_type": error_type,
+    }
+    if error_type is None:
+        return cast(AgentOperationOutput, result)
+    return cast(
+        AgentOperationOutput,
+        CallToolResult(
+            content=[TextContent(type="text", text=message)],
+            structured_content=result,
+            is_error=True,
+        ),
+    )
+
+
+def _agent_list_result(
+    agents: list[AgentSnapshot] | None = None,
+    *,
+    error_type: AgentManagerErrorType | None = None,
+    message: str = "",
+) -> AgentListOutput:
+    result = {
+        "ok": error_type is None,
+        "agents": [asdict(agent) for agent in agents or []],
+        "error_type": error_type,
+    }
+    if error_type is None:
+        return cast(AgentListOutput, result)
+    return cast(
+        AgentListOutput,
+        CallToolResult(
+            content=[TextContent(type="text", text=message)],
+            structured_content=result,
+            is_error=True,
+        ),
+    )
+
+
+def _get_agent_store() -> AgentStore:
+    global _AGENT_STORE
+    if _AGENT_STORE is None:
+        _AGENT_STORE = AgentStore()
+        _AGENT_STORE.reconcile_stale(MAX_TIMEOUT_SECONDS + 60)
+    return _AGENT_STORE
+
+
+def _valid_agent_id(value: object) -> str | None:
+    return value if isinstance(value, str) and _SAFE_AGENT_ID.fullmatch(value) else None
+
+
+def _snapshot_in_scope(snapshot: AgentSnapshot) -> bool:
+    try:
+        return Path(snapshot.workspace).resolve().is_relative_to(Path.cwd().resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _resolve_executable(name: str) -> Path | None:
@@ -1096,6 +1243,79 @@ def _input_conversation_id(value: object) -> str | None:
     return value
 
 
+def _prepare_execution(
+    *,
+    task: object,
+    context: object,
+    verification: object,
+    working_directory: object,
+    thinking_level: object,
+    mode: object,
+    acknowledge_review: object,
+    conversation_id: object,
+    run_info: RunInfo,
+) -> tuple[PreparedExecution | None, dict[str, Any] | None]:
+    def invalid(
+        message: str,
+        level: str | None = cast(str | None, thinking_level),
+        selected_mode: str | None = cast(str | None, mode),
+    ) -> tuple[None, dict[str, Any]]:
+        return None, _empty_result(
+            "ERROR", message, level, selected_mode,
+            error_type="invalid_request", run_info=run_info,
+        )
+
+    if not isinstance(task, str) or not task.strip():
+        return invalid("task must be a non-empty string")
+    if not isinstance(context, str) or not isinstance(verification, str):
+        return invalid("context and verification must be strings")
+    if not isinstance(working_directory, str):
+        return invalid("working_directory must be an existing Git root")
+    if thinking_level not in THINKING_LEVELS:
+        return invalid(
+            "thinking_level must be low, medium, or high", None,
+            cast(str | None, mode),
+        )
+    if mode not in MODES:
+        return invalid(
+            "mode must be plan or accept-edits", cast(str, thinking_level), None,
+        )
+    if not isinstance(acknowledge_review, bool):
+        return invalid("acknowledge_review must be a boolean")
+    normalized_conversation_id: str | None = None
+    if conversation_id is not None:
+        normalized_conversation_id = _input_conversation_id(conversation_id)
+        if normalized_conversation_id is None:
+            return invalid("conversation_id must be a UUID")
+
+    prompt = _prompt(task.strip(), context.strip(), verification.strip())
+    if len(prompt) > MAX_PROMPT_CHARS:
+        return invalid("task context is too large")
+
+    preflight = _git_preflight(working_directory or None)
+    workspace = preflight.root
+    if workspace is None:
+        message = (
+            "working_directory must be an existing Git root"
+            if working_directory
+            else "current working directory must be a Git root"
+        )
+        return None, _empty_result(
+            "ERROR", message, cast(str, thinking_level), cast(str, mode),
+            error_type=preflight.error_type or "workspace_not_git",
+            run_info=run_info,
+        )
+
+    return PreparedExecution(
+        workspace=workspace,
+        prompt=prompt,
+        thinking_level=cast(ThinkingLevel, thinking_level),
+        mode=cast(Mode, mode),
+        acknowledge_review=acknowledge_review,
+        conversation_id=normalized_conversation_id,
+    ), None
+
+
 def _success_result(
     payload: dict[str, Any], level: str, mode: str, *,
     run_info: RunInfo, cli_version: str | None, exit_code: int | None,
@@ -1380,6 +1600,339 @@ async def execute_with_antigravity_cli(
     }
 
 
+async def _run_managed_agent(agent_id: str, prepared: PreparedExecution) -> None:
+    store = _get_agent_store()
+    execution: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        snapshot = store.get(agent_id)
+        if snapshot is None:
+            return
+        if snapshot.cancel_requested:
+            store.finish(agent_id, "interrupted", manager_error="cancelled")
+            return
+        snapshot = store.mark_running(agent_id)
+        if snapshot is None or snapshot.status != "running":
+            return
+        execution = asyncio.create_task(
+            execute_with_antigravity_cli(
+                workspace=prepared.workspace,
+                prompt=prepared.prompt,
+                thinking_level=prepared.thinking_level,
+                mode=prepared.mode,
+                acknowledge_review=prepared.acknowledge_review,
+                conversation_id=prepared.conversation_id,
+            )
+        )
+        while not execution.done():
+            await asyncio.wait({execution}, timeout=0.25)
+            if store.cancel_requested(agent_id):
+                execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
+                store.finish(agent_id, "interrupted", manager_error="cancelled")
+                return
+        result = await execution
+        status: AgentStatus = (
+            "completed" if result.get("status") == "SUCCESS" else "failed"
+        )
+        store.finish(
+            agent_id,
+            status,
+            output=result,
+            conversation_id=_input_conversation_id(result.get("conversation_id")),
+            manager_error=(
+                cast(str | None, result.get("error_type"))
+                if status == "failed"
+                else None
+            ),
+        )
+    except asyncio.CancelledError:
+        if execution is not None:
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
+        try:
+            store.finish(agent_id, "interrupted", manager_error="cancelled")
+        except Exception:
+            logger.warning("Managed agent cancellation state could not be persisted")
+    except Exception:
+        logger.warning("Managed agent failed before producing a result")
+        try:
+            store.finish(agent_id, "failed", manager_error="manager_error")
+        except Exception:
+            logger.warning("Managed agent failure state could not be persisted")
+    finally:
+        if _AGENT_TASKS.get(agent_id) is asyncio.current_task():
+            _AGENT_TASKS.pop(agent_id, None)
+
+
+def _forget_managed_agent(agent_id: str, task: asyncio.Task[None]) -> None:
+    if _AGENT_TASKS.get(agent_id) is task:
+        _AGENT_TASKS.pop(agent_id, None)
+    if task.cancelled():
+        try:
+            _get_agent_store().finish(
+                agent_id, "interrupted", manager_error="cancelled"
+            )
+        except Exception:
+            logger.warning("Managed agent cancellation state could not be persisted")
+
+
+def _schedule_managed_agent(
+    prepared: PreparedExecution,
+    *,
+    parent_agent_id: str | None = None,
+) -> AgentSnapshot:
+    store = _get_agent_store()
+    snapshot = store.create(
+        workspace=prepared.workspace,
+        thinking_level=prepared.thinking_level,
+        mode=prepared.mode,
+        parent_agent_id=parent_agent_id,
+        conversation_id=prepared.conversation_id,
+    )
+    task = asyncio.create_task(
+        _run_managed_agent(snapshot.agent_id, prepared)
+    )
+    _AGENT_TASKS[snapshot.agent_id] = task
+    task.add_done_callback(
+        lambda done, agent_id=snapshot.agent_id: _forget_managed_agent(
+            agent_id, done
+        )
+    )
+    return snapshot
+
+
+def _scoped_agent(agent_id: object) -> tuple[AgentSnapshot | None, AgentOperationOutput | None]:
+    normalized = _valid_agent_id(agent_id)
+    if normalized is None:
+        return None, _agent_operation_result(
+            error_type="invalid_request",
+            message="agent_id must be a 32-character lowercase hexadecimal ID",
+        )
+    try:
+        snapshot = _get_agent_store().get(normalized)
+    except Exception:
+        return None, _agent_operation_result(
+            error_type="state_unavailable", message="Agent state is unavailable"
+        )
+    if snapshot is None or not _snapshot_in_scope(snapshot):
+        return None, _agent_operation_result(
+            error_type="agent_not_found", message="Agent was not found"
+        )
+    return snapshot, None
+
+
+@mcp.tool()
+async def antigravity_agent_spawn(
+    task: Annotated[str, SkipValidation],
+    context: Annotated[str, SkipValidation] = "",
+    verification: Annotated[str, SkipValidation] = "",
+    working_directory: Annotated[str, SkipValidation] = "",
+    thinking_level: Annotated[ThinkingLevel, SkipValidation] = "medium",
+    mode: Annotated[Mode, SkipValidation] = "plan",
+    acknowledge_review: Annotated[bool, SkipValidation] = False,
+) -> AgentOperationOutput:
+    """Start a durable Antigravity task and immediately return its agent ID."""
+    prepared, error = _prepare_execution(
+        task=task,
+        context=context,
+        verification=verification,
+        working_directory=working_directory,
+        thinking_level=thinking_level,
+        mode=mode,
+        acknowledge_review=acknowledge_review,
+        conversation_id=None,
+        run_info=RunInfo(),
+    )
+    if prepared is None:
+        assert error is not None
+        return _agent_operation_result(
+            error_type=cast(AgentManagerErrorType, error["error_type"]),
+            message=cast(str, error["result"]),
+        )
+    try:
+        return _agent_operation_result(_schedule_managed_agent(prepared))
+    except AgentCapacityError:
+        return _agent_operation_result(
+            error_type="capacity_reached", message="Active agent limit reached"
+        )
+    except Exception:
+        return _agent_operation_result(
+            error_type="state_unavailable", message="Agent state is unavailable"
+        )
+
+
+@mcp.tool()
+async def antigravity_agent_status(
+    agent_id: Annotated[str, SkipValidation],
+) -> AgentOperationOutput:
+    """Return the durable snapshot and terminal result for one agent."""
+    snapshot, error = _scoped_agent(agent_id)
+    return error or _agent_operation_result(snapshot)
+
+
+@mcp.tool()
+async def antigravity_agent_list(
+    status: Annotated[AgentStatus | None, SkipValidation] = None,
+    working_directory: Annotated[str, SkipValidation] = "",
+    limit: Annotated[int, SkipValidation] = 20,
+) -> AgentListOutput:
+    """List recent Antigravity agents in one allowed Git workspace."""
+    if status is not None and status not in (
+        "queued", "running", "completed", "failed", "interrupted"
+    ):
+        return _agent_list_result(
+            error_type="invalid_request", message="Invalid agent status"
+        )
+    if not isinstance(working_directory, str) or (
+        not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100
+    ):
+        return _agent_list_result(
+            error_type="invalid_request",
+            message="working_directory must be a string and limit must be 1..100",
+        )
+    preflight = _git_preflight(working_directory or None)
+    if preflight.root is None:
+        return _agent_list_result(
+            error_type=cast(
+                AgentManagerErrorType,
+                preflight.error_type or "workspace_not_git",
+            ),
+            message="working_directory must be an existing Git root",
+        )
+    try:
+        agents = _get_agent_store().list(
+            status=cast(AgentStatus | None, status),
+            workspace=preflight.root,
+            limit=limit,
+        )
+        return _agent_list_result(agents)
+    except Exception:
+        return _agent_list_result(
+            error_type="state_unavailable", message="Agent state is unavailable"
+        )
+
+
+@mcp.tool()
+async def antigravity_agent_wait(
+    agent_id: Annotated[str, SkipValidation],
+    timeout_seconds: Annotated[float, SkipValidation] = 30.0,
+) -> AgentOperationOutput:
+    """Wait up to 60 seconds for an agent to reach a terminal state."""
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not math.isfinite(timeout_seconds)
+        or not 0 <= timeout_seconds <= MAX_AGENT_WAIT_SECONDS
+    ):
+        return _agent_operation_result(
+            error_type="invalid_request", message="timeout_seconds must be 0..60"
+        )
+    snapshot, error = _scoped_agent(agent_id)
+    if error is not None:
+        return error
+    assert snapshot is not None
+    deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
+    while snapshot.status not in _TERMINAL_AGENT_STATUSES:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return _agent_operation_result(snapshot, wait_timed_out=True)
+        await asyncio.sleep(min(0.2, remaining))
+        snapshot, error = _scoped_agent(agent_id)
+        if error is not None:
+            return error
+        assert snapshot is not None
+    return _agent_operation_result(snapshot)
+
+
+@mcp.tool()
+async def antigravity_agent_interrupt(
+    agent_id: Annotated[str, SkipValidation],
+) -> AgentOperationOutput:
+    """Request idempotent cancellation and stop a locally owned agent now."""
+    snapshot, error = _scoped_agent(agent_id)
+    if error is not None:
+        return error
+    assert snapshot is not None
+    if snapshot.status in _TERMINAL_AGENT_STATUSES:
+        return _agent_operation_result(snapshot)
+    try:
+        store = _get_agent_store()
+        snapshot = store.request_cancel(snapshot.agent_id)
+        if snapshot is None:
+            return _agent_operation_result(
+                error_type="agent_not_found", message="Agent was not found"
+            )
+        task = _AGENT_TASKS.get(snapshot.agent_id)
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        refreshed = store.finish(
+            snapshot.agent_id, "interrupted", manager_error="cancelled"
+        )
+        return _agent_operation_result(refreshed)
+    except Exception:
+        return _agent_operation_result(
+            error_type="state_unavailable", message="Agent state is unavailable"
+        )
+
+
+@mcp.tool()
+async def antigravity_agent_followup(
+    agent_id: Annotated[str, SkipValidation],
+    task: Annotated[str, SkipValidation],
+    context: Annotated[str, SkipValidation] = "",
+    verification: Annotated[str, SkipValidation] = "",
+    thinking_level: Annotated[ThinkingLevel | None, SkipValidation] = None,
+    mode: Annotated[Mode, SkipValidation] = "plan",
+    acknowledge_review: Annotated[bool, SkipValidation] = False,
+) -> AgentOperationOutput:
+    """Continue a terminal agent's authenticated Antigravity conversation."""
+    parent, error = _scoped_agent(agent_id)
+    if error is not None:
+        return error
+    assert parent is not None
+    if parent.status not in _TERMINAL_AGENT_STATUSES or parent.conversation_id is None:
+        return _agent_operation_result(
+            error_type="invalid_state",
+            message="Follow-up requires a terminal agent with a conversation ID",
+        )
+    prepared, validation_error = _prepare_execution(
+        task=task,
+        context=context,
+        verification=verification,
+        working_directory=parent.workspace,
+        thinking_level=(
+            parent.thinking_level if thinking_level is None else thinking_level
+        ),
+        mode=mode,
+        acknowledge_review=acknowledge_review,
+        conversation_id=parent.conversation_id,
+        run_info=RunInfo(),
+    )
+    if prepared is None:
+        assert validation_error is not None
+        return _agent_operation_result(
+            error_type=cast(
+                AgentManagerErrorType, validation_error["error_type"]
+            ),
+            message=cast(str, validation_error["result"]),
+        )
+    try:
+        return _agent_operation_result(
+            _schedule_managed_agent(
+                prepared, parent_agent_id=parent.agent_id
+            )
+        )
+    except AgentCapacityError:
+        return _agent_operation_result(
+            error_type="capacity_reached", message="Active agent limit reached"
+        )
+    except Exception:
+        return _agent_operation_result(
+            error_type="state_unavailable", message="Agent state is unavailable"
+        )
+
+
 @mcp.tool()
 async def antigravity_cli_execute(
     task: Annotated[str, SkipValidation],
@@ -1394,81 +1947,20 @@ async def antigravity_cli_execute(
 ) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
     run = RunInfo()
-    if not isinstance(task, str) or not task.strip():
-        return _tool_result(
-            _empty_result(
-                "ERROR", "task must be a non-empty string", thinking_level, mode,
-                error_type="invalid_request", run_info=run,
-            )
-        )
-    if not isinstance(context, str) or not isinstance(verification, str):
-        return _tool_result(
-            _empty_result(
-                "ERROR", "context and verification must be strings", thinking_level, mode,
-                error_type="invalid_request", run_info=run,
-            )
-        )
-    if not isinstance(working_directory, str):
-        return _tool_result(
-            _empty_result(
-                "ERROR", "working_directory must be an existing Git root", thinking_level, mode,
-                error_type="invalid_request", run_info=run,
-            )
-        )
-    if thinking_level not in THINKING_LEVELS:
-        return _tool_result(
-            _empty_result(
-                "ERROR", "thinking_level must be low, medium, or high", None, mode,
-                error_type="invalid_request", run_info=run,
-            )
-        )
-    if mode not in MODES:
-        return _tool_result(
-            _empty_result(
-                "ERROR", "mode must be plan or accept-edits", thinking_level, None,
-                error_type="invalid_request", run_info=run,
-            )
-        )
-    if not isinstance(acknowledge_review, bool):
-        return _tool_result(
-            _empty_result(
-                "ERROR", "acknowledge_review must be a boolean", thinking_level, mode,
-                error_type="invalid_request", run_info=run,
-            )
-        )
-    if conversation_id is not None:
-        conversation_id = _input_conversation_id(conversation_id)
-        if conversation_id is None:
-            return _tool_result(
-                _empty_result(
-                    "ERROR", "conversation_id must be a UUID", thinking_level, mode,
-                    error_type="invalid_request", run_info=run,
-                )
-            )
-
-    prompt = _prompt(task.strip(), context.strip(), verification.strip())
-    if len(prompt) > MAX_PROMPT_CHARS:
-        return _tool_result(
-            _empty_result(
-                "ERROR", "task context is too large", thinking_level, mode,
-                error_type="invalid_request", run_info=run,
-            )
-        )
-
-    preflight = _git_preflight(working_directory or None)
-    workspace = preflight.root
-    if workspace is None:
-        message = (
-            "working_directory must be an existing Git root"
-            if working_directory
-            else "current working directory must be a Git root"
-        )
-        return _tool_result(
-            _empty_result(
-                "ERROR", message, thinking_level, mode,
-                error_type=preflight.error_type or "workspace_not_git", run_info=run,
-            )
-        )
+    prepared, error = _prepare_execution(
+        task=task,
+        context=context,
+        verification=verification,
+        working_directory=working_directory,
+        thinking_level=thinking_level,
+        mode=mode,
+        acknowledge_review=acknowledge_review,
+        conversation_id=conversation_id,
+        run_info=run,
+    )
+    if prepared is None:
+        assert error is not None
+        return _tool_result(error)
 
     progress_count = 0
     progress_lock = asyncio.Lock()
@@ -1482,14 +1974,14 @@ async def antigravity_cli_execute(
             await ctx.report_progress(progress_count, None, message)
 
     result = await execute_with_antigravity_cli(
-        workspace=workspace,
-        prompt=prompt,
-        thinking_level=thinking_level,
-        mode=mode,
+        workspace=prepared.workspace,
+        prompt=prepared.prompt,
+        thinking_level=prepared.thinking_level,
+        mode=prepared.mode,
         progress=report_progress if ctx is not None else None,
         run_info=run,
-        acknowledge_review=acknowledge_review,
-        conversation_id=conversation_id,
+        acknowledge_review=prepared.acknowledge_review,
+        conversation_id=prepared.conversation_id,
     )
     return _tool_result(result)
 

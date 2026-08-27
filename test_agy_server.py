@@ -1920,6 +1920,170 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(schema["properties"]["mode"]["enum"], ["plan", "accept-edits"])
         self.assertEqual(schema["properties"]["mode"]["default"], "plan")
 
+    def test_managed_agent_spawn_wait_followup_list_and_persistence(self):
+        conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+
+        async def scenario(store):
+            calls = []
+
+            async def execute(**kwargs):
+                calls.append(kwargs)
+                return {
+                    "status": "SUCCESS",
+                    "result": "managed-ok",
+                    "conversation_id": conversation_id,
+                }
+
+            workspace = Path.cwd().resolve()
+            with patch.object(server, "_AGENT_STORE", store), patch(
+                "agy_server._git_preflight",
+                return_value=server.GitPreflight(workspace, None),
+            ), patch(
+                "agy_server.execute_with_antigravity_cli", new=execute
+            ):
+                spawned = await server.antigravity_agent_spawn(
+                    "managed task", thinking_level="low", mode="accept-edits"
+                )
+                agent_id = spawned["agent"]["agent_id"]
+                self.assertEqual(spawned["agent"]["status"], "queued")
+                waited = await server.antigravity_agent_wait(agent_id, 2)
+                self.assertEqual(waited["agent"]["status"], "completed")
+                self.assertEqual(waited["agent"]["output"]["result"], "managed-ok")
+
+                followup = await server.antigravity_agent_followup(agent_id, "continue")
+                child_id = followup["agent"]["agent_id"]
+                child = await server.antigravity_agent_wait(child_id, 2)
+                self.assertEqual(child["agent"]["parent_agent_id"], agent_id)
+                self.assertEqual(calls[0]["mode"], "accept-edits")
+                self.assertEqual(calls[1]["mode"], "plan")
+                self.assertEqual(calls[1]["conversation_id"], conversation_id)
+
+                listed = await server.antigravity_agent_list(limit=10)
+                self.assertEqual(
+                    {item["agent_id"] for item in listed["agents"]},
+                    {agent_id, child_id},
+                )
+                return agent_id
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agents.sqlite3"
+            store = server.AgentStore(path, owner_id="lifecycle-test")
+            agent_id = asyncio.run(scenario(store))
+            store.close()
+            restored = server.AgentStore(path, owner_id="lifecycle-test")
+            self.assertEqual(restored.get(agent_id).status, "completed")
+            restored.close()
+        self.assertFalse(server._AGENT_TASKS)
+
+    def test_managed_agent_wait_timeout_and_interrupt(self):
+        async def scenario(store):
+            started = asyncio.Event()
+            cancelled = asyncio.Event()
+
+            async def execute(**_kwargs):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            workspace = Path.cwd().resolve()
+            with patch.object(server, "_AGENT_STORE", store), patch(
+                "agy_server._git_preflight",
+                return_value=server.GitPreflight(workspace, None),
+            ), patch(
+                "agy_server.execute_with_antigravity_cli", new=execute
+            ):
+                spawned = await server.antigravity_agent_spawn("slow managed task")
+                agent_id = spawned["agent"]["agent_id"]
+                await asyncio.wait_for(started.wait(), timeout=1)
+                timed_out = await server.antigravity_agent_wait(agent_id, 0.01)
+                self.assertTrue(timed_out["wait_timed_out"])
+                interrupted = await server.antigravity_agent_interrupt(agent_id)
+                self.assertEqual(interrupted["agent"]["status"], "interrupted")
+                self.assertTrue(interrupted["agent"]["cancel_requested"])
+                self.assertTrue(cancelled.is_set())
+                repeated = await server.antigravity_agent_interrupt(agent_id)
+                self.assertEqual(repeated["agent"]["status"], "interrupted")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = server.AgentStore(
+                Path(directory) / "agents.sqlite3", owner_id="interrupt-test"
+            )
+            asyncio.run(scenario(store))
+            store.close()
+        self.assertFalse(server._AGENT_TASKS)
+
+    def test_managed_agent_immediate_and_cross_store_interrupt(self):
+        async def scenario(primary, peer):
+            cancelled = asyncio.Event()
+
+            async def execute(**_kwargs):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            workspace = Path.cwd().resolve()
+            with patch.object(server, "_AGENT_STORE", primary), patch(
+                "agy_server._git_preflight",
+                return_value=server.GitPreflight(workspace, None),
+            ), patch(
+                "agy_server.execute_with_antigravity_cli", new=execute
+            ):
+                immediate = await server.antigravity_agent_spawn("cancel immediately")
+                immediate_id = immediate["agent"]["agent_id"]
+                stopped = await server.antigravity_agent_interrupt(immediate_id)
+                self.assertEqual(stopped["agent"]["status"], "interrupted")
+
+                spawned = await server.antigravity_agent_spawn("cross-store cancel")
+                agent_id = spawned["agent"]["agent_id"]
+                for _ in range(20):
+                    if primary.get(agent_id).status == "running":
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(primary.get(agent_id).status, "running")
+                peer.request_cancel(agent_id)
+                waited = await server.antigravity_agent_wait(agent_id, 2)
+                self.assertEqual(waited["agent"]["status"], "interrupted")
+                self.assertTrue(cancelled.is_set())
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agents.sqlite3"
+            primary = server.AgentStore(path, owner_id="cross-store-test")
+            peer = server.AgentStore(path, owner_id="cross-store-test")
+            asyncio.run(scenario(primary, peer))
+            peer.close()
+            primary.close()
+        self.assertFalse(server._AGENT_TASKS)
+
+    def test_managed_agent_validation_and_workspace_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = server.AgentStore(
+                Path(directory) / "agents.sqlite3", owner_id="validation-test"
+            )
+            with patch.object(server, "_AGENT_STORE", store), patch(
+                "agy_server._git_preflight"
+            ) as preflight:
+                invalid = asyncio.run(server.antigravity_agent_spawn(""))
+                invalid_id = asyncio.run(server.antigravity_agent_status("bad"))
+            self.assertTrue(result_data(invalid).get("error_type") == "invalid_request")
+            self.assertTrue(
+                result_data(invalid_id).get("error_type") == "invalid_request"
+            )
+            preflight.assert_not_called()
+
+            outside = store.create(
+                workspace=Path(directory), thinking_level="low", mode="plan"
+            )
+            with patch.object(server, "_AGENT_STORE", store):
+                hidden = asyncio.run(server.antigravity_agent_status(outside.agent_id))
+            self.assertEqual(result_data(hidden)["error_type"], "agent_not_found")
+            store.finish(outside.agent_id, "interrupted")
+            store.close()
+
     def test_context_progress_is_monotonic(self):
         class FakeContext:
             calls = []

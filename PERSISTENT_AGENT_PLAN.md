@@ -112,10 +112,10 @@ Terminal states неизменяемы. Follow-up создаёт новый `age
 
 ### 3. Lifecycle MCP API
 
-- [ ] Добавить шесть lifecycle tools.
-- [ ] Реализовать background execution, bounded wait и cross-process cancel flag.
-- [ ] Реализовать follow-up через `--conversation`.
-- [ ] Проверить raw STDIO `tools/list` и реальные последовательности
+- [x] Добавить шесть lifecycle tools.
+- [x] Реализовать background execution, bounded wait и cross-process cancel flag.
+- [x] Реализовать follow-up через `--conversation`.
+- [x] Проверить raw STDIO `tools/list` и реальные последовательности
   spawn/status/wait/followup/interrupt.
 
 ### 4. Codex custom agent и правила маршрутизации

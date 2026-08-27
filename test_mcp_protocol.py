@@ -16,6 +16,30 @@ ROOT = Path(__file__).resolve().parent
 SERVER = ROOT / "agy_server.py"
 FIXTURE = ROOT / "_mcp_protocol_fixture.py"
 TOOL_NAME = "antigravity_cli_execute"
+LIFECYCLE_TOOLS = {
+    "antigravity_agent_spawn",
+    "antigravity_agent_status",
+    "antigravity_agent_list",
+    "antigravity_agent_wait",
+    "antigravity_agent_interrupt",
+    "antigravity_agent_followup",
+}
+AGENT_FIELDS = {
+    "agent_id",
+    "parent_agent_id",
+    "workspace",
+    "thinking_level",
+    "mode",
+    "status",
+    "cancel_requested",
+    "conversation_id",
+    "created_at",
+    "started_at",
+    "finished_at",
+    "updated_at",
+    "output",
+    "manager_error",
+}
 INPUT_FIELDS = {
     "task",
     "context",
@@ -90,8 +114,13 @@ class MCPProtocolTest(unittest.TestCase):
                         self.assertIsNotNone(initialized.capabilities.tools)
 
                         listed = await session.list_tools()
-                        self.assertEqual([tool.name for tool in listed.tools], [TOOL_NAME])
-                        tool = listed.tools[0]
+                        self.assertEqual(
+                            {tool.name for tool in listed.tools},
+                            LIFECYCLE_TOOLS | {TOOL_NAME},
+                        )
+                        tool = next(
+                            tool for tool in listed.tools if tool.name == TOOL_NAME
+                        )
                         schema = tool.input_schema
                         self.assertEqual(set(schema["properties"]), INPUT_FIELDS)
                         self.assertEqual(schema["required"], ["task"])
@@ -304,6 +333,113 @@ class MCPProtocolTest(unittest.TestCase):
                         )
                         self.assertFalse(result.is_error)
                         self.assertEqual(result.structured_content["result"], "fixture-ok")
+
+        asyncio.run(scenario())
+
+    def test_real_stdio_agent_lifecycle(self):
+        async def scenario():
+            params = self._server_parameters(ROOT, trust_repo=True)
+            with open(os.devnull, "w", encoding="utf-8") as errlog:
+                async with stdio_client(params, errlog=errlog) as (read, write):
+                    async with ClientSession(
+                        read, write, read_timeout_seconds=5.0
+                    ) as session:
+                        await session.initialize()
+                        spawned = await session.call_tool(
+                            "antigravity_agent_spawn",
+                            {"task": "managed protocol probe", "mode": "plan"},
+                        )
+                        self.assertFalse(spawned.is_error)
+                        agent_id = spawned.structured_content["agent"]["agent_id"]
+                        self.assertEqual(len(agent_id), 32)
+                        self.assertEqual(
+                            set(spawned.structured_content["agent"]), AGENT_FIELDS
+                        )
+                        self.assertNotIn(
+                            "managed protocol probe", repr(spawned.structured_content)
+                        )
+
+                        waited = await session.call_tool(
+                            "antigravity_agent_wait",
+                            {"agent_id": agent_id, "timeout_seconds": 2},
+                        )
+                        self.assertFalse(waited.is_error)
+                        self.assertEqual(
+                            waited.structured_content["agent"]["status"], "completed"
+                        )
+                        self.assertEqual(
+                            waited.structured_content["agent"]["output"]["result"],
+                            "fixture-ok",
+                        )
+
+                        followup = await session.call_tool(
+                            "antigravity_agent_followup",
+                            {"agent_id": agent_id, "task": "follow-up protocol probe"},
+                        )
+                        self.assertFalse(followup.is_error)
+                        child_id = followup.structured_content["agent"]["agent_id"]
+                        child = await session.call_tool(
+                            "antigravity_agent_wait",
+                            {"agent_id": child_id, "timeout_seconds": 2},
+                        )
+                        self.assertEqual(
+                            child.structured_content["agent"]["parent_agent_id"],
+                            agent_id,
+                        )
+
+                        listed = await session.call_tool(
+                            "antigravity_agent_list", {"limit": 10}
+                        )
+                        self.assertFalse(listed.is_error)
+                        self.assertEqual(
+                            {item["agent_id"] for item in listed.structured_content["agents"]},
+                            {agent_id, child_id},
+                        )
+
+                        slow = await session.call_tool(
+                            "antigravity_agent_spawn",
+                            {"task": "slow protocol probe", "mode": "plan"},
+                        )
+                        slow_id = slow.structured_content["agent"]["agent_id"]
+                        interrupted = await session.call_tool(
+                            "antigravity_agent_interrupt", {"agent_id": slow_id}
+                        )
+                        self.assertFalse(interrupted.is_error)
+                        self.assertEqual(
+                            interrupted.structured_content["agent"]["status"],
+                            "interrupted",
+                        )
+
+                        missing = await session.call_tool(
+                            "antigravity_agent_status", {"agent_id": "bad"}
+                        )
+                        self.assertTrue(missing.is_error)
+                        self.assertEqual(
+                            missing.structured_content["error_type"], "invalid_request"
+                        )
+
+                        secret = "LIFECYCLE_SENTINEL_SECRET"
+                        for tool_name, arguments in (
+                            (
+                                "antigravity_agent_spawn",
+                                {"task": "x", "context": {"secret": secret}},
+                            ),
+                            (
+                                "antigravity_agent_status",
+                                {"agent_id": {"secret": secret}},
+                            ),
+                            (
+                                "antigravity_agent_wait",
+                                {"agent_id": agent_id, "timeout_seconds": secret},
+                            ),
+                        ):
+                            redacted = await session.call_tool(tool_name, arguments)
+                            self.assertTrue(redacted.is_error)
+                            self.assertNotIn(
+                                secret,
+                                repr(redacted.content)
+                                + repr(redacted.structured_content),
+                            )
 
         asyncio.run(scenario())
 
