@@ -24,6 +24,7 @@ INPUT_FIELDS = {
     "mode",
     "working_directory",
     "acknowledge_review",
+    "conversation_id",
 }
 OUTPUT_FIELDS = {
     "status",
@@ -118,6 +119,9 @@ class MCPProtocolTest(unittest.TestCase):
                         )
                         self.assertFalse(
                             schema["properties"]["acknowledge_review"]["default"]
+                        )
+                        self.assertIsNone(
+                            schema["properties"]["conversation_id"]["default"]
                         )
                         self.assertIsNotNone(tool.output_schema)
                         assert tool.output_schema is not None
@@ -236,6 +240,7 @@ class MCPProtocolTest(unittest.TestCase):
                             {"task": "x", "thinking_level": secret},
                             {"task": "x", "working_directory": {"secret": secret}},
                             {"task": "x", "acknowledge_review": {"secret": secret}},
+                            {"task": "x", "conversation_id": {"secret": secret}},
                         ):
                             with self.subTest(arguments=redacted_arguments):
                                 redacted = await session.call_tool(

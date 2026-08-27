@@ -401,6 +401,45 @@ class AgyServerTest(unittest.TestCase):
         self.assertIsNone(server._parse_git_status(b"bad\0"))
         self.assertIsNone(server._parse_git_status(b" M truncated.py"))
 
+    def test_build_argv_adds_only_validated_conversation_id(self):
+        conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+        argv = server._build_argv(
+            Path("C:/bin/agy.exe"), Path("C:/repo"), "PROMPT", "low", "plan", 10,
+            conversation_id,
+        )
+        self.assertEqual(argv[-2:], ["--conversation", conversation_id])
+        self.assertNotIn("--conversation", server._build_argv(
+            Path("C:/bin/agy.exe"), Path("C:/repo"), "PROMPT", "low", "plan", 10
+        ))
+
+    def test_handler_rejects_non_uuid_conversation_id_before_git(self):
+        with patch("agy_server._git_preflight") as preflight, patch(
+            "agy_server._resolve_cli"
+        ) as resolve_cli:
+            result = asyncio.run(server.antigravity_cli_execute(
+                "x", conversation_id="conversation-1"
+            ))
+        data = result_data(result)
+        self.assertEqual(data["error_type"], "invalid_request")
+        self.assertIn("conversation_id", data["result"])
+        preflight.assert_not_called()
+        resolve_cli.assert_not_called()
+
+    def test_handler_passes_valid_conversation_id_to_executor(self):
+        conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+        expected = {"status": "SUCCESS"}
+        with patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
+            "agy_server.execute_with_antigravity_cli", new=AsyncMock(return_value=expected)
+        ) as execute:
+            result = asyncio.run(server.antigravity_cli_execute(
+                "x", conversation_id=conversation_id
+            ))
+        self.assertEqual(result, expected)
+        self.assertEqual(execute.await_args.kwargs["conversation_id"], conversation_id)
+
     def test_git_status_snapshot_rejects_oversized_output_without_exposing_it(self):
         def run(*_args, stdout, **kwargs):
             self.assertIs(kwargs["stderr"], subprocess.DEVNULL)

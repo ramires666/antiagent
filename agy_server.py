@@ -63,6 +63,10 @@ MAX_PROMPT_CHARS = 24_000
 MAX_WINDOWS_COMMAND_LINE_UNITS = 32_767
 _LOCK_DIRECTORY = Path(tempfile.gettempdir()) / "antiagent-workspace-locks"
 _SAFE_CONVERSATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_INPUT_CONVERSATION_ID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 _SENSITIVE_ENV_NAME = re.compile(
     r"(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)", re.IGNORECASE
 )
@@ -1082,6 +1086,16 @@ def _conversation_id_info(payload: dict[str, Any]) -> tuple[str | None, bool]:
     return conversation_id, conversation_id is not None and isinstance(value, str)
 
 
+def _input_conversation_id(value: object) -> str | None:
+    if not isinstance(value, str) or not _INPUT_CONVERSATION_ID.fullmatch(value):
+        return None
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None
+    return value
+
+
 def _success_result(
     payload: dict[str, Any], level: str, mode: str, *,
     run_info: RunInfo, cli_version: str | None, exit_code: int | None,
@@ -1123,6 +1137,7 @@ def _build_argv(
     thinking_level: str,
     mode: str,
     timeout_seconds: int,
+    conversation_id: str | None = None,
 ) -> list[str]:
     argv = [
         str(cli),
@@ -1143,6 +1158,8 @@ def _build_argv(
         "--add-dir",
         str(workspace),
     ]
+    if conversation_id is not None:
+        argv.extend(("--conversation", conversation_id))
     return argv
 
 
@@ -1163,9 +1180,15 @@ async def execute_with_antigravity_cli(
     progress: ProgressCallback | None = None,
     run_info: RunInfo | None = None,
     acknowledge_review: bool = False,
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute one authenticated CLI process; also used by the live smoke."""
     run = run_info or RunInfo()
+    if conversation_id is not None and _input_conversation_id(conversation_id) is None:
+        return _empty_result(
+            "ERROR", "conversation_id must be a UUID", thinking_level, mode,
+            error_type="invalid_request", run_info=run,
+        )
     cli = _resolve_cli()
     if cli is None:
         return _empty_result(
@@ -1176,7 +1199,8 @@ async def execute_with_antigravity_cli(
     timeout_seconds = _timeout_seconds()
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     argv = _build_argv(
-        cli, workspace, prompt, thinking_level, mode, timeout_seconds
+        cli, workspace, prompt, thinking_level, mode, timeout_seconds,
+        conversation_id,
     )
 
     async def run_serialized() -> tuple[object, PostflightInfo]:
@@ -1365,6 +1389,7 @@ async def antigravity_cli_execute(
     thinking_level: Annotated[ThinkingLevel, SkipValidation] = "medium",
     mode: Annotated[Mode, SkipValidation] = "plan",
     acknowledge_review: Annotated[bool, SkipValidation] = False,
+    conversation_id: Annotated[str | None, SkipValidation] = None,
     ctx: Context | None = None,
 ) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
@@ -1411,6 +1436,15 @@ async def antigravity_cli_execute(
                 error_type="invalid_request", run_info=run,
             )
         )
+    if conversation_id is not None:
+        conversation_id = _input_conversation_id(conversation_id)
+        if conversation_id is None:
+            return _tool_result(
+                _empty_result(
+                    "ERROR", "conversation_id must be a UUID", thinking_level, mode,
+                    error_type="invalid_request", run_info=run,
+                )
+            )
 
     prompt = _prompt(task.strip(), context.strip(), verification.strip())
     if len(prompt) > MAX_PROMPT_CHARS:
@@ -1455,6 +1489,7 @@ async def antigravity_cli_execute(
         progress=report_progress if ctx is not None else None,
         run_info=run,
         acknowledge_review=acknowledge_review,
+        conversation_id=conversation_id,
     )
     return _tool_result(result)
 
