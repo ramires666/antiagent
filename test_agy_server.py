@@ -16,7 +16,89 @@ from unittest.mock import AsyncMock, patch
 import agy_server as server
 
 
+_LOCK_WORKER = r'''
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+import agy_server
+
+
+async def main():
+    root, lock_directory, marker, mode, hold, timeout = sys.argv[1:]
+    agy_server._LOCK_DIRECTORY = Path(lock_directory)
+    lock = agy_server.WorkspaceLock(Path(root))
+    try:
+        await lock.acquire(float(timeout))
+    except agy_server.WorkspaceLockTimeout:
+        Path(marker).write_text("timeout", encoding="ascii")
+        return
+    except agy_server.WorkspaceLockError:
+        Path(marker).write_text("error", encoding="ascii")
+        return
+    Path(marker).write_text("acquired", encoding="ascii")
+    if mode == "crash":
+        os._exit(0)
+    try:
+        await asyncio.sleep(float(hold))
+    finally:
+        lock.release()
+
+
+asyncio.run(main())
+'''
+
+
 class AgyServerTest(unittest.TestCase):
+    @staticmethod
+    def _start_lock_worker(root, lock_directory, marker, *, mode="hold", hold=0, timeout=1):
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _LOCK_WORKER,
+                str(root),
+                str(lock_directory),
+                str(marker),
+                mode,
+                str(hold),
+                str(timeout),
+            ],
+            cwd=str(Path(__file__).resolve().parent),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _wait_for_lock_marker(self, process, marker, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if marker.exists():
+                value = marker.read_text(encoding="ascii")
+                if value:
+                    return value
+            if process.poll() is not None:
+                _, stderr = process.communicate()
+                self.fail(f"lock worker exited before marker: {stderr}")
+            time.sleep(0.02)
+        self.fail("lock worker did not signal readiness")
+
+    @staticmethod
+    def _stop_lock_worker(process):
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+        if process.stderr is not None:
+            process.stderr.close()
+
     def test_model_mapping_and_git_root(self):
         self.assertEqual([server._model_for(x) for x in ("low", "medium", "high")], [
             "gemini-3.7-flash-low",
@@ -492,6 +574,150 @@ class AgyServerTest(unittest.TestCase):
             ))
         self.assertEqual(oversized["result"], "Antigravity CLI response was too large")
 
+    def test_workspace_lock_is_canonical_nonblocking_and_persistent(self):
+        async def scenario(lock_directory):
+            with patch("agy_server._LOCK_DIRECTORY", lock_directory):
+                root = Path(lock_directory) / "repo"
+                root.mkdir(parents=True)
+                first = server.WorkspaceLock(root)
+                equivalent = server.WorkspaceLock(root / ".")
+                self.assertEqual(first.path, equivalent.path)
+                await first.acquire(0)
+                self.assertTrue(first.path.exists())
+                with self.assertRaises(server.WorkspaceLockBusy):
+                    await equivalent.acquire(0)
+                first.release()
+                await equivalent.acquire(0.2)
+                equivalent.release()
+                self.assertTrue(first.path.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory) / "locks"))
+
+    def test_workspace_lock_cancellation_does_not_leave_acquired_lock(self):
+        async def scenario(lock_directory):
+            with patch("agy_server._LOCK_DIRECTORY", lock_directory):
+                root = Path(lock_directory) / "repo"
+                root.mkdir(parents=True)
+                holder = server.WorkspaceLock(root)
+                waiter = server.WorkspaceLock(root)
+                await holder.acquire(0)
+                task = asyncio.create_task(waiter.acquire(5))
+                await asyncio.sleep(0.06)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                holder.release()
+                await waiter.acquire(0.2)
+                waiter.release()
+
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(scenario(Path(directory) / "locks"))
+
+    def test_workspace_lock_multiprocess_contention_and_crash_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            lock_directory = base / "locks"
+            root = base / "repo"
+            root.mkdir()
+            owner_marker = base / "owner"
+            owner = self._start_lock_worker(
+                root, lock_directory, owner_marker, hold=3, timeout=3
+            )
+            contender = None
+            crash = None
+            recovery = None
+            try:
+                self.assertEqual(self._wait_for_lock_marker(owner, owner_marker), "acquired")
+                contender_marker = base / "contender"
+                contender = self._start_lock_worker(
+                    root, lock_directory, contender_marker, timeout=0.3
+                )
+                self.assertEqual(
+                    self._wait_for_lock_marker(contender, contender_marker), "timeout"
+                )
+                self.assertIsNone(owner.poll())
+                self.assertEqual(owner.wait(timeout=4), 0)
+            finally:
+                if contender is not None:
+                    self._stop_lock_worker(contender)
+                self._stop_lock_worker(owner)
+
+            crash_marker = base / "crash"
+            crash = self._start_lock_worker(
+                root, lock_directory, crash_marker, mode="crash", timeout=2
+            )
+            try:
+                self.assertEqual(
+                    self._wait_for_lock_marker(crash, crash_marker), "acquired"
+                )
+                self.assertEqual(crash.wait(timeout=3), 0)
+
+                recovery_marker = base / "recovery"
+                recovery = self._start_lock_worker(
+                    root, lock_directory, recovery_marker, hold=0.01, timeout=1
+                )
+                self.assertEqual(
+                    self._wait_for_lock_marker(recovery, recovery_marker), "acquired"
+                )
+                self.assertEqual(recovery.wait(timeout=3), 0)
+            finally:
+                for process in (crash, recovery):
+                    if process is not None:
+                        self._stop_lock_worker(process)
+
+    def test_workspace_lock_multiprocess_distinct_roots_run_in_parallel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            lock_directory = base / "locks"
+            root_one = base / "repo-one"
+            root_two = base / "repo-two"
+            root_one.mkdir()
+            root_two.mkdir()
+            first_marker = base / "first"
+            second_marker = base / "second"
+            first = self._start_lock_worker(
+                root_one, lock_directory, first_marker, hold=3, timeout=3
+            )
+            second = None
+            try:
+                self.assertEqual(self._wait_for_lock_marker(first, first_marker), "acquired")
+                second = self._start_lock_worker(
+                    root_two, lock_directory, second_marker, hold=0.01, timeout=1
+                )
+                self.assertEqual(
+                    self._wait_for_lock_marker(second, second_marker), "acquired"
+                )
+                self.assertIsNone(first.poll())
+                self.assertEqual(first.wait(timeout=4), 0)
+                self.assertEqual(second.wait(timeout=3), 0)
+                self.assertNotEqual(
+                    server._workspace_lock_path(root_one),
+                    server._workspace_lock_path(root_two),
+                )
+            finally:
+                self._stop_lock_worker(first)
+                if second is not None:
+                    self._stop_lock_worker(second)
+
+    def test_workspace_lock_path_failure_is_safe_result(self):
+        async def run(*_args):
+            self.fail("CLI must not run when workspace lock setup fails")
+
+        with tempfile.TemporaryDirectory() as directory:
+            bad_directory = Path(directory) / "not-a-directory"
+            bad_directory.write_text("file", encoding="ascii")
+            with patch("agy_server._LOCK_DIRECTORY", bad_directory), patch(
+                "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+            ), patch("agy_server._timeout_seconds", return_value=0.1), patch(
+                "agy_server._run_cli", new=run
+            ):
+                result = asyncio.run(server.execute_with_antigravity_cli(
+                    workspace=Path("C:/repo"), prompt="x",
+                    thinking_level="low", mode="plan",
+                ))
+        self.assertEqual(result["result"], "Workspace lock could not be acquired")
+
     def test_outer_timeout_releases_execution_lock(self):
         async def scenario():
             calls = 0
@@ -500,14 +726,13 @@ class AgyServerTest(unittest.TestCase):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
-                    await asyncio.Event().wait()
+                    await asyncio.sleep(_args[-1])
+                    return 0, "", True
                 return 0, '{"status":"SUCCESS","response":"after timeout"}', False
 
             with patch("agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")), patch(
                 "agy_server._timeout_seconds", return_value=0.01
-            ), patch("agy_server._run_cli", new=run), patch(
-                "agy_server.EXECUTION_LOCK", asyncio.Lock()
-            ):
+            ), patch("agy_server._run_cli", new=run):
                 first = await server.execute_with_antigravity_cli(
                     workspace=Path("C:/repo"), prompt="x",
                     thinking_level="low", mode="plan",
@@ -525,32 +750,33 @@ class AgyServerTest(unittest.TestCase):
 
     def test_timeout_while_waiting_for_lock_then_next_call_succeeds(self):
         async def scenario():
-            lock = asyncio.Lock()
-            await lock.acquire()
-            run = AsyncMock(return_value=(
-                0, '{"status":"SUCCESS","response":"after release"}', False
-            ))
-            with patch("agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")), patch(
-                "agy_server._timeout_seconds", return_value=0.01
-            ), patch("agy_server._run_cli", new=run), patch(
-                "agy_server.EXECUTION_LOCK", lock
-            ):
-                try:
-                    blocked = await server.execute_with_antigravity_cli(
+            with tempfile.TemporaryDirectory() as directory:
+                run = AsyncMock(return_value=(
+                    0, '{"status":"SUCCESS","response":"after release"}', False
+                ))
+                with patch("agy_server._LOCK_DIRECTORY", Path(directory)), patch(
+                    "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+                ), patch("agy_server._timeout_seconds", return_value=0.01), patch(
+                    "agy_server._run_cli", new=run
+                ):
+                    lock = server.WorkspaceLock(Path("C:/repo"))
+                    await lock.acquire(0)
+                    try:
+                        blocked = await server.execute_with_antigravity_cli(
+                            workspace=Path("C:/repo"), prompt="x",
+                            thinking_level="low", mode="plan",
+                        )
+                        calls_while_locked = run.await_count
+                    finally:
+                        lock.release()
+                    recovered = await server.execute_with_antigravity_cli(
                         workspace=Path("C:/repo"), prompt="x",
                         thinking_level="low", mode="plan",
                     )
-                    calls_while_locked = run.await_count
-                finally:
-                    lock.release()
-                recovered = await server.execute_with_antigravity_cli(
-                    workspace=Path("C:/repo"), prompt="x",
-                    thinking_level="low", mode="plan",
-                )
             return blocked, calls_while_locked, recovered, run.await_count
 
         blocked, calls_while_locked, recovered, total_calls = asyncio.run(scenario())
-        self.assertEqual(blocked["result"], "Antigravity CLI timed out")
+        self.assertEqual(blocked["result"], "Workspace lock timed out")
         self.assertEqual(calls_while_locked, 0)
         self.assertEqual(recovered["result"], "after release")
         self.assertEqual(total_calls, 1)
@@ -598,7 +824,8 @@ class AgyServerTest(unittest.TestCase):
 
             async def run(*_args):
                 if timeout:
-                    await asyncio.Event().wait()
+                    await asyncio.sleep(_args[-1])
+                    return 0, "", True
                 await started.wait()
                 return 0, '{"status":"SUCCESS","response":"ok"}', False
 
@@ -609,7 +836,7 @@ class AgyServerTest(unittest.TestCase):
                 "agy_server._timeout_seconds", return_value=0.01 if timeout else 1
             ), patch("agy_server._progress_heartbeat", new=heartbeat), patch(
                 "agy_server._run_cli", new=run
-            ), patch("agy_server.EXECUTION_LOCK", asyncio.Lock()):
+            ):
                 result = await server.execute_with_antigravity_cli(
                     workspace=Path("C:/repo"), prompt="x", thinking_level="low",
                     mode="plan", progress=progress,

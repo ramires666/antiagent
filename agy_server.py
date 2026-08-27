@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
+import hashlib
 import json
 import logging
 import math
@@ -15,8 +17,11 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
+from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -47,7 +52,7 @@ MAX_STDOUT_CHARS = 1_000_000
 MAX_STDERR_CHARS = 16_384
 MAX_PROMPT_CHARS = 24_000
 MAX_WINDOWS_COMMAND_LINE_UNITS = 32_767
-EXECUTION_LOCK = asyncio.Lock()
+_LOCK_DIRECTORY = Path(tempfile.gettempdir()) / "antiagent-workspace-locks"
 _SAFE_CONVERSATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _SENSITIVE_ENV_NAME = re.compile(
     r"(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)", re.IGNORECASE
@@ -65,6 +70,121 @@ _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+class WorkspaceLockError(RuntimeError):
+    """Base class for the per-workspace inter-process lock."""
+
+
+class WorkspaceLockBusy(WorkspaceLockError):
+    """The workspace lock is currently held by another process."""
+
+
+class WorkspaceLockTimeout(WorkspaceLockError):
+    """The workspace lock was not acquired before the deadline."""
+
+
+def _workspace_lock_path(root: Path) -> Path:
+    try:
+        canonical = os.path.normcase(os.path.realpath(os.fspath(root)))
+        _LOCK_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name != "nt":
+            directory_stat = _LOCK_DIRECTORY.lstat()
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise OSError("workspace lock directory is not a directory")
+            if directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o077:
+                raise OSError("workspace lock directory is not private")
+        digest = hashlib.sha256(os.fsencode(canonical)).hexdigest()
+        return _LOCK_DIRECTORY / f"{digest}.lock"
+    except (AttributeError, OSError, TypeError, ValueError):
+        # Do not expose a temporary-directory path through the MCP result.
+        raise WorkspaceLockError from None
+
+
+class WorkspaceLock:
+    def __init__(self, root: Path):
+        self.path = _workspace_lock_path(root)
+        self._fd: int | None = None
+
+    def _try_acquire(self) -> None:
+        try:
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            raise WorkspaceLockError from None
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            if os.name == "nt":
+                import msvcrt
+
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    if exc.errno in (errno.EACCES, errno.EAGAIN):
+                        raise WorkspaceLockBusy from exc
+                    raise WorkspaceLockError from exc
+            else:
+                import fcntl
+
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise WorkspaceLockError from exc
+                    raise WorkspaceLockBusy from exc
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        self._fd = fd
+
+    async def acquire(self, timeout: float) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            try:
+                self._try_acquire()
+                return
+            except WorkspaceLockBusy:
+                if timeout <= 0:
+                    raise
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise WorkspaceLockTimeout from None
+                await asyncio.sleep(min(0.05, remaining))
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+@asynccontextmanager
+async def locked_workspace(root: Path, timeout: float):
+    lock = WorkspaceLock(root)
+    await lock.acquire(timeout)
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class _IoCounters(ctypes.Structure):
@@ -465,7 +585,7 @@ async def _collect_output(
 
 
 async def _run_cli(
-    argv: list[str], cwd: Path, timeout_seconds: int | None = None
+    argv: list[str], cwd: Path, timeout_seconds: float | None = None
 ) -> tuple[int | None, str, bool]:
     if os.name == "nt":
         command_line = subprocess.list2cmdline(argv)
@@ -622,26 +742,42 @@ async def execute_with_antigravity_cli(
             "ERROR", "Antigravity CLI is not installed or unavailable", thinking_level, mode
         )
     timeout_seconds = _timeout_seconds()
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
     argv = _build_argv(
         cli, workspace, prompt, thinking_level, mode, timeout_seconds
     )
 
     async def run_serialized() -> tuple[int | None, str, bool]:
-        async with EXECUTION_LOCK:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise WorkspaceLockTimeout
+        async with locked_workspace(workspace, remaining):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise WorkspaceLockTimeout
             await _emit_progress(progress, "Antigravity CLI is running")
-            return await _run_cli(argv, workspace, timeout_seconds)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise WorkspaceLockTimeout
+            return await _run_cli(argv, workspace, remaining)
 
     heartbeat: asyncio.Task[None] | None = None
     try:
         await _emit_progress(progress, "Antigravity CLI request queued")
         if progress is not None:
             heartbeat = asyncio.create_task(_progress_heartbeat(progress))
-        returncode, stdout, timed_out = await asyncio.wait_for(
-            run_serialized(), timeout=timeout_seconds
-        )
+        # The lock and CLI share one deadline.  _run_cli owns its cancellation
+        # cleanup, so a second outer wait_for would race the typed lock error.
+        returncode, stdout, timed_out = await run_serialized()
     except asyncio.TimeoutError:
         logger.warning("Antigravity CLI timed out")
         return _empty_result("ERROR", "Antigravity CLI timed out", thinking_level, mode)
+    except WorkspaceLockTimeout:
+        logger.warning("Workspace lock timed out")
+        return _empty_result("ERROR", "Workspace lock timed out", thinking_level, mode)
+    except WorkspaceLockError:
+        logger.warning("Workspace lock could not be acquired")
+        return _empty_result("ERROR", "Workspace lock could not be acquired", thinking_level, mode)
     finally:
         if heartbeat is not None:
             heartbeat.cancel()
