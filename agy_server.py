@@ -24,10 +24,11 @@ import tempfile
 from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from ctypes import wintypes
-from pydantic import BaseModel, ConfigDict
+from mcp.types import CallToolResult, TextContent
+from pydantic import BaseModel, ConfigDict, SkipValidation
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
@@ -48,6 +49,7 @@ MODES = ("plan", "accept-edits")
 DEFAULT_TIMEOUT_SECONDS = 840
 MAX_TIMEOUT_SECONDS = 3600
 MAX_RESULT_CHARS = 30_000
+TRUNCATION_MARKER = "\n\n[Antigravity result truncated by MCP wrapper]"
 MAX_STDOUT_CHARS = 1_000_000
 MAX_STDERR_CHARS = 16_384
 MAX_PROMPT_CHARS = 24_000
@@ -285,10 +287,20 @@ def _empty_result(
     conversation_id: str | None = None,
     usage: dict[str, int | float] | None = None,
 ) -> dict[str, Any]:
-    truncated = len(result) > MAX_RESULT_CHARS
+    if len(result) <= MAX_RESULT_CHARS:
+        safe_result, truncated = result, False
+    elif MAX_RESULT_CHARS <= len(TRUNCATION_MARKER):
+        safe_result, truncated = TRUNCATION_MARKER[:MAX_RESULT_CHARS], True
+    else:
+        available = MAX_RESULT_CHARS - len(TRUNCATION_MARKER)
+        head_size = (available + 1) // 2
+        tail_size = available - head_size
+        tail = result[-tail_size:] if tail_size else ""
+        safe_result = result[:head_size] + TRUNCATION_MARKER + tail
+        truncated = True
     return {
         "status": status,
-        "result": result[:MAX_RESULT_CHARS],
+        "result": safe_result,
         "model": _model_for(level) if level in THINKING_LEVELS else None,
         "thinking_level": level if level in THINKING_LEVELS else None,
         "mode": mode if mode in MODES else None,
@@ -296,6 +308,19 @@ def _empty_result(
         "conversation_id": conversation_id,
         "result_truncated": truncated,
     }
+
+
+def _tool_result(result: dict[str, Any]) -> AntigravityCliOutput:
+    if result.get("status") != "ERROR":
+        return cast(AntigravityCliOutput, result)
+    return cast(
+        AntigravityCliOutput,
+        CallToolResult(
+            content=[TextContent(type="text", text=result["result"])],
+            structured_content=result,
+            is_error=True,
+        ),
+    )
 
 
 def _resolve_executable(name: str) -> Path | None:
@@ -814,30 +839,40 @@ async def execute_with_antigravity_cli(
 
 @mcp.tool()
 async def antigravity_cli_execute(
-    task: str,
-    context: str = "",
-    verification: str = "",
-    working_directory: str = "",
-    thinking_level: ThinkingLevel = "medium",
-    mode: Mode = "accept-edits",
-    ctx: Context | None = None,
+    task: Annotated[str, SkipValidation],
+    context: Annotated[str, SkipValidation] = "",
+    verification: Annotated[str, SkipValidation] = "",
+    working_directory: Annotated[str, SkipValidation] = "",
+    thinking_level: Annotated[ThinkingLevel, SkipValidation] = "medium",
+    mode: Annotated[Mode, SkipValidation] = "plan",
+    ctx: Annotated[Context | None, SkipValidation] = None,
 ) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
     if not isinstance(task, str) or not task.strip():
-        return _empty_result("ERROR", "task must be a non-empty string", thinking_level, mode)
+        return _tool_result(
+            _empty_result("ERROR", "task must be a non-empty string", thinking_level, mode)
+        )
     if not isinstance(context, str) or not isinstance(verification, str):
-        return _empty_result("ERROR", "context and verification must be strings", thinking_level, mode)
+        return _tool_result(
+            _empty_result("ERROR", "context and verification must be strings", thinking_level, mode)
+        )
     if not isinstance(working_directory, str):
-        return _empty_result("ERROR", "working_directory must be an existing Git root", thinking_level, mode)
+        return _tool_result(
+            _empty_result("ERROR", "working_directory must be an existing Git root", thinking_level, mode)
+        )
     if thinking_level not in THINKING_LEVELS:
-        return _empty_result("ERROR", "thinking_level must be low, medium, or high", None, mode)
+        return _tool_result(
+            _empty_result("ERROR", "thinking_level must be low, medium, or high", None, mode)
+        )
     if mode not in MODES:
-        return _empty_result("ERROR", "mode must be plan or accept-edits", thinking_level, None)
+        return _tool_result(
+            _empty_result("ERROR", "mode must be plan or accept-edits", thinking_level, None)
+        )
 
     prompt = _prompt(task.strip(), context.strip(), verification.strip())
     if len(prompt) > MAX_PROMPT_CHARS:
-        return _empty_result(
-            "ERROR", "task context is too large", thinking_level, mode
+        return _tool_result(
+            _empty_result("ERROR", "task context is too large", thinking_level, mode)
         )
 
     workspace = _git_root(working_directory or None)
@@ -847,7 +882,9 @@ async def antigravity_cli_execute(
             if working_directory
             else "current working directory must be a Git root"
         )
-        return _empty_result("ERROR", message, thinking_level, mode)
+        return _tool_result(
+            _empty_result("ERROR", message, thinking_level, mode)
+        )
 
     progress_count = 0
     progress_lock = asyncio.Lock()
@@ -860,13 +897,32 @@ async def antigravity_cli_execute(
             progress_count += 1
             await ctx.report_progress(progress_count, None, message)
 
-    return await execute_with_antigravity_cli(
+    result = await execute_with_antigravity_cli(
         workspace=workspace,
         prompt=prompt,
         thinking_level=thinking_level,
         mode=mode,
         progress=report_progress if ctx is not None else None,
     )
+    return _tool_result(result)
+
+
+async def _redact_tool_validation_error(ctx, call_next):
+    result = await call_next(ctx)
+    if (
+        ctx.method == "tools/call"
+        and isinstance(result, dict)
+        and result.get("isError") is True
+        and "structuredContent" not in result
+    ):
+        return {
+            **result,
+            "content": [{"type": "text", "text": "Invalid tool arguments"}],
+        }
+    return result
+
+
+mcp.middleware.append(_redact_tool_validation_error)
 
 
 if __name__ == "__main__":

@@ -97,7 +97,7 @@ class MCPProtocolTest(unittest.TestCase):
                         )
                         self.assertEqual(
                             schema["properties"]["mode"]["default"],
-                            "accept-edits",
+                            "plan",
                         )
                         self.assertIsNotNone(tool.output_schema)
                         assert tool.output_schema is not None
@@ -154,25 +154,70 @@ class MCPProtocolTest(unittest.TestCase):
                             ],
                         )
 
+                        default_mode = await session.call_tool(
+                            TOOL_NAME, {"task": "default mode protocol probe"}
+                        )
+                        self.assertFalse(default_mode.is_error)
+                        self.assertEqual(
+                            default_mode.structured_content["result"],
+                            "default-mode-plan",
+                        )
+
                         unknown = await session.call_tool("missing", {})
                         self.assertTrue(unknown.is_error)
-                        self.assertIn("Unknown tool", unknown.content[0].text)
+                        self.assertEqual(unknown.content[0].text, "Invalid tool arguments")
+                        self.assertIsNone(unknown.structured_content)
 
                         missing = await session.call_tool(TOOL_NAME, {})
                         self.assertTrue(missing.is_error)
-                        self.assertIn("Field required", missing.content[0].text)
+                        self.assertEqual(missing.content[0].text, "Invalid tool arguments")
+                        self.assertIsNone(missing.structured_content)
+
+                        missing_secret = await session.call_tool(
+                            TOOL_NAME, {"context": {"secret": "PROTOCOL_SENTINEL_SECRET"}}
+                        )
+                        self.assertTrue(missing_secret.is_error)
+                        self.assertEqual(
+                            missing_secret.content[0].text, "Invalid tool arguments"
+                        )
+                        self.assertIsNone(missing_secret.structured_content)
+                        self.assertNotIn(
+                            "PROTOCOL_SENTINEL_SECRET", repr(missing_secret.content)
+                        )
 
                         wrong_type = await session.call_tool(
                             TOOL_NAME, {"task": 123}
                         )
                         self.assertTrue(wrong_type.is_error)
-                        self.assertIn("valid string", wrong_type.content[0].text)
+                        self.assertIn("non-empty string", wrong_type.content[0].text)
+                        self.assertEqual(
+                            set(wrong_type.structured_content), OUTPUT_FIELDS
+                        )
 
                         wrong_context = await session.call_tool(
                             TOOL_NAME, {"task": "x", "context": 123}
                         )
                         self.assertTrue(wrong_context.is_error)
                         self.assertIn("context", wrong_context.content[0].text)
+                        self.assertEqual(
+                            set(wrong_context.structured_content), OUTPUT_FIELDS
+                        )
+
+                        secret = "PROTOCOL_SENTINEL_SECRET"
+                        for redacted_arguments in (
+                            {"task": "x", "context": {"secret": secret}},
+                            {"task": "x", "thinking_level": secret},
+                            {"task": "x", "working_directory": {"secret": secret}},
+                        ):
+                            with self.subTest(arguments=redacted_arguments):
+                                redacted = await session.call_tool(
+                                    TOOL_NAME, redacted_arguments
+                                )
+                                self.assertTrue(redacted.is_error)
+                                wire_text = repr(redacted.content) + repr(
+                                    redacted.structured_content
+                                )
+                                self.assertNotIn(secret, wire_text)
 
                         invalid_enum = await session.call_tool(
                             TOOL_NAME,
@@ -182,6 +227,9 @@ class MCPProtocolTest(unittest.TestCase):
                         self.assertIn("low", invalid_enum.content[0].text)
                         self.assertIn("medium", invalid_enum.content[0].text)
                         self.assertIn("high", invalid_enum.content[0].text)
+                        self.assertEqual(
+                            set(invalid_enum.structured_content), OUTPUT_FIELDS
+                        )
 
                         invalid_mode = await session.call_tool(
                             TOOL_NAME,
@@ -190,6 +238,9 @@ class MCPProtocolTest(unittest.TestCase):
                         self.assertTrue(invalid_mode.is_error)
                         self.assertIn("plan", invalid_mode.content[0].text)
                         self.assertIn("accept-edits", invalid_mode.content[0].text)
+                        self.assertEqual(
+                            set(invalid_mode.structured_content), OUTPUT_FIELDS
+                        )
 
                         repeated = await session.call_tool(TOOL_NAME, arguments)
                         self.assertFalse(repeated.is_error)
@@ -299,7 +350,7 @@ class MCPProtocolTest(unittest.TestCase):
                                 TOOL_NAME,
                                 {"task": "protocol probe", "mode": "plan"},
                             )
-                            self.assertFalse(result.is_error)
+                            self.assertTrue(result.is_error)
                             self.assertEqual(result.structured_content["status"], "ERROR")
                             self.assertEqual(
                                 result.structured_content["result"],

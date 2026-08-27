@@ -14,6 +14,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agy_server as server
+from mcp.types import CallToolResult
+
+
+def result_data(result):
+    return result.structured_content if isinstance(result, CallToolResult) else result
 
 
 _LOCK_WORKER = r'''
@@ -124,9 +129,12 @@ class AgyServerTest(unittest.TestCase):
             bad_level = asyncio.run(server.antigravity_cli_execute("x", thinking_level="bad"))
             bad_mode = asyncio.run(server.antigravity_cli_execute("x", mode="yolo"))
         resolve.assert_not_called()
-        self.assertEqual(empty["status"], "ERROR")
-        self.assertEqual(bad_level["status"], "ERROR")
-        self.assertEqual(bad_mode["status"], "ERROR")
+        self.assertTrue(empty.is_error)
+        self.assertTrue(bad_level.is_error)
+        self.assertTrue(bad_mode.is_error)
+        self.assertEqual(result_data(empty)["status"], "ERROR")
+        self.assertEqual(result_data(bad_level)["status"], "ERROR")
+        self.assertEqual(result_data(bad_mode)["status"], "ERROR")
 
     def _execute(
         self, *, level="low", mode="plan", stdout=None, returncode=0,
@@ -251,7 +259,7 @@ class AgyServerTest(unittest.TestCase):
             "agy_server.execute_with_antigravity_cli", new=AsyncMock()
         ) as execute:
             result = asyncio.run(server.antigravity_cli_execute("x"))
-        self.assertEqual(result["result"], "current working directory must be a Git root")
+        self.assertEqual(result_data(result)["result"], "current working directory must be a Git root")
         execute.assert_not_awaited()
 
     def test_explicit_git_root_absolute_relative_and_rejections(self):
@@ -307,9 +315,9 @@ class AgyServerTest(unittest.TestCase):
         git_root.assert_called_once_with(working_directory)
         execute.assert_not_awaited()
         resolve_cli.assert_not_called()
-        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result_data(result)["status"], "ERROR")
         self.assertEqual(
-            result["result"], "working_directory must be an existing Git root"
+            result_data(result)["result"], "working_directory must be an existing Git root"
         )
 
     def test_empty_git_stdout_is_rejected(self):
@@ -329,7 +337,7 @@ class AgyServerTest(unittest.TestCase):
         for arguments, expected in cases:
             with self.subTest(arguments=arguments), patch("agy_server._git_root") as root:
                 result = asyncio.run(server.antigravity_cli_execute(**arguments))
-            self.assertEqual(result["result"], expected)
+            self.assertEqual(result_data(result)["result"], expected)
             root.assert_not_called()
 
         with patch("agy_server._git_root") as root, patch(
@@ -338,7 +346,7 @@ class AgyServerTest(unittest.TestCase):
             result = asyncio.run(server.antigravity_cli_execute(
                 "x", working_directory=123
             ))
-        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result_data(result)["status"], "ERROR")
         root.assert_not_called()
         execute.assert_not_awaited()
 
@@ -366,6 +374,24 @@ class AgyServerTest(unittest.TestCase):
             "workspace": Path("C:/repo"), "prompt": expected_prompt,
             "thinking_level": "medium", "mode": "plan",
         })
+
+    def test_runtime_error_result_is_mcp_error_without_input_echo(self):
+        secret = "UNIT_SENTINEL_SECRET"
+        for arguments in (
+            {"task": "x", "context": {"secret": secret}},
+            {"task": "x", "thinking_level": secret},
+            {"task": "x", "working_directory": {"secret": secret}},
+        ):
+            with self.subTest(arguments=arguments):
+                result = asyncio.run(server.antigravity_cli_execute(**arguments))
+                self.assertIsInstance(result, CallToolResult)
+                self.assertTrue(result.is_error)
+                self.assertEqual(set(result.structured_content), {
+                    "status", "result", "model", "thinking_level", "mode",
+                    "usage", "conversation_id", "result_truncated",
+                })
+                self.assertNotIn(secret, repr(result.content))
+                self.assertNotIn(secret, repr(result.structured_content))
 
     def test_exact_argv_and_subprocess_contract(self):
         cli = Path("C:/bin/agy.exe")
@@ -489,7 +515,7 @@ class AgyServerTest(unittest.TestCase):
 
     def test_success_normalization_usage_id_and_truncation(self):
         payload = {
-            "status": "SUCCESS", "response": "x" * (server.MAX_RESULT_CHARS + 20),
+            "status": "SUCCESS", "response": "H" * server.MAX_RESULT_CHARS + "T" * 20,
             "conversation_id": "safe-id_1", "usage": {
                 "input_tokens": 2, "output_tokens": 3, "total_tokens": 5,
                 "secret": "discard",
@@ -499,12 +525,19 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(result["status"], "SUCCESS")
         self.assertEqual(len(result["result"]), server.MAX_RESULT_CHARS)
         self.assertTrue(result["result_truncated"])
+        self.assertIn(server.TRUNCATION_MARKER, result["result"])
+        self.assertTrue(result["result"].startswith("H"))
+        self.assertTrue(result["result"].endswith("T"))
         self.assertEqual(result["thinking_level"], "low")
         self.assertEqual(result["model"], "gemini-3.7-flash-low")
         self.assertEqual(result["mode"], "plan")
         self.assertEqual(result["conversation_id"], "safe-id_1")
         self.assertEqual(result["usage"], {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
         self.assertNotIn("secret", json.dumps(result))
+        with patch.object(server, "MAX_RESULT_CHARS", len(server.TRUNCATION_MARKER) + 1):
+            edge = server._empty_result("SUCCESS", "abcdef" * 20, "low", "plan")
+        self.assertEqual(len(edge["result"]), len(server.TRUNCATION_MARKER) + 1)
+        self.assertEqual(edge["result"], "a" + server.TRUNCATION_MARKER)
 
     def test_nonfinite_usage_values_are_filtered(self):
         payload = {
@@ -548,8 +581,8 @@ class AgyServerTest(unittest.TestCase):
         for options, expected in cases:
             with self.subTest(options=options):
                 result, _ = self._execute(**options)
-                self.assertEqual(result["status"], "ERROR")
-                self.assertEqual(result["result"], expected)
+                self.assertEqual(result_data(result)["status"], "ERROR")
+                self.assertEqual(result_data(result)["result"], expected)
 
     def test_cli_unavailable_and_defensive_stdout_limit(self):
         with patch("agy_server._resolve_cli", return_value=None), patch(
@@ -863,9 +896,9 @@ class AgyServerTest(unittest.TestCase):
         for payload, expected in cases:
             with self.subTest(payload=payload):
                 result, _ = self._execute(stdout=payload)
-                self.assertEqual(result["status"], "ERROR")
-                self.assertEqual(result["result"], expected)
-                self.assertNotIn("private", json.dumps(result))
+                self.assertEqual(result_data(result)["status"], "ERROR")
+                self.assertEqual(result_data(result)["result"], expected)
+                self.assertNotIn("private", json.dumps(result_data(result)))
         missing_response, _ = self._execute(stdout={"status": "SUCCESS"})
         self.assertEqual(missing_response["status"], "SUCCESS")
         self.assertEqual(missing_response["result"], "")
@@ -875,13 +908,13 @@ class AgyServerTest(unittest.TestCase):
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
         ), patch("agy_server._run_cli", new=AsyncMock(return_value=(0, "TOKEN=secret", False))):
             malformed = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
-        self.assertEqual(malformed["result"], "Antigravity CLI returned invalid JSON")
+        self.assertEqual(result_data(malformed)["result"], "Antigravity CLI returned invalid JSON")
         with patch("agy_server._git_root", return_value=Path("C:/repo")), patch(
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
         ), patch("agy_server._run_cli", new=AsyncMock(return_value=(1, '{"status":"FAIL","response":"secret"}', False))):
             failed = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
-        self.assertEqual(failed["result"], "Antigravity CLI task failed")
-        self.assertNotIn("secret", json.dumps(failed))
+        self.assertEqual(result_data(failed)["result"], "Antigravity CLI task failed")
+        self.assertNotIn("secret", json.dumps(result_data(failed)))
 
     def test_stderr_and_logs_do_not_disclose_output(self):
         async def scenario():
@@ -913,7 +946,7 @@ class AgyServerTest(unittest.TestCase):
             result, _ = self._execute(stdout={
                 "status": "FAIL", "response": "PAYLOAD_SECRET"
             })
-        self.assertEqual(result["result"], "Antigravity CLI task failed")
+        self.assertEqual(result_data(result)["result"], "Antigravity CLI task failed")
         self.assertNotIn("PAYLOAD_SECRET", "\n".join(logs.output))
 
     def test_empty_result_from_output_overflow_is_safe_error(self):
@@ -923,7 +956,7 @@ class AgyServerTest(unittest.TestCase):
             "agy_server._run_cli", new=AsyncMock(return_value=(-9, "", False))
         ):
             result = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
-        self.assertEqual(result, {
+        self.assertEqual(result_data(result), {
             "status": "ERROR",
             "result": "Antigravity CLI returned invalid JSON",
             "model": "gemini-3.7-flash-medium",
@@ -941,7 +974,7 @@ class AgyServerTest(unittest.TestCase):
             result = asyncio.run(server.antigravity_cli_execute(
                 "x", context="c" * server.MAX_PROMPT_CHARS
             ))
-        self.assertEqual(result["result"], "task context is too large")
+        self.assertEqual(result_data(result)["result"], "task context is too large")
         git_root.assert_not_called()
         execute.assert_not_called()
 
@@ -1541,7 +1574,7 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(schema["properties"]["thinking_level"]["enum"], ["low", "medium", "high"])
         self.assertEqual(schema["properties"]["thinking_level"]["default"], "medium")
         self.assertEqual(schema["properties"]["mode"]["enum"], ["plan", "accept-edits"])
-        self.assertEqual(schema["properties"]["mode"]["default"], "accept-edits")
+        self.assertEqual(schema["properties"]["mode"]["default"], "plan")
 
     def test_context_progress_is_monotonic(self):
         class FakeContext:

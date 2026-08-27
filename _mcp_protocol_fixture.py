@@ -15,6 +15,9 @@ async def _fake_run(argv, cwd, timeout_seconds):
     if "cancellation state probe" in prompt:
         response = "cancelled-seen" if CANCEL_SEEN else "not-cancelled"
         return 0, '{"status":"SUCCESS","response":"' + response + '"}', False
+    if "default mode protocol probe" in prompt:
+        mode = argv[argv.index("--mode") + 1]
+        return 0, '{"status":"SUCCESS","response":"default-mode-' + mode + '"}', False
     if "slow protocol probe" in prompt:
         try:
             delay = 3.0 if "cancellation" in prompt else 0.35
