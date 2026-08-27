@@ -160,6 +160,7 @@ Gemini через `agy`: исключить перехват исполняем�
 [mcp_servers.antigravity_cli_executor]
 command = "W:/_python/antiagent/.venv/Scripts/python.exe"
 args = ["W:/_python/antiagent/agy_server.py"]
+cwd = "W:/_python/antiagent"
 enabled = true
 required = true
 startup_timeout_sec = 30
@@ -214,6 +215,20 @@ enabled_tools = ["antigravity_cli_execute"]
 11. после него изолированный `accept-edits` smoke с полным diff review.
 
 ## Definition of Done
+
+## Фактический статус выполнения (baseline `cd41f44`, 27.08.2026)
+
+Все этапы 1–7 выполнены:
+
+- [x] дефекты зафиксированы regression-тестами;
+- [x] запуск executable, UTF-16 budget, process-tree cleanup и межпроцессный lock усилены;
+- [x] MCP contract, typed diagnostics, redaction, `isError`, metadata и progress исправлены;
+- [x] Git preflight/postflight, persistent review marker и `acknowledge_review` реализованы;
+- [x] Codex timeout настроен на 900 секунд при wrapper timeout 840 секунд;
+- [x] legacy SDK path удалён, dependency и устаревшие команды убраны;
+- [x] тесты и документация обновлены.
+
+Результат: 73 deterministic теста, включая 5 STDIO MCP тестов; authenticated live OAuth smoke успешен. Filename-only tracked-secret scan вернул 0 файлов. Ограничения: postflight использует status и file metadata без content hashes, автоматического rollback нет.
 
 - Ни один executable не разрешается через недоверенный current directory.
 - Codex timeout больше общего wrapper timeout.

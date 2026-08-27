@@ -1,88 +1,40 @@
 # MCP test matrix
 
-Цель: проверить не только Python helpers, но и реальный STDIO JSON-RPC путь клиента до `agy_server.py`. Все автоматические тесты работают offline, без OAuth, API keys, сети и изменений пользовательских файлов.
+Актуально для baseline `cd41f44` (27 августа 2026 г.). Автоматические тесты offline, кроме отдельно отмеченного authenticated live smoke.
 
-## 1. MCP protocol
+## MCP protocol — 5 тестов
 
-| Сценарий | Ожидаемый результат | Проверка |
-|---|---|---|
-| STDIO process start and initialize | Согласована поддерживаемая версия MCP; имя сервера корректно | Real `ClientSession` |
-| `tools/list` | Доступен ровно ожидаемый tool | Real `ClientSession` |
-| Tool schema | `task` required; `thinking_level=low|medium|high`; `mode=plan|accept-edits`; `working_directory` string, default пустой; defaults корректны | Real `ClientSession` |
-| Output schema | Все поля structured response и их типы описаны; неизвестные поля запрещены | Real `ClientSession` |
-| Valid `tools/call` | Структурированный `CallToolResult`; stdout содержит только JSON-RPC | Real `ClientSession` |
-| Unknown tool | Стандартная MCP ошибка без падения server process | Real `ClientSession` |
-| Missing `task` | Schema/validation error, без запуска Git или CLI | Real `ClientSession` |
-| Wrong argument types | Schema/validation error, без запуска Git или CLI | Real `ClientSession` |
-| Invalid enum values | Schema/validation error или безопасный structured error согласно MCP SDK | Real `ClientSession` |
-| Non-Git working directory | Безопасный structured error, сессия остаётся рабочей | Real `ClientSession` |
-| Progress token | Сервер может отправить `notifications/progress`; отсутствие поддержки клиента не ломает вызов | Client callback/unit |
-| Cancellation | Вызов отменяется, subprocess tree завершается, MCP session остаётся согласованной | Client/unit |
-| Sequential calls after an error | Следующий вызов работает; lock и protocol stream не повреждены | Real `ClientSession` |
+| Сценарий | Ожидаемый результат |
+|---|---|
+| STDIO initialize и `tools/list` | Согласованный MCP и ровно один documented tool |
+| Schema и valid call | `task` обязателен, defaults `thinking_level=medium`, `mode=plan`; structured output валиден |
+| Unknown/missing/wrong/invalid arguments | Без падения process, без запуска Git/CLI и без утечки входных данных |
+| Runtime error | MCP `isError=true`, structured metadata сохранена, stderr/secrets redacted |
+| Progress/cancellation/sequential call | `run_id` и state видимы, cleanup завершён, следующая операция работает |
 
-## 2. Input and workspace errors
+## Input/workspace
 
-- `task`: пустой, whitespace, non-string.
-- `context` и `verification`: non-string.
-- `working_directory`: пустой default использует process cwd; абсолютный или относительный путь после canonical resolve должен быть process cwd или его descendant и точным Git-root (например, `W:\HARDDEV\smartgold` при cwd `W:\HARDDEV`); non-string, несуществующий, non-Git, `..`/symlink/junction наружу и вложенный не-root путь отклоняются.
-- Prompt: ниже лимита, ровно на лимите, выше лимита.
-- Prompt formatting and stripping.
-- Git: success, command exception, timeout/non-zero, empty/invalid output, nested directory, non-repository.
-- Validation and prompt-size errors happen before Git/CLI resolution.
+Проверяются пустые/нестроковые `task`, `context`, `verification`, некорректные enum и prompt limits; пустой cwd использует process cwd. Проверяются Git root, вложенный root, non-Git, missing path, выход за allowed root, symlink/junction и dirty workspace. `accept-edits` дополнительно проверяется на clean/dirty/no-op/complete/partial state и review acknowledgement.
 
-## 3. Configuration and CLI resolution
+## Process and security
 
-- Timeout: unset, valid, invalid, zero/negative, above maximum.
-- CLI resolution priority: explicit environment path, `PATH`, `%LOCALAPPDATA%`, unavailable.
-- Missing CLI returns a generic safe error.
-- Exact argv: prompt, mode, model, effort, `json`, print timeout, sandbox, disabled slash commands, Git root.
-- No shell and no `--dangerously-skip-permissions` in either mode.
-- Child environment removes API keys, tokens, secrets, passwords, credentials and Google credential files.
+Проверяются executable resolution, exact argv, отсутствие shell и dangerous permission bypass, safe child environment, spawn/OSError, timeout, cancellation, bounded stdout/stderr, reader failure, Windows Job Object/exact PID tree kill и POSIX fallback. Output не включает raw stderr, prompt, environment или secrets; truncation — head + marker + tail.
 
-## 4. Subprocess lifecycle
+## Git postflight
 
-- Spawn success and OSError/ValueError.
-- Correct cwd, stdin/stdout/stderr and platform creation flags.
-- Global lock serializes execution and releases after success/error/timeout/cancellation.
-- Inner timeout and outer timeout while waiting for the lock.
-- Caller cancellation re-raises `CancelledError` after cleanup.
-- Unexpected reader/process exceptions return safe errors after cleanup.
-- Windows Job Object: success plus create/configure/open/assign failures.
-- Tree-kill: Windows success/fallback/error and POSIX success/fallback.
-- Actual Windows descendant termination regression test.
+| Сценарий | Ожидаемый результат |
+|---|---|
+| Clean `accept-edits` no-op | `worktree_changed=false`, postflight complete |
+| Existing dirty tree | Не отклоняется только из-за dirty; `preexisting_dirty=true` |
+| Successful edit | Только фактически изменённые paths, complete postflight |
+| Timeout/cancellation с изменениями, partial/unknown | `requires_review=true`, no reset/stash/rollback |
+| Persistent marker | Следующий editing call требует `acknowledge_review=true` |
 
-## 5. Output bounds and normalization
+## Release acceptance
 
-- stdout/stderr empty, normal, exact limit and over limit.
-- Process exit before/after pipe EOF; reader failure; killed-process wait failure.
-- stderr never appears in tool result or logs.
-- JSON: malformed, scalar/list, non-zero exit, `status != SUCCESS`, missing/non-string response.
-- Result truncation and `result_truncated` flag.
-- Usage allowlist; non-dict, bool/string, negative and non-finite numbers.
-- Conversation ID: valid, empty, non-string, path-like, whitespace and overlong.
-- Unknown response fields and secret markers are discarded from structured metadata.
-- Generic error logs and results contain no prompt/stdout/stderr/environment values.
-
-## 6. Release acceptance
-
-1. Full `unittest discover -v` succeeds twice consecutively.
-2. Real STDIO protocol suite succeeds without browser or network.
-3. `py_compile` succeeds for server, smoke and test files.
-4. MCP schema snapshot contains only documented arguments and enums.
-5. `git diff --check` and repository secret scan succeed.
-6. No child `agy`/test process remains after timeout or cancellation tests.
-7. Optional authenticated live smoke remains read-only and is not part of the deterministic suite.
-
-## 7. Фактический статус на commit `c1b4f2f`
-
-Среда последней проверки: Windows 11 (`10.0.26200.0`), Python `3.13.4`, MCP `2.0.0`, Pydantic `2.13.4`, AnyIO `4.14.2` из `.venv`.
-
-- Всего: **59 тестов, 59 PASS**.
-- Полный discovery прошёл два раза подряд без ошибок.
-- Реальный STDIO-контур проверен через `mcp.ClientSession`: initialize, `tools/list`, input/output schema, успешный `tools/call`, unknown tool, обязательный `task`, неверные типы и enum, не-Git cwd, progress notifications, отмена вызова и повторный вызов в той же сессии. Новый regression запускает server process из parent cwd и выбирает дочерний Git-root через `working_directory`.
-- Deterministic STDIO fixture (`_mcp_protocol_fixture.py`) подменяет `_run_cli`; он не запускает настоящий `agy`, не использует OAuth, браузер, API keys или сеть.
-- Проверены ошибки и lifecycle: validation/Git/CLI resolution, spawn/timeout/overflow/reader failure, lock recovery, cancellation/reap, Windows Job Object и tree-kill, bounds/JSON normalization, progress heartbeat и serialization.
-- В Windows descendant regression исправлена прежняя проверка `tasklist`, которая могла дать false-negative при ошибке команды или совпадении строки: теперь тест проверяет exact PID через `OpenProcess`/`GetExitCodeProcess` и закрывает полученный handle.
-- Для `working_directory` проверены absolute/relative path, exact Git-root, generic rejection и canonical cwd-descendant security boundary, включая отказ до Git для пути наружу. Прямая проверка `W:\HARDDEV` → `W:\HARDDEV\smartgold` вернула ожидаемый exact Git-root.
-
-Матрица отражает проверенные reachable branches, но не является обещанием математического 100% покрытия. Не выполнялись authenticated live OAuth smoke и проверка с реальным `agy`/реальным аккаунтом; это сознательное ограничение deterministic/offline suite.
+1. `unittest discover` проходит дважды и в обратном порядке targeted suites.
+2. Real STDIO protocol suite проходит.
+3. `py_compile`, `pip check`, `git diff --check` проходят.
+4. Проверены Windows lifecycle, lock, clean/dirty/postflight и отсутствие surviving children.
+5. Authenticated live OAuth `plan` smoke и isolated `accept-edits` smoke успешны; временный repo удалён.
+6. Финальный filename-only tracked-secret scan: `0` high-confidence matches и `0` подозрительных tracked-имён.

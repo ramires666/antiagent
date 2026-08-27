@@ -257,6 +257,18 @@ Antigravity отказал именно из-за dirty tree. Требуется
 12. После исправления повторить сначала последовательный smoke test, затем
    Git/non-Git, clean/dirty, Windows path и parallel regression matrix.
 
+## Results after remediation
+
+План реализован на baseline `cd41f44` (27 августа 2026 г.). Исправлены запуск процессов и UTF-16 budget, process-tree cleanup, межпроцессный workspace lock, MCP error semantics/redaction и default `plan`, typed diagnostics/version/metadata, Git pre/postflight с persistent review marker и явным acknowledgement, а также Codex timeout 900 секунд при wrapper timeout 840 секунд. Legacy SDK-ветка и `google-antigravity` удалены.
+
+Актуальная проверка: 73 deterministic теста после удаления legacy-файлов, включая 5 тестов реального MCP STDIO harness. Authenticated live OAuth smoke в `plan` успешен: контрольный marker найден в ответе, Git не изменён. В изолированном `accept-edits` smoke успешно изменён только `README.txt`; postflight завершён, полный diff просмотрен, временный репозиторий удалён. Filename-only tracked-secret scan вернул 0 файлов.
+
+Устаревшие рекомендации о необходимости принимать любой committed temporary repo, возвращать raw stderr или считать dirty tree причиной отказа заменены фактическим typed preflight/postflight поведением. Исторические evidence и hypotheses выше сохранены как исходные наблюдения, а не как текущие утверждения.
+
+Ограничение: postflight fingerprint основан на `git status` и метаданных файлов, не на content hashes; автоматического rollback нет. Authenticated smoke зависит от внешней OAuth-сессии и поэтому не входит в deterministic count.
+
+Lifecycle нативных Codex children, потоковая выдача результатов независимых children и UI thread identity не реализуются этим single-tool MCP wrapper: это отдельный слой оркестрации клиента. Текущий проект исправляет безопасное выполнение одного leaf-agent вызова и не выдаётся за полную замену native subagents.
+
 ## Acceptance criteria
 
 Сбой считается устранённым, когда:

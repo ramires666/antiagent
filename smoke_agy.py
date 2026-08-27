@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import io
 import json
-import subprocess
 from pathlib import Path
 
 
@@ -14,36 +13,21 @@ MARKER = "AGY_SMOKE_READONLY_MARKER"
 
 
 def git_root() -> Path:
-    root = Path.cwd().resolve()
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-            shell=False,
-        )
-        git_root_path = Path(completed.stdout.strip()).resolve()
-    except (OSError, subprocess.SubprocessError, ValueError):
+    from agy_server import _git_preflight
+
+    root = _git_preflight().root
+    if root is None:
         raise RuntimeError("current directory is not a Git repository root") from None
-    if git_root_path != root:
-        raise RuntimeError("current directory is not a Git repository root")
     return root
 
 
-def git_status(root: Path) -> str:
-    completed = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=True,
-        shell=False,
-    )
-    return completed.stdout
+def git_status(root: Path) -> object:
+    from agy_server import _git_status_snapshot
+
+    snapshot = _git_status_snapshot(root)
+    if snapshot is None:
+        raise RuntimeError("Git status is unavailable")
+    return snapshot
 
 
 async def run_smoke() -> dict[str, object]:
