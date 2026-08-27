@@ -1,6 +1,6 @@
 # Antigravity CLI OAuth Executor для Codex
 
-`agy_server.py` — primary MCP executor. Он запускает официальный Antigravity CLI (`agy`) как subprocess с OAuth-сессией браузера. Старая SDK-реализация в `server.py` сохраняется как backup до отдельного этапа удаления legacy-файлов.
+`agy_server.py` — единственный production MCP executor. Он запускает официальный Antigravity CLI (`agy`) как subprocess с OAuth-сессией браузера; API-key/SDK-ветки в проекте нет.
 
 ## Официальные источники
 
@@ -107,6 +107,4 @@ Acceptance criteria:
 
 Тесты используют subprocess injection/mock и не требуют сети или browser login. Реальный OAuth smoke выполняется отдельно после ручного входа.
 
-## Backup
-
-`server.py`, `smoke_antigravity.py` и связанные тесты относятся к прежней Python SDK-ветке и не удаляются при развитии `agy_server.py`.
+В проекте намеренно оставлен один поддерживаемый путь: `agy_server.py` + OAuth CLI. Старую несовместимую SDK/API-key реализацию следует хранить только в истории Git или отдельном архивном репозитории.
