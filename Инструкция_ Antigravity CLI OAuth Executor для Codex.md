@@ -1,6 +1,6 @@
 # Antigravity CLI OAuth Executor для Codex
 
-`agy_server.py` — primary MCP executor. Он запускает официальный Antigravity CLI (`agy`) как subprocess с OAuth-сессией браузера. Старая SDK-реализация в `server.py` сохраняется как backup.
+`agy_server.py` — primary MCP executor. Он запускает официальный Antigravity CLI (`agy`) как subprocess с OAuth-сессией браузера. Старая SDK-реализация в `server.py` сохраняется как backup до отдельного этапа удаления legacy-файлов.
 
 ## Официальные источники
 
@@ -18,7 +18,7 @@ API keys в executor не используются. OAuth выполняется
 
 ## Установка и OAuth
 
-В Windows PowerShell установите официальную версию CLI 1.1.16 инструкцией из документации:
+В Windows PowerShell установите актуальную официальную версию CLI инструкцией из документации (в текущем checkout проверена версия `1.1.22`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://antigravity.google/cli/install.ps1 | iex"
@@ -39,7 +39,7 @@ py -m venv .venv
 
 ## Режимы
 
-Поддерживаются только `thinking_level`: `low`, `medium`, `high`; default — `medium`. Выбирается модель `gemini-3.7-flash-{level}`. Также поддерживаются режимы `plan` (анализ без изменений) и `accept-edits` (явно разрешённые изменения).
+Поддерживаются только `thinking_level`: `low`, `medium`, `high`; default — `medium`. Выбирается модель `gemini-3.7-flash-{level}`. Поддерживаются режимы `plan` (анализ без изменений) и `accept-edits` (явно разрешённые изменения); default режима — `plan`.
 
 В unattended MCP adapter всегда передаёт `--sandbox` и `--disable-slash-commands`. `--dangerously-skip-permissions` никогда не используется. `accept-edits` разрешает штатные изменения файлов внутри workspace; shell-команды и операции, требующие подтверждения, в headless режиме soft-denied, если пользователь отдельно не добавил узкое allow-правило в настройках CLI. Проверки результата независимо запускает основной агент.
 
@@ -53,9 +53,9 @@ Allow rules минимальны: чтение workspace, необходимые
 
 ## MCP-контракт
 
-Входы tool: `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`) и `mode` (`plan|accept-edits`, default `accept-edits`).
+Входы tool: `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`), `mode` (`plan|accept-edits`, default `plan`) и `acknowledge_review` (boolean, default `false`). Для каждого editing-вызова оператор должен явно выбрать `mode=accept-edits`. `acknowledge_review=true` нужен только после ручной проверки partial/unknown результата, когда wrapper вернул `review_required`.
 
-Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`.
+Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`.
 
 ## MCP-конфигурация Windows
 
@@ -72,11 +72,17 @@ codex.cmd mcp get antigravity_cli_executor
 
 ```toml
 [mcp_servers.antigravity_cli_executor]
-command = "<ABSOLUTE_PATH_TO_PYTHON>"
-args = ["<ABSOLUTE_PATH_TO_REPO>\\agy_server.py"]
+command = 'W:\_python\antiagent\.venv\Scripts\python.exe'
+args = ['W:\_python\antiagent\agy_server.py']
+cwd = 'W:\_python\antiagent'
+enabled = true
+required = true
+startup_timeout_sec = 30
+tool_timeout_sec = 900
+enabled_tools = ['antigravity_cli_execute']
 ```
 
-Используйте абсолютные пути и placeholders. Указывайте Python из `.venv`; не подставляйте глобальный `python` или глобальный MCP. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts.
+В этом checkout готовый project-scoped шаблон находится в `.codex/config.toml`; для другого проекта замените абсолютные пути на его trusted root и `.venv`. Указывайте Python из `.venv`; не подставляйте глобальный `python` или глобальный MCP. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому `tool_timeout_sec` Codex должен быть 900 секунд.
 
 ## Smoke и тесты
 
@@ -88,7 +94,7 @@ agy --version
 
 Acceptance criteria:
 
-1. Schema валидирует `low|medium|high`, default `medium`, `plan`, `accept-edits` и строковый `working_directory`.
+1. Schema валидирует `low|medium|high`, default `medium`, `plan`, `accept-edits`, boolean `acknowledge_review` (default `false`) и строковый `working_directory`.
 2. `working_directory` разрешается как абсолютный путь или относительно process cwd; пустой default использует process cwd. После canonical resolve путь обязан быть process cwd или его descendant и точным Git-root; выход через `..`, symlink или junction и остальные каталоги отклоняются. Subprocess получает этот абсолютный Git-root в `cwd`.
 3. Adapter передаёт `--sandbox` и `--disable-slash-commands`.
 4. stdout JSON, malformed JSON, non-zero exit и timeout дают безопасный структурированный ответ.
@@ -96,6 +102,8 @@ Acceptance criteria:
 6. Wrapper не передаёт API-key переменные окружения и не логирует `stderr`; основной агент не передаёт секреты в task и проверяет model response на случайно возвращённые секреты.
 7. Permission engine работает без bypass-флага; sandbox активен как дополнительное, но не абсолютное ограничение host.
 8. Diff независимо проверяется основным Codex-агентом.
+9. Каждый ответ сообщает `run_id`, timestamps, duration, exit code, typed `error_type`, `retryable`, фактическую `cli_version` и явные признаки доступности usage/conversation metadata.
+10. Каждый вызов сообщает Git postflight: `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`; полный diff через MCP не возвращается.
 
 Тесты используют subprocess injection/mock и не требуют сети или browser login. Реальный OAuth smoke выполняется отдельно после ручного входа.
 
