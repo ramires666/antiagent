@@ -21,6 +21,8 @@ TERMINAL_STATUSES = ("completed", "failed", "interrupted")
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_HISTORY = 1000
 MAX_ACTIVE_AGENTS = 32
+STATE_DIR_ENV = "ANTIAGENT_STATE_DIR"
+_STATE_DIRECTORY: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -45,12 +47,53 @@ class AgentCapacityError(RuntimeError):
     """The owner already has the maximum number of active agents."""
 
 
-def default_db_path() -> Path:
+def _resolve_default_state_dir() -> Path:
+    configured = os.environ.get(STATE_DIR_ENV, "").strip()
+    if configured:
+        path = Path(configured)
+        if not path.is_absolute():
+            raise ValueError(f"{STATE_DIR_ENV} must be an absolute path")
+        if path.is_symlink() or (
+            hasattr(path, "is_junction") and path.is_junction()
+        ):
+            raise OSError(f"{STATE_DIR_ENV} must not be a link")
+        if path.exists() and not path.is_dir():
+            raise OSError(f"{STATE_DIR_ENV} must be a directory")
+        return path.resolve()
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
     else:
         base = os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
-    return Path(base) / "antiagent" / "agents.sqlite3"
+    return (Path(base) / "antiagent").resolve()
+
+
+def default_state_dir() -> Path:
+    """Return the process-wide state root resolved on first use."""
+    global _STATE_DIRECTORY
+    if _STATE_DIRECTORY is None:
+        _STATE_DIRECTORY = _resolve_default_state_dir()
+    return _STATE_DIRECTORY
+
+
+def prepare_state_dir() -> Path:
+    """Create and validate the shared process state root."""
+    directory = default_state_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory.is_symlink() or (
+        hasattr(directory, "is_junction") and directory.is_junction()
+    ) or not directory.is_dir():
+        raise OSError("state root is not a real directory")
+    if os.name != "nt":
+        directory_stat = directory.lstat()
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise OSError("state root is not a directory")
+        if directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o077:
+            raise OSError("state root is not private")
+    return directory
+
+
+def default_db_path() -> Path:
+    return prepare_state_dir() / "agents.sqlite3"
 
 
 def _canonical_workspace(value: str | os.PathLike[str]) -> str:
@@ -70,16 +113,22 @@ def _prepare_path(path: Path) -> Path:
     path = Path(os.path.abspath(os.fspath(path)))
     parent = path.parent
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if parent.is_symlink() or (
+        hasattr(parent, "is_junction") and parent.is_junction()
+    ) or not parent.is_dir():
+        raise OSError("database parent is not a real directory")
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or (
+            hasattr(path, "is_junction") and path.is_junction()
+        ) or not path.is_file():
+            raise OSError("database file is not a regular file")
     if os.name != "nt":
         info = parent.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise OSError("database parent is not a private directory")
         if info.st_mode & 0o077:
             raise OSError("database parent directory is not private")
-        if path.exists() or path.is_symlink():
-            info = path.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise OSError("database file is not a regular file")
+        if path.exists():
             os.chmod(path, 0o600)
         else:
             os.chmod(parent, 0o700)
@@ -363,4 +412,7 @@ class AgentStore:
                 raise
 
 
-__all__ = ["AgentCapacityError", "AgentSnapshot", "AgentStore", "default_db_path"]
+__all__ = [
+    "AgentCapacityError", "AgentSnapshot", "AgentStore", "default_db_path",
+    "default_state_dir", "prepare_state_dir",
+]

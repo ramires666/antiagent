@@ -4,6 +4,7 @@ import asyncio
 import ctypes
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,21 @@ asyncio.run(main())
 
 
 class AgyServerTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._state_directory = tempfile.TemporaryDirectory(
+            prefix="antiagent-unit-state-"
+        )
+        cls._state_patch = patch(
+            "agent_manager._STATE_DIRECTORY", Path(cls._state_directory.name)
+        )
+        cls._state_patch.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._state_patch.stop()
+        cls._state_directory.cleanup()
+
     @staticmethod
     def _start_lock_worker(root, lock_directory, marker, *, mode="hold", hold=0, timeout=1):
         return subprocess.Popen(
@@ -462,6 +478,39 @@ class AgyServerTest(unittest.TestCase):
             "agy_server.subprocess.run", side_effect=run
         ):
             self.assertIsNone(server._git_status_snapshot(Path("C:/repo")))
+
+    def test_git_status_snapshot_uses_state_dir_instead_of_system_temp(self):
+        real_temporary_file = tempfile.TemporaryFile
+
+        def temporary_file(*args, **kwargs):
+            self.assertEqual(kwargs.get("dir"), state_root / "scratch")
+            return real_temporary_file(*args, **kwargs)
+
+        def run(*_args, stdout, **_kwargs):
+            stdout.write(b" M tracked.txt\0")
+            return type("Completed", (), {"returncode": 0})()
+
+        with tempfile.TemporaryDirectory(prefix="antiagent-state-") as directory:
+            state_root = Path(directory)
+            with patch("agent_manager._STATE_DIRECTORY", state_root), patch(
+                "agy_server._resolve_executable", return_value=Path("C:/git.exe")
+            ), patch("agy_server.tempfile.TemporaryFile", side_effect=temporary_file), patch(
+                "agy_server.subprocess.run", side_effect=run
+            ):
+                snapshot = server._git_status_snapshot(Path("C:/repo"))
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.entries["tracked.txt"][0], " M")
+
+    @unittest.skipIf(os.name == "nt", "POSIX state-root permission regression")
+    def test_lock_first_creates_private_state_root_usable_by_agent_store(self):
+        with tempfile.TemporaryDirectory(prefix="antiagent-parent-") as directory:
+            state_root = Path(directory) / "state"
+            with patch("agent_manager._STATE_DIRECTORY", state_root):
+                server._workspace_lock_path(Path(directory) / "repo")
+                self.assertEqual(stat.S_IMODE(state_root.stat().st_mode), 0o700)
+                with server.AgentStore(owner_id="lock-first-test") as store:
+                    self.assertEqual(store.path, state_root / "agents.sqlite3")
 
     def test_postflight_detects_another_edit_to_preexisting_dirty_file(self):
         with tempfile.TemporaryDirectory(prefix="agy-dirty-") as directory:
@@ -974,6 +1023,44 @@ class AgyServerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             asyncio.run(scenario(Path(directory) / "locks"))
 
+    def test_workspace_lock_uses_process_wide_configured_state_dir(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            server, "_LOCK_DIRECTORY", None
+        ), patch("agent_manager._STATE_DIRECTORY", None):
+            base = Path(directory)
+            root = base / "repo"
+            first_state = base / "state-one"
+            second_state = base / "state-two"
+            with patch.dict(
+                os.environ, {"ANTIAGENT_STATE_DIR": str(first_state)}
+            ):
+                first = server._workspace_lock_path(root)
+            with patch.dict(
+                os.environ, {"ANTIAGENT_STATE_DIR": str(second_state)}
+            ):
+                second = server._workspace_lock_path(root)
+            self.assertEqual(first.parent, first_state.resolve() / "locks")
+            self.assertEqual(second.parent, first_state.resolve() / "locks")
+            self.assertEqual(first.name, second.name)
+
+            state_file = base / "state-file"
+            state_file.write_text("x", encoding="utf-8")
+            for invalid in ("relative-state", str(state_file)):
+                with self.subTest(invalid=invalid), patch(
+                    "agent_manager._STATE_DIRECTORY", None
+                ), patch.dict(
+                    os.environ, {"ANTIAGENT_STATE_DIR": invalid}
+                ):
+                    with self.assertRaises(server.WorkspaceLockError):
+                        server._workspace_lock_path(root)
+
+            blocked_state = base / "blocked-state"
+            blocked_state.mkdir()
+            (blocked_state / "locks").write_text("x", encoding="utf-8")
+            with patch("agent_manager._STATE_DIRECTORY", blocked_state):
+                with self.assertRaises(server.WorkspaceLockError):
+                    server._workspace_lock_path(root)
+
     def test_workspace_lock_cancellation_does_not_leave_acquired_lock(self):
         async def scenario(lock_directory):
             with patch("agy_server._LOCK_DIRECTORY", lock_directory):
@@ -993,6 +1080,25 @@ class AgyServerTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             asyncio.run(scenario(Path(directory) / "locks"))
+
+    def test_workspace_lock_rejects_non_regular_lock_leaf(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            server, "_LOCK_DIRECTORY", Path(directory) / "locks"
+        ):
+            lock = server.WorkspaceLock(Path(directory) / "repo")
+            lock.path.mkdir(parents=True)
+            with self.assertRaises(server.WorkspaceLockError):
+                lock._try_acquire()
+
+            lock.path.rmdir()
+            target = Path(directory) / "target.lock"
+            target.write_text("x", encoding="utf-8")
+            try:
+                lock.path.symlink_to(target)
+            except OSError:
+                return
+            with self.assertRaises(server.WorkspaceLockError):
+                lock._try_acquire()
 
     def test_workspace_lock_multiprocess_contention_and_crash_release(self):
         with tempfile.TemporaryDirectory() as directory:

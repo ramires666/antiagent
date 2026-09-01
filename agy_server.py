@@ -37,7 +37,12 @@ from pydantic import BaseModel, ConfigDict, SkipValidation
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 
-from agent_manager import AgentCapacityError, AgentSnapshot, AgentStore
+from agent_manager import (
+    AgentCapacityError,
+    AgentSnapshot,
+    AgentStore,
+    prepare_state_dir,
+)
 
 
 logging.basicConfig(
@@ -63,7 +68,7 @@ MAX_GIT_STATUS_PATH_LENGTH = 4_096
 MAX_GIT_STATUS_PATHS = 10_000
 MAX_PROMPT_CHARS = 24_000
 MAX_WINDOWS_COMMAND_LINE_UNITS = 32_767
-_LOCK_DIRECTORY = Path(tempfile.gettempdir()) / "antiagent-workspace-locks"
+_LOCK_DIRECTORY: Path | None = None
 _SAFE_CONVERSATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _SAFE_AGENT_ID = re.compile(r"^[0-9a-f]{32}$")
 _INPUT_CONVERSATION_ID = re.compile(
@@ -238,15 +243,24 @@ class WorkspaceLockTimeout(WorkspaceLockError):
 def _workspace_lock_path(root: Path) -> Path:
     try:
         canonical = os.path.normcase(os.path.realpath(os.fspath(root)))
-        _LOCK_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_directory = (
+            _LOCK_DIRECTORY
+            if _LOCK_DIRECTORY is not None
+            else prepare_state_dir() / "locks"
+        )
+        lock_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if lock_directory.is_symlink() or (
+            hasattr(lock_directory, "is_junction") and lock_directory.is_junction()
+        ) or not lock_directory.is_dir():
+            raise OSError("workspace lock directory is not a real directory")
         if os.name != "nt":
-            directory_stat = _LOCK_DIRECTORY.lstat()
+            directory_stat = lock_directory.lstat()
             if not stat.S_ISDIR(directory_stat.st_mode):
                 raise OSError("workspace lock directory is not a directory")
             if directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o077:
                 raise OSError("workspace lock directory is not private")
         digest = hashlib.sha256(os.fsencode(canonical)).hexdigest()
-        return _LOCK_DIRECTORY / f"{digest}.lock"
+        return lock_directory / f"{digest}.lock"
     except (AttributeError, OSError, TypeError, ValueError):
         # Do not expose a temporary-directory path through the MCP result.
         raise WorkspaceLockError from None
@@ -259,10 +273,18 @@ class WorkspaceLock:
 
     def _try_acquire(self) -> None:
         try:
-            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(self.path, flags, 0o600)
         except OSError:
             raise WorkspaceLockError from None
         try:
+            path_stat = os.lstat(self.path)
+            fd_stat = os.fstat(fd)
+            if not stat.S_ISREG(path_stat.st_mode) or (
+                path_stat.st_dev,
+                path_stat.st_ino,
+            ) != (fd_stat.st_dev, fd_stat.st_ino):
+                raise WorkspaceLockError
             os.lseek(fd, 0, os.SEEK_SET)
             if os.name == "nt":
                 import msvcrt
@@ -777,7 +799,21 @@ def _git_status_snapshot(workspace: Path) -> GitStatusSnapshot | None:
     if git is None:
         return None
     try:
-        with tempfile.TemporaryFile() as output:
+        scratch_directory = prepare_state_dir() / "scratch"
+        scratch_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if scratch_directory.is_symlink() or (
+            hasattr(scratch_directory, "is_junction")
+            and scratch_directory.is_junction()
+        ) or not scratch_directory.is_dir():
+            return None
+        if os.name != "nt":
+            directory_stat = scratch_directory.lstat()
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                return None
+            if directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o077:
+                return None
+        # Review state must stay usable when the sandbox cannot access system TEMP.
+        with tempfile.TemporaryFile(dir=scratch_directory) as output:
             completed = subprocess.run(
                 [str(git), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
                 cwd=str(workspace),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from agent_manager import AgentStore
 
 CANCEL_SEEN = False
 FIXTURE_STATE = tempfile.TemporaryDirectory(prefix="antiagent-mcp-fixture-")
+os.environ["ANTIAGENT_STATE_DIR"] = FIXTURE_STATE.name
 agy_server._AGENT_STORE = AgentStore(
     Path(FIXTURE_STATE.name) / "agents.sqlite3", owner_id="protocol-fixture"
 )

@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import agent_manager as manager
 
@@ -11,6 +12,38 @@ import agent_manager as manager
 class AgentStoreTest(unittest.TestCase):
     def _store(self, directory: str, *, owner: str = "test-owner") -> manager.AgentStore:
         return manager.AgentStore(Path(directory) / "state" / "agents.sqlite3", owner_id=owner)
+
+    def test_configured_state_dir_is_absolute_and_owns_default_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "configured-state"
+            with patch.object(manager, "_STATE_DIRECTORY", None), patch.dict(
+                os.environ, {manager.STATE_DIR_ENV: str(state)}
+            ):
+                self.assertEqual(manager.default_state_dir(), state.resolve())
+                self.assertEqual(
+                    manager.default_db_path(), state.resolve() / "agents.sqlite3"
+                )
+                store = manager.AgentStore(owner_id="configured-state-test")
+                self.assertEqual(store.path, state.resolve() / "agents.sqlite3")
+                store.close()
+
+            state_file = Path(directory) / "not-a-directory"
+            state_file.write_text("x", encoding="utf-8")
+            for invalid in ("relative-state", str(state_file)):
+                with self.subTest(invalid=invalid), patch.object(
+                    manager, "_STATE_DIRECTORY", None
+                ), patch.dict(
+                    os.environ, {manager.STATE_DIR_ENV: invalid}
+                ):
+                    with self.assertRaises((OSError, ValueError)):
+                        manager.default_state_dir()
+
+    def test_database_path_rejects_directory_on_all_platforms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "agents.sqlite3"
+            database.mkdir()
+            with self.assertRaises(OSError):
+                manager.AgentStore(database, owner_id="invalid-database-test")
 
     def test_persists_snapshots_without_owner_or_database_path(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2,7 +2,7 @@
 
 Дата: 2026-09-01
 
-Статус: этап A выполнен, этап B следующий
+Статус: этапы A–B выполнены, этап C следующий
 
 Основные компоненты: `agy_server.py`, `agent_manager.py`, MCP-конфигурация Codex
 
@@ -125,18 +125,21 @@ Doctor не должен запускать OAuth, читать keyring, печ�
 Критерий приёмки: deterministic fixture воспроизводит каждый класс; sentinel из
 stderr отсутствует в result, logs и structured snapshot.
 
-### Этап B — настраиваемый wrapper state root (P0)
+### Этап B — настраиваемый wrapper state root (P0, выполнен)
 
 Файлы: `agy_server.py`, `agent_manager.py`, тесты.
 
-- [ ] Ввести единый `ANTIAGENT_STATE_DIR` с абсолютным путём.
-- [ ] Разместить под ним `locks/`, `agents.sqlite3` и review markers либо явно
-      документировать исключения.
-- [ ] Не доверять относительному пути, symlink/junction наружу или обычному
-      файлу вместо каталога.
-- [ ] Возвращать typed `state_unavailable`, не маскировать его под auth.
-- [ ] Сохранить безопасный platform default для запусков без переменной.
-- [ ] Добавить Windows regression: недоступный системный TEMP не ломает запуск
+- [x] Ввести единый `ANTIAGENT_STATE_DIR` с абсолютным путём.
+- [x] Разместить под ним `locks/`, `scratch/` для bounded Git review snapshot,
+      `agents.sqlite3` и review markers либо явно документировать исключения.
+- [x] Не доверять относительному пути, link/junction в самом state root,
+      каталоге locks или конечном DB/lock path и обычному файлу вместо каталога.
+- [x] Возвращать typed `state_unavailable` для manager state и
+      `workspace_lock_unavailable` для lock state, не маскировать их под auth.
+- [x] Сохранить безопасный platform default для запусков без переменной.
+- [x] Зафиксировать state root на первом обращении; изменение env требует
+      полного restart executor-процессов.
+- [x] Добавить Windows regression: недоступный системный TEMP не ломает запуск
       при заданном `ANTIAGENT_STATE_DIR`.
 
 Критерий приёмки: suite проходит с запрещённым default TEMP и доступным явным
