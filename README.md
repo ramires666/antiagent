@@ -27,23 +27,39 @@ py -m venv .venv
 agy --version
 ```
 
-## 2. Подключите MCP к Codex
+## 2. Установите переносимую MCP-команду
 
-Файл `.codex/config.toml` уже настроен для checkout
-`C:\projects\antiagent`. Если репозиторий находится в другом месте, замените
-абсолютные пути в `command`, `args` и `cwd`.
-
-Если project-scoped config не используется, альтернативно зарегистрируйте
-server в пользовательской конфигурации через Codex CLI. Выберите один способ,
-чтобы не дублировать запись:
+Установите проект как отдельное приложение через `pipx`. `pipx` создаёт
+изолированное окружение и публикует команду `antiagent-mcp` в `PATH`; поэтому
+конфигурация Codex не зависит от каталога checkout, буквы диска или имени
+пользователя:
 
 ```powershell
-codex.cmd mcp add antigravity_cli_executor -- "C:\projects\antiagent\.venv\Scripts\python.exe" "C:\projects\antiagent\agy_server.py"
+py -m pip install --user pipx
+py -m pipx ensurepath
+py -m pipx install .
+Get-Command antiagent-mcp
+```
+
+После изменения исходников обновляйте установленное приложение из текущего
+checkout командой `py -m pipx install --force .`.
+
+## 3. Подключите MCP к Codex один раз
+
+Зарегистрируйте установленную команду в пользовательской конфигурации. Не
+задавайте `cwd`: MCP наследует Git-root текущей Codex-сессии, поэтому одна
+регистрация безопасно работает с разными проектами:
+
+```powershell
+codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- antiagent-mcp
 codex.cmd mcp get antigravity_cli_executor
 ```
 
-Запускайте Codex из Git-root этого проекта и полностью перезапустите CLI,
-desktop app или IDE extension после изменения MCP/custom-agent конфигурации.
+Файл `.codex/config.toml` содержит тот же переносимый project-scoped вариант
+для разработки самого Antiagent. В нём также нет абсолютного пути и `cwd`.
+
+Запускайте Codex из Git-root целевого проекта и полностью перезапустите CLI,
+desktop app или IDE extension после изменения MCP-конфигурации.
 Полный контракт local placement, host boundary и проверка существующего OAuth
 описаны в [host-side deployment guide](HOST_SIDE_DEPLOYMENT.md). Значение
 `ANTIAGENT_EXECUTION_BOUNDARY=host` является декларацией оператора; готовность
@@ -53,7 +69,7 @@ desktop app или IDE extension после изменения MCP/custom-agent 
 проверяет только версию CLI, boundary declaration, wrapper state и Git-root;
 OAuth/keyring и сеть не читаются, поэтому `oauth_ready` остаётся `unknown`.
 
-## 3. Подключите skill
+## 4. Подключите skill
 
 Дополнительная установка для этого checkout не требуется. Codex автоматически
 ищет repo-scoped skills в `.agents/skills`, поэтому файл
@@ -72,9 +88,11 @@ Codex также может выбрать skill автоматически, к�
 
 Чтобы использовать skill в другом репозитории, скопируйте всю папку
 `.agents/skills/antigravity-executor` в `.agents/skills` целевого Git-root и
-подключите там MCP server. Один skill не создаёт MCP-подключение автоматически.
+при необходимости `.codex/agents/antigravity_worker.toml` в `.codex/agents`.
+Повторная MCP-регистрация не нужна. Один skill не создаёт MCP-подключение
+автоматически.
 
-## 4. Разрешите изменения после плана
+## 5. Разрешите изменения после плана
 
 Первый запуск всегда выполняется в безопасном `mode=plan`. Для конкретного
 согласованного изменения напишите:
@@ -87,10 +105,11 @@ $antigravity-executor разрешаю выполнить предложенны
 Antigravity не получает задачи на архитектуру, security, destructive-операции,
 секреты, commit или push. Финальное решение всегда остаётся за основным Codex.
 
-## 5. Проверка проекта
+## 6. Проверка проекта
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -v
+.\.venv\Scripts\python.exe .\smoke_mcp.py <КОРЕНЬ_GIT_ПРОЕКТА>
 .\.venv\Scripts\python.exe smoke_agy.py
 git diff --check
 ```

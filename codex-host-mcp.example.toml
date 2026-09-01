@@ -1,8 +1,6 @@
-# Inert template. Replace every C:\ABSOLUTE\... placeholder before installation.
+# Portable template used after installing the `antiagent-mcp` command in PATH.
 [mcp_servers.antigravity_cli_executor]
-command = 'C:\ABSOLUTE\antiagent\.venv\Scripts\python.exe'
-args = ['C:\ABSOLUTE\antiagent\agy_server.py']
-cwd = 'C:\ABSOLUTE\antiagent'
+command = 'antiagent-mcp'
 experimental_environment = "local"
 enabled = true
 required = true
@@ -22,6 +20,3 @@ enabled_tools = [
 [mcp_servers.antigravity_cli_executor.env]
 # Assertion only: verify actual placement with a live read-only MCP smoke.
 ANTIAGENT_EXECUTION_BOUNDARY = "host"
-ANTIAGENT_STATE_DIR = 'C:\ABSOLUTE\PRIVATE\antiagent-state'
-# Optional when agy is not available through the host PATH:
-# ANTIGRAVITY_CLI_PATH = 'C:\ABSOLUTE\agy\bin\agy.exe'

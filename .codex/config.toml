@@ -1,7 +1,5 @@
 [mcp_servers.antigravity_cli_executor]
-command = 'C:\projects\antiagent\.venv\Scripts\python.exe'
-args = ['C:\projects\antiagent\agy_server.py']
-cwd = 'C:\projects\antiagent'
+command = 'antiagent-mcp'
 experimental_environment = 'local'
 enabled = true
 required = true

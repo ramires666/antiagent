@@ -36,20 +36,22 @@ stdio server в remote executor. Оно само по себе не доказы
 - [Codex configuration reference](https://developers.openai.com/codex/config-reference/)
 - [Codex MCP configuration](https://developers.openai.com/codex/mcp/)
 
-Используйте [codex-host-mcp.example.toml](codex-host-mcp.example.toml) как inert
-шаблон. Не копируйте его в конфигурацию, пока не определены реальные абсолютные
-пути и не подтверждено, что выбранный Codex runtime запускает local stdio MCP в
-обычном пользовательском контексте.
+Используйте [codex-host-mcp.example.toml](codex-host-mcp.example.toml) как
+переносимый шаблон после установки команды `antiagent-mcp` через `pipx`. Он не
+содержит путь к checkout и намеренно не задаёт `cwd`: process наследует Git-root
+текущей Codex-сессии.
 
 ## Обязательные свойства host process
 
 1. MCP process и ручной `agy` работают под одним Windows SID.
-2. `command`, `args`, `cwd`, `ANTIAGENT_STATE_DIR` и при необходимости
-   `ANTIGRAVITY_CLI_PATH` — абсолютные локальные пути.
-3. State root доступен только этому пользователю и допускает создание
+2. Команда `antiagent-mcp` разрешается через пользовательский `PATH`, а MCP не
+   закреплён за диском, checkout или целевым проектом.
+3. Унаследованный process cwd является точным Git-root текущего проекта.
+4. State root по умолчанию в `%LOCALAPPDATA%\antiagent` доступен только этому
+   пользователю и допускает создание
    `agents.sqlite3`, `locks/` и `scratch/`.
-4. `agy --version` успешно выполняется в том же host context.
-5. Read-only MCP smoke в `mode=plan` завершается непустым `SUCCESS` без browser
+5. `agy --version` успешно выполняется в том же host context.
+6. Read-only MCP smoke в `mode=plan` завершается непустым `SUCCESS` без browser
    OAuth, повторного входа и изменений Git.
 
 `agy --version` проверяет только наличие исполняемого файла. Доступ к
@@ -61,19 +63,24 @@ stdio server в remote executor. Оно само по себе не доказы
 
 1. Откройте обычный PowerShell под тем Windows-пользователем, который уже
    авторизовал Antigravity/Gemini.
-2. Найдите абсолютные пути:
+2. Проверьте CLI и установите переносимую MCP-команду из Git-root Antiagent:
 
    ```powershell
-   (Get-Command agy -ErrorAction Stop).Source
-   (Get-Command python -ErrorAction Stop).Source
    agy --version
+   py -m pip install --user pipx
+   py -m pipx ensurepath
+   py -m pipx install .
+   Get-Command antiagent-mcp -ErrorAction Stop
    ```
 
-3. Создайте приватный state root вне sandbox-only каталога. Не помещайте туда
-   токены или копии профиля.
-4. Заполните inert TOML-шаблон и добавьте запись ровно в одну конфигурацию:
-   project-scoped `.codex/config.toml` доверенного репозитория или user-level
-   config. Не держите две конкурирующие регистрации одного MCP.
+3. Зарегистрируйте одну пользовательскую MCP-команду без `cwd`:
+
+   ```powershell
+   codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- antiagent-mcp
+   ```
+
+4. Не держите конкурирующие регистрации одного MCP. Project-scoped шаблон
+   нужен только для разработки самого Antiagent.
 5. Полностью перезапустите Codex. State root и MCP environment фиксируются при
    старте процесса.
 6. Проверьте регистрацию через `codex mcp get antigravity_cli_executor`.

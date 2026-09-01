@@ -45,7 +45,7 @@ py -m venv .venv
 
 ## Workspace, permissions и sandbox
 
-До запуска проверяется абсолютный Git-root. Необязательный `working_directory` принимает абсолютный путь или путь относительно текущего каталога MCP process и должен указывать точно на Git-root; пустое значение использует текущий каталог process. После canonical resolve разрешён только process cwd или его descendant: `..`, symlink или junction, ведущие наружу, отклоняются. Например, при process cwd `W:\HARDDEV` разрешён `W:\HARDDEV\smartgold`. Trust bypass не добавляется автоматически. Prompt запрещает дочернему агенту использовать MCP, plugins, subagents и сеть; slash/skill expansion дополнительно отключён флагом CLI.
+До запуска проверяется абсолютный Git-root. Необязательный `working_directory` принимает абсолютный путь или путь относительно текущего каталога MCP process и должен указывать точно на Git-root; пустое значение использует текущий каталог process. Глобальная MCP-регистрация намеренно не задаёт `cwd`, поэтому process наследует Git-root текущей Codex-сессии. После canonical resolve разрешён только process cwd или его descendant: `..`, symlink или junction, ведущие наружу, отклоняются. Trust bypass не добавляется автоматически. Prompt запрещает дочернему агенту использовать MCP, plugins, subagents и сеть; slash/skill expansion дополнительно отключён флагом CLI.
 
 Allow rules минимальны: чтение workspace, необходимые редактирования и явно разрешённые проверки. Shell, сеть, parent directories и внешние credentials не разрешаются глобально. `run_command` остаётся OS trust boundary.
 
@@ -77,10 +77,14 @@ Persistent manager добавляет шесть tools:
 
 ## MCP-конфигурация Windows
 
-Рекомендуемый способ — официальный CLI Codex:
+Сначала установите переносимую команду через `pipx`, затем зарегистрируйте её
+через официальный CLI Codex:
 
 ```powershell
-codex.cmd mcp add antigravity_cli_executor -- "<ABSOLUTE_PATH_TO_REPO>\.venv\Scripts\python.exe" "<ABSOLUTE_PATH_TO_REPO>\agy_server.py"
+py -m pip install --user pipx
+py -m pipx ensurepath
+py -m pipx install .
+codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- antiagent-mcp
 codex.cmd mcp get antigravity_cli_executor
 ```
 
@@ -90,9 +94,7 @@ codex.cmd mcp get antigravity_cli_executor
 
 ```toml
 [mcp_servers.antigravity_cli_executor]
-command = 'C:\projects\antiagent\.venv\Scripts\python.exe'
-args = ['C:\projects\antiagent\agy_server.py']
-cwd = 'C:\projects\antiagent'
+command = 'antiagent-mcp'
 experimental_environment = 'local'
 enabled = true
 required = true
@@ -113,7 +115,7 @@ enabled_tools = [
 ANTIAGENT_EXECUTION_BOUNDARY = 'host'
 ```
 
-В этом checkout готовый project-scoped шаблон находится в `.codex/config.toml`, а custom Codex-agent — в `.codex/agents/antigravity_worker.toml`. `experimental_environment='local'` исключает remote executor placement, но само по себе не доказывает доступ к Windows keyring. Boundary подтверждается только read-only live smoke после полного restart; подробности — в `HOST_SIDE_DEPLOYMENT.md`. Agent использует `gpt-5.6-luna` только как дешёвый proxy внутри native Codex thread, имеет `sandbox_mode=read-only` и MCP allowlist из восьми tools; фактическую coding-задачу выполняет Gemini/Antigravity. Для другого проекта замените абсолютные пути на его trusted root и `.venv`. Указывайте Python из `.venv`; не подставляйте глобальный `python` или глобальный MCP. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому `tool_timeout_sec` Codex должен быть 900 секунд.
+В этом checkout готовый project-scoped шаблон находится в `.codex/config.toml`, а custom Codex-agent — в `.codex/agents/antigravity_worker.toml`. `experimental_environment='local'` исключает remote executor placement, но само по себе не доказывает доступ к Windows keyring. Boundary подтверждается только read-only live smoke после полного restart; подробности — в `HOST_SIDE_DEPLOYMENT.md`. Agent использует `gpt-5.6-luna` только как дешёвый proxy внутри native Codex thread, имеет `sandbox_mode=read-only` и MCP allowlist из восьми tools; фактическую coding-задачу выполняет Gemini/Antigravity. Для другого проекта копируются только нужные worker/skill-файлы; глобальную MCP-регистрацию и пути менять не нужно. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому `tool_timeout_sec` Codex должен быть 900 секунд.
 
 Custom agents загружаются при старте Codex. После добавления или изменения TOML полностью перезапустите CLI/app/IDE session. Fine-grained запрета shell отдельным полем custom-agent schema нет: здесь применяются read-only sandbox, MCP allowlist и developer instructions. Родительский Codex остаётся владельцем lifecycle/UI, разрешений, diff review и тестов.
 
@@ -122,7 +124,8 @@ Custom agents загружаются при старте Codex. После до�
 ```powershell
 agy --version
 .\.venv\Scripts\python.exe -m unittest discover -v
-.\.venv\Scripts\python.exe "<ABSOLUTE_PATH_TO_REPO>\smoke_agy.py"
+.\.venv\Scripts\python.exe .\smoke_mcp.py <КОРЕНЬ_GIT_ПРОЕКТА>
+.\.venv\Scripts\python.exe .\smoke_agy.py
 ```
 
 Acceptance criteria:
