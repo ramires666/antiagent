@@ -687,8 +687,13 @@ def _get_agent_store() -> AgentStore:
     global _AGENT_STORE
     if _AGENT_STORE is None:
         _AGENT_STORE = AgentStore()
-        _AGENT_STORE.reconcile_stale(MAX_TIMEOUT_SECONDS + 60)
     return _AGENT_STORE
+
+
+def _reconcile_agent_store() -> AgentStore:
+    store = _get_agent_store()
+    store.reconcile_stale(MAX_TIMEOUT_SECONDS + 60)
+    return store
 
 
 def _valid_agent_id(value: object) -> str | None:
@@ -2054,7 +2059,7 @@ def _schedule_managed_agent(
     *,
     parent_agent_id: str | None = None,
 ) -> AgentSnapshot:
-    store = _get_agent_store()
+    store = _reconcile_agent_store()
     snapshot = store.create(
         workspace=prepared.workspace,
         thinking_level=prepared.thinking_level,
@@ -2173,7 +2178,7 @@ async def antigravity_agent_list(
             message="working_directory must be an existing Git root",
         )
     try:
-        agents = _get_agent_store().list(
+        agents = _reconcile_agent_store().list(
             status=cast(AgentStatus | None, status),
             workspace=preflight.root,
             limit=limit,

@@ -217,11 +217,18 @@ profile, non-writable state, denied network, OAuth timeout — возвраща�
 
 ### Этап G — lifecycle и concurrency (P2)
 
-- [ ] После рестарта немедленно завершать orphaned local tasks как
-      `manager_lost`, либо ввести полноценный lease/heartbeat recovery.
+- [x] Перед каждым новым `spawn` и `list` выполнять bounded reconciliation;
+      старые orphaned local tasks получают `manager_lost` и освобождают capacity.
+- [ ] После рестарта немедленно завершать совсем свежие orphaned tasks либо
+      ввести полноценный lease/heartbeat recovery (отдельный ADR).
 - [ ] Разделить exclusive edit lock и shared read-only lease.
 - [ ] Capacity учитывать per workspace и per owner/session.
 - [ ] Сохранить terminal immutability и cross-process cancellation.
+
+Примечание: полноценные leases/shared Windows locks/per-workspace quotas не
+включены в этот проход: они требуют отдельного протокола восстановления и
+межпроцессного тестового стенда; текущий fail-safe reconciliation закрывает
+вечный leak capacity без изменения публичного MCP-контракта.
 
 ## 7. Тестовая матрица
 
