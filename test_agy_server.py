@@ -83,6 +83,43 @@ class AgyServerTest(unittest.TestCase):
         cls._state_patch.stop()
         cls._state_directory.cleanup()
 
+    def test_execution_boundary_accepts_only_exact_host(self):
+        with patch.dict(
+            os.environ, {server.EXECUTION_BOUNDARY_ENV: "host"}
+        ), patch.object(server.logger, "warning") as warning:
+            self.assertTrue(server._check_execution_boundary())
+        warning.assert_not_called()
+
+    def test_execution_boundary_warning_is_generic_and_compatible(self):
+        sentinel = "SECRET-C:/Users/example/profile"
+        for value in (None, "", "HOST", sentinel):
+            with self.subTest(value=value):
+                environment = (
+                    {} if value is None else {server.EXECUTION_BOUNDARY_ENV: value}
+                )
+                with patch.dict(os.environ, environment, clear=True), patch.object(
+                    server.logger, "warning"
+                ) as warning:
+                    self.assertFalse(server._check_execution_boundary())
+                warning.assert_called_once_with(
+                    "Host execution boundary is not declared; OAuth readiness is unverified"
+                )
+                self.assertNotIn(sentinel, repr(warning.call_args))
+
+    def test_main_checks_boundary_before_starting_stdio(self):
+        calls = []
+        with patch.object(
+            server, "_check_execution_boundary", side_effect=lambda: calls.append("check")
+        ) as check, patch.object(
+            server.mcp,
+            "run",
+            side_effect=lambda **_kwargs: calls.append("run"),
+        ) as run:
+            server.main()
+        check.assert_called_once_with()
+        run.assert_called_once_with(transport="stdio")
+        self.assertEqual(calls, ["check", "run"])
+
     @staticmethod
     def _start_lock_worker(root, lock_directory, marker, *, mode="hold", hold=0, timeout=1):
         return subprocess.Popen(

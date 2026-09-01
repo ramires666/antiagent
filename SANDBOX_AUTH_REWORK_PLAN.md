@@ -2,7 +2,7 @@
 
 Дата: 2026-09-01
 
-Статус: этапы A–B выполнены, этап C следующий
+Статус: этапы A–B и C1 выполнены; C2 live acceptance после restart — следующий
 
 Основные компоненты: `agy_server.py`, `agent_manager.py`, MCP-конфигурация Codex
 
@@ -145,20 +145,22 @@ stderr отсутствует в result, logs и structured snapshot.
 Критерий приёмки: suite проходит с запрещённым default TEMP и доступным явным
 state root; никаких credentials в новом каталоге нет.
 
-### Этап C — host-side deployment contract (P0)
+### Этап C — host-side deployment contract (P0, C1 выполнен)
 
 Файлы: новый deployment-раздел документации; `.codex/config.toml` только после
 review существующих пользовательских изменений.
 
-- [ ] Явно назвать MCP process host-side trust component.
-- [ ] Добавить startup self-check `ANTIAGENT_EXECUTION_BOUNDARY=host`.
-- [ ] Если boundary не объявлена, не утверждать готовность OAuth; выдавать
+- [x] Явно назвать MCP process host-side trust component.
+- [x] Добавить startup self-check `ANTIAGENT_EXECUTION_BOUNDARY=host`.
+- [x] Если boundary не объявлена, не утверждать готовность OAuth; выдавать
       диагностическое предупреждение, но сохранить совместимость.
-- [ ] Описать, что sandbox runtime должен разрешать запуск локального stdio MCP
+- [x] Описать, что sandbox runtime должен разрешать запуск локального stdio MCP
       за пределами shell sandbox.
-- [ ] Запретить рекомендации по копированию `.gemini` или keyring export.
-- [ ] Добавить операторскую проверку: одинаковый Windows identity, доступ к
+- [x] Запретить рекомендации по копированию `.gemini` или keyring export.
+- [x] Добавить операторскую проверку: одинаковый Windows identity, доступ к
       штатному профилю, успешный `agy --version`, затем live `plan` smoke.
+- [ ] После установки inert config-примера в проверенный local runtime выполнить
+      полный restart Codex и live `plan` smoke без browser/re-auth.
 
 Критерий приёмки: при host-side запуске используется существующий keyring без
 повторного OAuth; при sandboxed запуске возвращается profile/network code.

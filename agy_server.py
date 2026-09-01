@@ -53,6 +53,8 @@ logging.basicConfig(
 logger = logging.getLogger("antigravity-cli-mcp")
 mcp = MCPServer("Antigravity CLI Executor")
 
+EXECUTION_BOUNDARY_ENV = "ANTIAGENT_EXECUTION_BOUNDARY"
+
 ThinkingLevel = Literal["low", "medium", "high"]
 Mode = Literal["plan", "accept-edits"]
 THINKING_LEVELS = ("low", "medium", "high")
@@ -2199,5 +2201,20 @@ async def _redact_tool_validation_error(ctx, call_next):
 mcp.middleware.append(_redact_tool_validation_error)
 
 
-if __name__ == "__main__":
+def _check_execution_boundary() -> bool:
+    """Check the operator-declared process boundary without exposing its value."""
+    if os.environ.get(EXECUTION_BOUNDARY_ENV) == "host":
+        return True
+    logger.warning(
+        "Host execution boundary is not declared; OAuth readiness is unverified"
+    )
+    return False
+
+
+def main() -> None:
+    _check_execution_boundary()
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
