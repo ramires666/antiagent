@@ -2,7 +2,7 @@
 
 Дата: 2026-09-01
 
-Статус: начата реализация
+Статус: этап A выполнен, этап B следующий
 
 Основные компоненты: `agy_server.py`, `agent_manager.py`, MCP-конфигурация Codex
 
@@ -110,17 +110,17 @@ Doctor не должен запускать OAuth, читать keyring, печ�
 
 ## 6. Этапы реализации
 
-### Этап A — строгая диагностика результата (P0, начат)
+### Этап A — строгая диагностика результата (P0, выполнен)
 
 Файлы: `agy_server.py`, `test_agy_server.py`, `test_mcp_protocol.py`.
 
-- [ ] Сохранять bounded `stderr` только внутри `CliRunResult`.
-- [ ] Классифицировать только финальный failed/timeout result.
-- [ ] Не логировать и не возвращать raw `stderr`.
-- [ ] Добавить перечисленные machine codes в Pydantic/MCP schema.
-- [ ] Отклонять пустой `SUCCESS.response` как `no_content`.
-- [ ] Оставлять неизвестный failure как `cli_error`.
-- [ ] Добавить precedence tests на составные цепочки ошибок.
+- [x] Сохранять bounded `stderr` только внутри `CliRunResult`.
+- [x] Классифицировать только финальный failed/timeout result.
+- [x] Не логировать и не возвращать raw `stderr`.
+- [x] Добавить перечисленные machine codes в Pydantic/MCP schema.
+- [x] Отклонять пустой `SUCCESS.response` как `no_content`.
+- [x] Оставлять неизвестный failure как `cli_error`.
+- [x] Добавить precedence tests на составные цепочки ошибок.
 
 Критерий приёмки: deterministic fixture воспроизводит каждый класс; sentinel из
 stderr отсутствует в result, logs и structured snapshot.

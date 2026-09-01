@@ -134,6 +134,13 @@ class AgyServerTest(unittest.TestCase):
         )
         self.assertFalse(run.call_args.kwargs["shell"])
 
+    def test_cli_run_result_preserves_legacy_positional_flags(self):
+        result = server.CliRunResult(1, "output", False, True, True)
+        self.assertTrue(result.command_line_too_long)
+        self.assertTrue(result.output_limit)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result, (1, "output", False))
+
     def test_validation_happens_before_cli_resolution(self):
         with patch("agy_server._resolve_cli") as resolve:
             empty = asyncio.run(server.antigravity_cli_execute("  "))
@@ -212,7 +219,7 @@ class AgyServerTest(unittest.TestCase):
 
     def _execute(
         self, *, level="low", mode="plan", stdout=None, returncode=0,
-        timed_out=False,
+        timed_out=False, stderr="",
     ):
         captured = {}
 
@@ -220,9 +227,14 @@ class AgyServerTest(unittest.TestCase):
             captured["argv"] = argv
             captured["cwd"] = cwd
             captured["timeout_seconds"] = timeout_seconds
-            return returncode, json.dumps(stdout if stdout is not None else {
-                "status": "SUCCESS", "response": "marker",
-            }), timed_out
+            return server.CliRunResult(
+                returncode,
+                json.dumps(stdout if stdout is not None else {
+                    "status": "SUCCESS", "response": "marker",
+                }),
+                timed_out,
+                stderr=stderr,
+            )
 
         with patch(
             "agy_server._git_preflight",
@@ -1235,8 +1247,14 @@ class AgyServerTest(unittest.TestCase):
                 self.assertEqual(result_data(result)["result"], expected)
                 self.assertNotIn("private", json.dumps(result_data(result)))
         missing_response, _ = self._execute(stdout={"status": "SUCCESS"})
-        self.assertEqual(missing_response["status"], "SUCCESS")
-        self.assertEqual(missing_response["result"], "")
+        missing_data = result_data(missing_response)
+        self.assertEqual(missing_data["status"], "ERROR")
+        self.assertEqual(missing_data["error_type"], "no_content")
+        self.assertEqual(missing_data["result"], "Antigravity CLI returned no content")
+        whitespace_response, _ = self._execute(stdout={
+            "status": "SUCCESS", "response": " \r\n\t"
+        })
+        self.assertEqual(result_data(whitespace_response)["error_type"], "no_content")
 
     def test_malformed_and_nonzero_output_are_generic(self):
         with patch(
@@ -1256,6 +1274,149 @@ class AgyServerTest(unittest.TestCase):
             failed = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
         self.assertEqual(result_data(failed)["result"], "Antigravity CLI task failed")
         self.assertNotIn("secret", json.dumps(result_data(failed)))
+
+    def test_cli_failure_classification_precedence_and_redaction(self):
+        cases = (
+            (
+                "profile",
+                "Failed to resolve GeminiDir .gemini: Access is denied PROFILE_SECRET",
+                "profile_unreadable",
+                "Antigravity profile is not readable by the executor",
+                False,
+            ),
+            (
+                "profile-writer",
+                "summary store recreate failed: unable to open database file WRITER_SECRET",
+                "profile_not_writable",
+                "Antigravity profile state is not writable by the executor",
+                False,
+            ),
+            (
+                "network-before-oauth",
+                "connectex: socket in a way forbidden by its access permissions\n"
+                "Print mode: triggering interactive OAuth\nNETWORK_SECRET",
+                "network_denied",
+                "Antigravity network access was denied",
+                True,
+            ),
+            (
+                "profile-before-network",
+                "profile directory access is denied\nconnectex: network denied PROFILE_NETWORK_SECRET",
+                "profile_unreadable",
+                "Antigravity profile is not readable by the executor",
+                False,
+            ),
+            (
+                "network-before-permission",
+                "network denied\nsoft-denying tool confirmation NETWORK_PERMISSION_SECRET",
+                "network_denied",
+                "Antigravity network access was denied",
+                False,
+            ),
+            (
+                "permission-before-oauth",
+                "soft-denying tool confirmation\nauth timed out PERMISSION_OAUTH_SECRET",
+                "permission_denied",
+                "Antigravity tool permission was denied",
+                True,
+            ),
+            (
+                "oauth-before-auth",
+                "You are not logged into Antigravity\nPrint mode: auth timed out OAUTH_SECRET",
+                "oauth_timeout",
+                "Antigravity OAuth did not complete",
+                True,
+            ),
+            (
+                "auth",
+                "You are not logged into Antigravity AUTH_SECRET",
+                "auth_missing",
+                "Antigravity authentication is unavailable",
+                False,
+            ),
+            (
+                "permission",
+                'Print mode: soft-denying tool confirmation "ListDir" PERMISSION_SECRET',
+                "permission_denied",
+                "Antigravity tool permission was denied",
+                False,
+            ),
+            (
+                "policy-before-profile",
+                "approval-review policy denied payload; .gemini Access is denied POLICY_SECRET",
+                "policy_denied",
+                "Antigravity payload was denied by policy",
+                False,
+            ),
+        )
+        for name, stderr, expected_type, expected_message, timed_out in cases:
+            with self.subTest(name=name), self.assertLogs(
+                server.logger, level="WARNING"
+            ) as logs:
+                result, _ = self._execute(
+                    stdout={"status": "FAIL", "error": "safe"},
+                    returncode=1,
+                    timed_out=timed_out,
+                    stderr=stderr,
+                )
+            data = result_data(result)
+            self.assertEqual(data["status"], "ERROR")
+            self.assertEqual(data["error_type"], expected_type)
+            self.assertEqual(data["result"], expected_message)
+            self.assertFalse(data["retryable"])
+            secret = stderr.split()[-1]
+            self.assertNotIn(secret, json.dumps(data))
+            self.assertNotIn(secret, "\n".join(logs.output))
+
+        unknown, _ = self._execute(
+            stdout={"status": "FAIL"}, returncode=1,
+            stderr="unrecognized internal failure UNKNOWN_SECRET",
+        )
+        self.assertEqual(result_data(unknown)["error_type"], "cli_error")
+        self.assertNotIn("UNKNOWN_SECRET", json.dumps(result_data(unknown)))
+
+        stale_auth, _ = self._execute(
+            stdout={"status": "FAIL", "error": "backend failure"},
+            returncode=1,
+            stderr=(
+                "You are not logged into Antigravity\n"
+                "ChainedAuth: authenticated via keyring STALE_AUTH_SECRET"
+            ),
+        )
+        self.assertEqual(result_data(stale_auth)["error_type"], "cli_error")
+        self.assertNotIn("STALE_AUTH_SECRET", json.dumps(result_data(stale_auth)))
+
+        benign_response, _ = self._execute(
+            stdout={"status": "FAIL", "response": "user text says policy denied"},
+            returncode=1,
+            stderr="unrecognized BENIGN_RESPONSE_SECRET",
+        )
+        self.assertEqual(result_data(benign_response)["error_type"], "cli_error")
+
+        unknown_timeout, _ = self._execute(
+            stdout={"status": "FAIL"}, returncode=1, timed_out=True,
+            stderr="unrecognized timeout detail TIMEOUT_SECRET",
+        )
+        self.assertEqual(result_data(unknown_timeout)["error_type"], "timeout")
+
+    def test_classified_stderr_is_not_persisted_in_agent_store(self):
+        secret = "PERSISTED_STDERR_SECRET"
+        result, _ = self._execute(
+            stdout={"status": "FAIL"}, returncode=1,
+            stderr=f"network denied {secret}",
+        )
+        data = result_data(result)
+        self.assertEqual(data["error_type"], "network_denied")
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "agents.sqlite3"
+            store = server.AgentStore(database, owner_id="stderr-redaction-test")
+            snapshot = store.create(Path(directory), "low", "plan")
+            store.finish(snapshot.agent_id, "failed", output=data)
+            stored = store.get(snapshot.agent_id)
+            store.close()
+            self.assertIsNotNone(stored)
+            self.assertNotIn(secret, json.dumps(stored.output))
+            self.assertNotIn(secret.encode(), database.read_bytes())
 
     def test_stderr_and_logs_do_not_disclose_output(self):
         async def scenario():
@@ -1282,7 +1443,9 @@ class AgyServerTest(unittest.TestCase):
             ):
                 return await server._run_cli(["agy"], Path("C:/repo"), 1)
 
-        self.assertEqual(asyncio.run(scenario()), (0, "public", False))
+        cli_result = asyncio.run(scenario())
+        self.assertEqual(cli_result, (0, "public", False))
+        self.assertEqual(cli_result.stderr, "STDERR_SECRET")
         with self.assertLogs(server.logger, level="WARNING") as logs:
             result, _ = self._execute(stdout={
                 "status": "FAIL", "response": "PAYLOAD_SECRET"
@@ -1302,8 +1465,8 @@ class AgyServerTest(unittest.TestCase):
             result = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
         data = result_data(result)
         self.assertEqual(data["status"], "ERROR")
-        self.assertEqual(data["result"], "Antigravity CLI returned invalid JSON")
-        self.assertEqual(data["error_type"], "invalid_json")
+        self.assertEqual(data["result"], "Antigravity CLI task failed")
+        self.assertEqual(data["error_type"], "cli_error")
         self.assertEqual(data["exit_code"], -9)
         self.assertFalse(data["retryable"])
         self.assertEqual(set(data), OUTPUT_FIELDS)

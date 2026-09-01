@@ -105,6 +105,14 @@ ErrorType = Literal[
     "invalid_payload",
     "invalid_response",
     "cli_error",
+    "profile_unreadable",
+    "profile_not_writable",
+    "network_denied",
+    "auth_missing",
+    "oauth_timeout",
+    "permission_denied",
+    "policy_denied",
+    "no_content",
     "review_required",
     "review_state_unavailable",
 ]
@@ -129,6 +137,14 @@ AgentManagerErrorType = Literal[
     "invalid_payload",
     "invalid_response",
     "cli_error",
+    "profile_unreadable",
+    "profile_not_writable",
+    "network_denied",
+    "auth_missing",
+    "oauth_timeout",
+    "permission_denied",
+    "policy_denied",
+    "no_content",
     "review_required",
     "review_state_unavailable",
     "agent_not_found",
@@ -169,6 +185,7 @@ class CliRunResult:
     timed_out: bool
     command_line_too_long: bool = False
     output_limit: bool = False
+    stderr: str = ""
 
     def __iter__(self):
         yield self.returncode
@@ -1150,7 +1167,7 @@ async def _run_cli(
     try:
         # Shield the pipe-draining task: cancelling it on Windows can leave
         # Proactor pipe transports behind after taskkill.
-        stdout, exceeded, _stderr = await asyncio.wait_for(
+        stdout, exceeded, stderr = await asyncio.wait_for(
             asyncio.shield(communication), timeout=timeout_seconds or _timeout_seconds()
         )
         if exceeded:
@@ -1158,16 +1175,21 @@ async def _run_cli(
             job = None
             await asyncio.to_thread(_kill_process_tree, process)
             await _finish_killed_process(process, communication)
+            # A pipe exceeded its bound. Discard both raw streams instead of
+            # retaining an incomplete diagnostic that may contain secrets.
             return CliRunResult(process.returncode, "", False, output_limit=True)
         return CliRunResult(
-            process.returncode, stdout.decode("utf-8", errors="replace"), False
+            process.returncode,
+            stdout.decode("utf-8", errors="replace"),
+            False,
+            stderr=stderr.decode("utf-8", errors="replace"),
         )
     except asyncio.TimeoutError:
         _close_windows_job(job)
         job = None
         await asyncio.to_thread(_kill_process_tree, process)
         try:
-            stdout, _exceeded, _stderr = await asyncio.wait_for(
+            stdout, _exceeded, stderr = await asyncio.wait_for(
                 asyncio.shield(communication), timeout=10
             )
         except Exception:
@@ -1176,10 +1198,15 @@ async def _run_cli(
             except OSError:
                 pass
             await _finish_killed_process(process, communication)
+            # Reader failure means no trustworthy bounded diagnostic is
+            # available; preserve the typed timeout and keep stderr empty.
             return CliRunResult(process.returncode, "", True)
         await _finish_killed_process(process, communication)
         return CliRunResult(
-            process.returncode, stdout.decode("utf-8", errors="replace"), True
+            process.returncode,
+            stdout.decode("utf-8", errors="replace"),
+            True,
+            stderr=stderr.decode("utf-8", errors="replace"),
         )
     except asyncio.CancelledError:
         _close_windows_job(job)
@@ -1321,14 +1348,26 @@ def _success_result(
     run_info: RunInfo, cli_version: str | None, exit_code: int | None,
 ) -> dict[str, Any]:
     response = payload.get("response", "")
+    usage, usage_available = _usage_info(payload)
+    conversation_id, conversation_id_available = _conversation_id_info(payload)
     if not isinstance(response, str):
         return _empty_result(
             "ERROR", "Antigravity CLI returned an invalid response", level, mode,
             error_type="invalid_response", run_info=run_info,
-            cli_version=cli_version, exit_code=exit_code,
+            cli_version=cli_version, exit_code=exit_code, usage=usage,
+            usage_available=usage_available,
+            conversation_id=conversation_id,
+            conversation_id_available=conversation_id_available,
         )
-    usage, usage_available = _usage_info(payload)
-    conversation_id, conversation_id_available = _conversation_id_info(payload)
+    if not response.strip():
+        return _empty_result(
+            "ERROR", "Antigravity CLI returned no content", level, mode,
+            error_type="no_content", run_info=run_info,
+            cli_version=cli_version, exit_code=exit_code, usage=usage,
+            usage_available=usage_available,
+            conversation_id=conversation_id,
+            conversation_id_available=conversation_id_available,
+        )
     return _empty_result(
         "SUCCESS",
         response,
@@ -1385,6 +1424,88 @@ def _build_argv(
 
 def _safe_exit_code(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+_CLI_FAILURE_MESSAGES: dict[ErrorType, str] = {
+    "profile_unreadable": "Antigravity profile is not readable by the executor",
+    "profile_not_writable": "Antigravity profile state is not writable by the executor",
+    "network_denied": "Antigravity network access was denied",
+    "auth_missing": "Antigravity authentication is unavailable",
+    "oauth_timeout": "Antigravity OAuth did not complete",
+    "permission_denied": "Antigravity tool permission was denied",
+    "policy_denied": "Antigravity payload was denied by policy",
+}
+
+
+def _classify_cli_failure(
+    stderr: str,
+    payload: dict[str, Any] | None = None,
+) -> ErrorType | None:
+    """Return an allowlisted final failure class without exposing diagnostics."""
+    parts = [stderr]
+    if payload is not None:
+        for key in ("error_type", "error", "message", "final_status"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+            elif isinstance(value, dict):
+                try:
+                    parts.append(json.dumps(value, ensure_ascii=False, default=str))
+                except (TypeError, ValueError):
+                    pass
+    diagnostic = "\n".join(parts).lower()
+    auth_succeeded = any(marker in diagnostic for marker in (
+        "authenticated via keyring", "oauth: authenticated successfully",
+        "keyringauth: loaded token", "streamgeneratecontent", "responseid",
+    ))
+
+    # Root-cause order is deliberate. Derived auth/OAuth messages often follow
+    # an earlier profile or network denial in the same CLI run.
+    if any(marker in diagnostic for marker in (
+        "approval gate", "approval-review", "policy_denied", "policy denied",
+        "blocked_policy", "unacceptable risk",
+    )):
+        return "policy_denied"
+
+    profile_marker = any(marker in diagnostic for marker in (
+        ".gemini", "antigravity-cli", "summary store", "summary_store",
+        "crash reporter", "crash output", "profile directory", "profile access",
+        "profile_unreadable",
+        "profile unreadable", "profile_not_writable", "profile not writable",
+    ))
+    if profile_marker and any(marker in diagnostic for marker in (
+        "profile_not_writable", "profile not writable", "unable to open database file",
+        "failed to setup crash output", "summary store recreate failed",
+    )):
+        return "profile_not_writable"
+    if profile_marker and any(marker in diagnostic for marker in (
+        "access is denied", "permission denied", "profile_unreadable",
+        "profile unreadable", "cannot read", "failed to resolve geminidir",
+    )):
+        return "profile_unreadable"
+
+    if any(marker in diagnostic for marker in (
+        "network_denied", "network denied", "socket access was forbidden",
+        "socket in a way forbidden by its access permissions",
+        "connectex:", "network is unreachable",
+    )):
+        return "network_denied"
+    if any(marker in diagnostic for marker in (
+        "soft-denying tool confirmation", "permission_denied", "permission denied",
+        "tool permission was denied", "denied tool",
+    )):
+        return "permission_denied"
+    if not auth_succeeded and any(marker in diagnostic for marker in (
+        "oauth_timeout", "oauth timeout", "auth timed out",
+        "triggering interactive oauth",
+    )):
+        return "oauth_timeout"
+    if not auth_succeeded and any(marker in diagnostic for marker in (
+        "auth_missing", "auth missing", "you are not logged into antigravity",
+        "login required", "authentication required",
+    )):
+        return "auth_missing"
+    return None
 
 
 def _retryable(error_type: ErrorType | None, mode: str | None) -> bool:
@@ -1485,11 +1606,13 @@ async def execute_with_antigravity_cli(
             returncode = cli_result.returncode
             stdout = cli_result.stdout
             timed_out = cli_result.timed_out
+            stderr = cli_result.stderr
             command_line_too_long = cli_result.command_line_too_long
             output_limit = cli_result.output_limit
         else:
             # Keep small test/integration fakes compatible with the old triple.
             returncode, stdout, timed_out = cli_result
+            stderr = ""
             command_line_too_long = False
             output_limit = False
     except asyncio.TimeoutError:
@@ -1533,10 +1656,17 @@ async def execute_with_antigravity_cli(
         run.finish()
 
     if timed_out:
-        logger.warning("Antigravity CLI timed out")
+        classified = _classify_cli_failure(stderr)
+        error_type = classified or "timeout"
+        message = (
+            _CLI_FAILURE_MESSAGES[classified]
+            if classified in _CLI_FAILURE_MESSAGES
+            else "Antigravity CLI timed out"
+        )
+        logger.warning("Antigravity CLI failed (%s)", error_type)
         return _empty_result(
-            "ERROR", "Antigravity CLI timed out", thinking_level, mode,
-            error_type="timeout", run_info=run, cli_version=cli_version,
+            "ERROR", message, thinking_level, mode,
+            error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
             postflight=postflight,
         )
@@ -1563,6 +1693,28 @@ async def execute_with_antigravity_cli(
             exit_code=_safe_exit_code(returncode),
             postflight=postflight,
         )
+    if returncode != 0:
+        payload_for_classification: dict[str, Any] | None = None
+        try:
+            parsed_failure = json.loads(stdout.strip())
+            if isinstance(parsed_failure, dict):
+                payload_for_classification = parsed_failure
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        classified = _classify_cli_failure(stderr, payload_for_classification)
+        error_type = classified or "cli_error"
+        message = (
+            _CLI_FAILURE_MESSAGES[classified]
+            if classified in _CLI_FAILURE_MESSAGES
+            else "Antigravity CLI task failed"
+        )
+        logger.warning("Antigravity CLI task failed (%s)", error_type)
+        return _empty_result(
+            "ERROR", message, thinking_level, mode,
+            error_type=error_type, run_info=run, cli_version=cli_version,
+            exit_code=_safe_exit_code(returncode),
+            postflight=postflight,
+        )
     try:
         payload = json.loads(stdout.strip())
     except (json.JSONDecodeError, TypeError, ValueError):
@@ -1580,11 +1732,18 @@ async def execute_with_antigravity_cli(
             exit_code=_safe_exit_code(returncode),
             postflight=postflight,
         )
-    if returncode != 0 or payload.get("status") != "SUCCESS":
-        logger.warning("Antigravity CLI task failed")
+    if payload.get("status") != "SUCCESS":
+        classified = _classify_cli_failure(stderr, payload)
+        error_type = classified or "cli_error"
+        message = (
+            _CLI_FAILURE_MESSAGES[classified]
+            if classified in _CLI_FAILURE_MESSAGES
+            else "Antigravity CLI task failed"
+        )
+        logger.warning("Antigravity CLI task failed (%s)", error_type)
         return _empty_result(
-            "ERROR", "Antigravity CLI task failed", thinking_level, mode,
-            error_type="cli_error", run_info=run, cli_version=cli_version,
+            "ERROR", message, thinking_level, mode,
+            error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
             postflight=postflight,
         )
