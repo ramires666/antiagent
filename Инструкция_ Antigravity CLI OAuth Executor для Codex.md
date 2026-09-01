@@ -83,9 +83,10 @@ codex.cmd mcp get antigravity_cli_executor
 
 ```toml
 [mcp_servers.antigravity_cli_executor]
-command = 'W:\_python\antiagent\.venv\Scripts\python.exe'
-args = ['W:\_python\antiagent\agy_server.py']
-cwd = 'W:\_python\antiagent'
+command = 'C:\projects\antiagent\.venv\Scripts\python.exe'
+args = ['C:\projects\antiagent\agy_server.py']
+cwd = 'C:\projects\antiagent'
+experimental_environment = 'local'
 enabled = true
 required = true
 startup_timeout_sec = 30
@@ -99,9 +100,12 @@ enabled_tools = [
   'antigravity_agent_interrupt',
   'antigravity_cli_execute',
 ]
+
+[mcp_servers.antigravity_cli_executor.env]
+ANTIAGENT_EXECUTION_BOUNDARY = 'host'
 ```
 
-В этом checkout готовый project-scoped шаблон находится в `.codex/config.toml`, а custom Codex-agent — в `.codex/agents/antigravity_worker.toml`. Agent использует `gpt-5.6-luna` только как дешёвый proxy внутри native Codex thread, имеет `sandbox_mode=read-only` и MCP allowlist из семи tools; фактическую coding-задачу выполняет Gemini/Antigravity. Для другого проекта замените абсолютные пути на его trusted root и `.venv`. Указывайте Python из `.venv`; не подставляйте глобальный `python` или глобальный MCP. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому `tool_timeout_sec` Codex должен быть 900 секунд.
+В этом checkout готовый project-scoped шаблон находится в `.codex/config.toml`, а custom Codex-agent — в `.codex/agents/antigravity_worker.toml`. `experimental_environment='local'` исключает remote executor placement, но само по себе не доказывает доступ к Windows keyring. Boundary подтверждается только read-only live smoke после полного restart; подробности — в `HOST_SIDE_DEPLOYMENT.md`. Agent использует `gpt-5.6-luna` только как дешёвый proxy внутри native Codex thread, имеет `sandbox_mode=read-only` и MCP allowlist из семи tools; фактическую coding-задачу выполняет Gemini/Antigravity. Для другого проекта замените абсолютные пути на его trusted root и `.venv`. Указывайте Python из `.venv`; не подставляйте глобальный `python` или глобальный MCP. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому `tool_timeout_sec` Codex должен быть 900 секунд.
 
 Custom agents загружаются при старте Codex. После добавления или изменения TOML полностью перезапустите CLI/app/IDE session. Fine-grained запрета shell отдельным полем custom-agent schema нет: здесь применяются read-only sandbox, MCP allowlist и developer instructions. Родительский Codex остаётся владельцем lifecycle/UI, разрешений, diff review и тестов.
 

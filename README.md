@@ -1,8 +1,8 @@
 # Antiagent: Antigravity для Codex
 
 Этот проект подключает OAuth-аутентифицированный Antigravity CLI к Codex через
-локальный MCP server. Codex управляет задачей, разрешениями, review и тестами, а
-Gemini/Antigravity выполняет небольшую leaf coding-задачу.
+локальный stdio MCP process. Codex управляет задачей, разрешениями, review и
+тестами, а Gemini/Antigravity выполняет небольшую leaf coding-задачу.
 
 В репозитории уже находятся:
 
@@ -30,7 +30,7 @@ agy --version
 ## 2. Подключите MCP к Codex
 
 Файл `.codex/config.toml` уже настроен для checkout
-`W:\_python\antiagent`. Если репозиторий находится в другом месте, замените
+`C:\projects\antiagent`. Если репозиторий находится в другом месте, замените
 абсолютные пути в `command`, `args` и `cwd`.
 
 Если project-scoped config не используется, альтернативно зарегистрируйте
@@ -38,12 +38,16 @@ server в пользовательской конфигурации через C
 чтобы не дублировать запись:
 
 ```powershell
-codex.cmd mcp add antigravity_cli_executor -- "W:\_python\antiagent\.venv\Scripts\python.exe" "W:\_python\antiagent\agy_server.py"
+codex.cmd mcp add antigravity_cli_executor -- "C:\projects\antiagent\.venv\Scripts\python.exe" "C:\projects\antiagent\agy_server.py"
 codex.cmd mcp get antigravity_cli_executor
 ```
 
 Запускайте Codex из Git-root этого проекта и полностью перезапустите CLI,
 desktop app или IDE extension после изменения MCP/custom-agent конфигурации.
+Полный контракт local placement, host boundary и проверка существующего OAuth
+описаны в [host-side deployment guide](HOST_SIDE_DEPLOYMENT.md). Значение
+`ANTIAGENT_EXECUTION_BOUNDARY=host` является декларацией оператора; готовность
+подтверждается только новым read-only MCP smoke после перезапуска.
 
 ## 3. Подключите skill
 

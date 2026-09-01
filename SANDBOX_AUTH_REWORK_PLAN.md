@@ -2,7 +2,8 @@
 
 Дата: 2026-09-01
 
-Статус: этапы A–B и C1 выполнены; C2 live acceptance после restart — следующий
+Статус: A–B и C1 выполнены; C2 config установлен, post-restart smoke ожидается;
+этап D следующий
 
 Основные компоненты: `agy_server.py`, `agent_manager.py`, MCP-конфигурация Codex
 
@@ -145,7 +146,7 @@ stderr отсутствует в result, logs и structured snapshot.
 Критерий приёмки: suite проходит с запрещённым default TEMP и доступным явным
 state root; никаких credentials в новом каталоге нет.
 
-### Этап C — host-side deployment contract (P0, C1 выполнен)
+### Этап C — host-side deployment contract (P0, C2 ожидает restart)
 
 Файлы: новый deployment-раздел документации; `.codex/config.toml` только после
 review существующих пользовательских изменений.
@@ -159,8 +160,14 @@ review существующих пользовательских изменен�
 - [x] Запретить рекомендации по копированию `.gemini` или keyring export.
 - [x] Добавить операторскую проверку: одинаковый Windows identity, доступ к
       штатному профилю, успешный `agy --version`, затем live `plan` smoke.
-- [ ] После установки inert config-примера в проверенный local runtime выполнить
-      полный restart Codex и live `plan` smoke без browser/re-auth.
+- [x] Установить local placement и boundary declaration в active config;
+      изменения применяются для новых MCP process после полного restart Codex.
+- [x] Выполнить pre-restart baseline без browser/re-auth: `SUCCESS`, marker
+      `ANTIAGENT_HOST_OAUTH_OK_20260901`, CLI `1.1.23`, usage доступен
+      (`total_tokens=16540`), run `ccbc913c9f734514a162af09e355aabb`,
+      Git не изменён.
+- [ ] После полного restart повторить marker через новый MCP process и записать
+      `status`, usage, CLI version, run ID и неизменный Git.
 
 Критерий приёмки: при host-side запуске используется существующий keyring без
 повторного OAuth; при sandboxed запуске возвращается profile/network code.

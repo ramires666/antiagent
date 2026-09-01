@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from ctypes import wintypes
 from pathlib import Path
@@ -119,6 +120,15 @@ class AgyServerTest(unittest.TestCase):
         check.assert_called_once_with()
         run.assert_called_once_with(transport="stdio")
         self.assertEqual(calls, ["check", "run"])
+
+    def test_project_config_declares_local_host_boundary(self):
+        config_path = Path(__file__).resolve().parent / ".codex" / "config.toml"
+        with config_path.open("rb") as stream:
+            config = tomllib.load(stream)
+        executor = config["mcp_servers"]["antigravity_cli_executor"]
+        self.assertEqual(executor["experimental_environment"], "local")
+        self.assertEqual(executor["env"], {server.EXECUTION_BOUNDARY_ENV: "host"})
+        self.assertEqual(executor["tool_timeout_sec"], 900)
 
     @staticmethod
     def _start_lock_worker(root, lock_directory, marker, *, mode="hold", hold=0, timeout=1):

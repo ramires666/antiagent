@@ -1,7 +1,8 @@
 [mcp_servers.antigravity_cli_executor]
-command = 'W:\_python\antiagent\.venv\Scripts\python.exe'
-args = ['W:\_python\antiagent\agy_server.py']
-cwd = 'W:\_python\antiagent'
+command = 'C:\projects\antiagent\.venv\Scripts\python.exe'
+args = ['C:\projects\antiagent\agy_server.py']
+cwd = 'C:\projects\antiagent'
+experimental_environment = 'local'
 enabled = true
 required = true
 startup_timeout_sec = 30
@@ -15,3 +16,6 @@ enabled_tools = [
   'antigravity_agent_interrupt',
   'antigravity_cli_execute',
 ]
+
+[mcp_servers.antigravity_cli_executor.env]
+ANTIAGENT_EXECUTION_BOUNDARY = 'host'
