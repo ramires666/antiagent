@@ -28,6 +28,11 @@ OUTPUT_FIELDS = {
     "preexisting_dirty", "worktree_changed", "changed_paths",
     "postflight_complete", "requires_review",
 }
+DOCTOR_FIELDS = {
+    "checks_passed", "cli_available", "cli_version",
+    "execution_boundary_declared", "state_writable", "workspace_status",
+    "auth_probe", "network_probe", "oauth_ready", "error_type",
+}
 
 
 def result_data(result):
@@ -129,6 +134,78 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(executor["experimental_environment"], "local")
         self.assertEqual(executor["env"], {server.EXECUTION_BOUNDARY_ENV: "host"})
         self.assertEqual(executor["tool_timeout_sec"], 900)
+        self.assertIn("antigravity_doctor", executor["enabled_tools"])
+
+    def test_doctor_reports_local_checks_without_claiming_oauth(self):
+        with patch("agy_server._resolve_cli", return_value=Path("C:/agy.exe")), patch(
+            "agy_server._probe_cli_version", return_value="1.1.23"
+        ) as version, patch(
+            "agy_server._probe_state_writable", return_value=True
+        ), patch(
+            "agy_server._git_preflight",
+            return_value=server.GitPreflight(Path("C:/repo"), None),
+        ), patch(
+            "agy_server._execution_boundary_declared", return_value=True
+        ):
+            result = asyncio.run(server.antigravity_doctor())
+        self.assertEqual(set(result.model_dump()), DOCTOR_FIELDS)
+        self.assertTrue(result.checks_passed)
+        self.assertEqual(result.cli_version, "1.1.23")
+        self.assertEqual(result.workspace_status, "ready")
+        self.assertEqual(result.auth_probe, "unsupported")
+        self.assertEqual(result.network_probe, "not_run")
+        self.assertEqual(result.oauth_ready, "unknown")
+        self.assertIsNone(result.error_type)
+        version.assert_called_once_with(Path("C:/agy.exe"))
+
+    def test_doctor_reports_safe_primary_failures(self):
+        cases = (
+            (False, True, "ready", "boundary_unverified"),
+            (True, False, "ready", "cli_unavailable"),
+            (True, True, "ready", "state_unavailable"),
+            (True, True, "workspace_not_git", "workspace_not_git"),
+        )
+        for boundary, cli_ready, workspace_status, expected in cases:
+            with self.subTest(expected=expected), patch(
+                "agy_server._resolve_cli",
+                return_value=Path("C:/agy.exe") if cli_ready else None,
+            ), patch(
+                "agy_server._probe_cli_version",
+                return_value="1.1.23" if cli_ready else None,
+            ), patch(
+                "agy_server._probe_state_writable",
+                return_value=expected != "state_unavailable",
+            ), patch(
+                "agy_server._git_preflight",
+                return_value=server.GitPreflight(
+                    Path("C:/repo") if workspace_status == "ready" else None,
+                    None if workspace_status == "ready" else workspace_status,
+                ),
+            ), patch(
+                "agy_server._execution_boundary_declared", return_value=boundary
+            ):
+                result = asyncio.run(server.antigravity_doctor())
+            self.assertFalse(result.checks_passed)
+            self.assertEqual(result.error_type, expected)
+            self.assertNotIn("C:/", result.model_dump_json())
+
+    def test_doctor_rejects_non_string_without_running_probes(self):
+        with patch("agy_server._resolve_cli") as resolve, patch(
+            "agy_server._git_preflight"
+        ) as preflight:
+            result = asyncio.run(server.antigravity_doctor(123))
+        self.assertEqual(result.error_type, "invalid_request")
+        self.assertEqual(result.auth_probe, "unsupported")
+        resolve.assert_not_called()
+        preflight.assert_not_called()
+
+    def test_doctor_state_probe_is_ephemeral(self):
+        with tempfile.TemporaryDirectory(prefix="antiagent-doctor-") as directory:
+            state_root = Path(directory)
+            before = set(state_root.iterdir())
+            with patch("agent_manager._STATE_DIRECTORY", state_root):
+                self.assertTrue(server._probe_state_writable())
+            self.assertEqual(set(state_root.iterdir()), before)
 
     @staticmethod
     def _start_lock_worker(root, lock_directory, marker, *, mode="hold", hold=0, timeout=1):
@@ -187,15 +264,18 @@ class AgyServerTest(unittest.TestCase):
         with patch("agy_server.Path.cwd", return_value=Path("C:/repo")), patch(
             "agy_server._resolve_executable", return_value=Path("C:/Git/cmd/git.exe")
         ), patch(
-            "agy_server.subprocess.run",
-            return_value=type("Completed", (), {"stdout": "C:/repo\n"})(),
+            "agy_server._run_bounded_probe",
+            return_value=server.BoundedProbeResult(0, b"C:/repo\n", b""),
         ) as run:
             self.assertEqual(server._git_root(), Path("C:/repo"))
         self.assertEqual(
             run.call_args.args[0],
             [str(Path("C:/Git/cmd/git.exe")), "rev-parse", "--show-toplevel"],
         )
-        self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertEqual(run.call_args.kwargs["stdout_limit"], server.MAX_GIT_ROOT_BYTES)
+        self.assertEqual(
+            run.call_args.kwargs["stderr_limit"], server.MAX_PROBE_STDERR_BYTES
+        )
 
     def test_cli_run_result_preserves_legacy_positional_flags(self):
         result = server.CliRunResult(1, "output", False, True, True)
@@ -268,17 +348,50 @@ class AgyServerTest(unittest.TestCase):
         self.assertTrue(data["conversation_id_available"])
         self.assertTrue(data["metadata_complete"])
 
-    def test_cli_version_probe_is_bounded_and_uses_sanitized_environment(self):
-        completed = type("Completed", (), {"returncode": 0, "stdout": "1.1.22\n"})()
-        with patch.dict(os.environ, {"TEST_API_KEY": "secret"}, clear=False), patch(
-            "agy_server.subprocess.run", return_value=completed
-        ) as run:
+    def test_cli_version_probe_declares_strict_output_bounds(self):
+        completed = server.BoundedProbeResult(0, b"1.1.22\n", b"")
+        with patch("agy_server._run_bounded_probe", return_value=completed) as run:
             self.assertEqual(server._probe_cli_version(Path("C:/bin/agy.exe")), "1.1.22")
         kwargs = run.call_args.kwargs
-        self.assertEqual(kwargs["cwd"], str(Path("C:/bin")))
-        self.assertEqual(kwargs["timeout"], 5)
-        self.assertFalse(kwargs["shell"])
-        self.assertNotIn("TEST_API_KEY", kwargs["env"])
+        self.assertEqual(kwargs["cwd"], Path("C:/bin"))
+        self.assertEqual(kwargs["timeout_seconds"], 5)
+        self.assertEqual(kwargs["stdout_limit"], server.MAX_VERSION_BYTES)
+        self.assertEqual(kwargs["stderr_limit"], server.MAX_PROBE_STDERR_BYTES)
+
+    def test_bounded_probe_discards_stdout_and_stderr_on_overflow(self):
+        for stream in ("stdout", "stderr"):
+            script = (
+                "import sys; "
+                f"sys.{stream}.buffer.write(b'secret-value-' * 100); "
+                f"sys.{stream}.flush()"
+            )
+            with self.subTest(stream=stream):
+                result = server._run_bounded_probe(
+                    [sys.executable, "-c", script],
+                    cwd=Path.cwd(),
+                    timeout_seconds=5,
+                    stdout_limit=32,
+                    stderr_limit=32,
+                )
+                self.assertTrue(result.output_limit)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr, b"")
+
+    def test_bounded_probe_uses_sanitized_environment(self):
+        with patch.dict(os.environ, {"TEST_API_KEY": "secret"}, clear=False):
+            result = server._run_bounded_probe(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.getenv('TEST_API_KEY', 'missing'))",
+                ],
+                cwd=Path.cwd(),
+                timeout_seconds=5,
+                stdout_limit=32,
+                stderr_limit=32,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), b"missing")
 
     def _execute(
         self, *, level="low", mode="plan", stdout=None, returncode=0,
@@ -398,15 +511,19 @@ class AgyServerTest(unittest.TestCase):
             self.assertTrue(resolved.is_absolute())
 
     def test_git_failures_and_non_root_are_rejected(self):
-        for error in (OSError("missing"), subprocess.TimeoutExpired("git", 5)):
-            with self.subTest(error=type(error).__name__), patch(
+        failures = (
+            server.BoundedProbeResult(None, b"", b""),
+            server.BoundedProbeResult(None, b"", b"", timed_out=True),
+        )
+        for failure in failures:
+            with self.subTest(failure=failure), patch(
                 "agy_server.Path.cwd", return_value=Path("C:/repo")
-            ), patch("agy_server.subprocess.run", side_effect=error):
+            ), patch("agy_server._run_bounded_probe", return_value=failure):
                 self.assertIsNone(server._git_root())
 
-        completed = type("Completed", (), {"stdout": "C:/other\n"})()
+        completed = server.BoundedProbeResult(0, b"C:/other\n", b"")
         with patch("agy_server.Path.cwd", return_value=Path("C:/repo")), patch(
-            "agy_server.subprocess.run", return_value=completed
+            "agy_server._run_bounded_probe", return_value=completed
         ):
             self.assertIsNone(server._git_root())
 
@@ -435,14 +552,14 @@ class AgyServerTest(unittest.TestCase):
             file_path.write_text("not a directory", encoding="utf-8")
 
             def git_root(*_args, cwd, **_kwargs):
-                candidate = Path(cwd).resolve()
+                candidate = cwd.resolve()
                 self.assertTrue(candidate.is_dir())
                 if candidate == non_git:
-                    raise subprocess.CalledProcessError(128, "git")
+                    return server.BoundedProbeResult(128, b"", b"not a repository")
                 root = repo if candidate == nested else candidate
-                return type("Completed", (), {"stdout": f"{root}\n"})()
+                return server.BoundedProbeResult(0, f"{root}\n".encode(), b"")
 
-            with patch("agy_server.subprocess.run", side_effect=git_root):
+            with patch("agy_server._run_bounded_probe", side_effect=git_root):
                 self.assertEqual(server._git_root(str(repo)), repo)
                 self.assertEqual(
                     server._git_root(str(repo.relative_to(process_cwd))), repo
@@ -458,7 +575,7 @@ class AgyServerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="agy-outside-") as directory:
             outside = Path(directory).resolve()
             self.assertFalse(outside.is_relative_to(process_cwd))
-            with patch("agy_server.subprocess.run") as git:
+            with patch("agy_server._run_bounded_probe") as git:
                 self.assertIsNone(server._git_root(str(outside)))
             git.assert_not_called()
 
@@ -762,11 +879,11 @@ class AgyServerTest(unittest.TestCase):
         )
 
     def test_empty_git_stdout_is_rejected(self):
-        for stdout in ("", " \t\r\n"):
-            completed = type("Completed", (), {"stdout": stdout})()
+        for stdout in (b"", b" \t\r\n"):
+            completed = server.BoundedProbeResult(0, stdout, b"")
             with self.subTest(stdout=repr(stdout)), patch(
                 "agy_server.Path.cwd", return_value=Path("C:/repo")
-            ), patch("agy_server.subprocess.run", return_value=completed):
+            ), patch("agy_server._run_bounded_probe", return_value=completed):
                 self.assertIsNone(server._git_root())
 
     def test_non_string_inputs_and_prompt_formatting(self):
@@ -2235,6 +2352,9 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(schema["properties"]["thinking_level"]["default"], "medium")
         self.assertEqual(schema["properties"]["mode"]["enum"], ["plan", "accept-edits"])
         self.assertEqual(schema["properties"]["mode"]["default"], "plan")
+        doctor = next(tool for tool in tools if tool.name == "antigravity_doctor")
+        self.assertEqual(doctor.input_schema["properties"]["working_directory"]["default"], "")
+        self.assertEqual(set(doctor.output_schema["properties"]), DOCTOR_FIELDS)
 
     def test_managed_agent_spawn_wait_followup_list_and_persistence(self):
         conversation_id = "123e4567-e89b-12d3-a456-426614174000"

@@ -78,9 +78,11 @@ stdio server в remote executor. Оно само по себе не доказы
    старте процесса.
 6. Проверьте регистрацию через `codex mcp get antigravity_cli_executor`.
    Команда подтверждает config, но не доступ к keyring.
-7. Выполните один live MCP smoke через `antigravity_cli_execute` или lifecycle
+7. Вызовите `antigravity_doctor`: local checks должны пройти, но
+   `oauth_ready=unknown` останется ожидаемым до live smoke.
+8. Выполните один live MCP smoke через `antigravity_cli_execute` или lifecycle
    tools: `mode=plan`, `thinking_level=low`, точный marker, без файловых правок.
-8. Убедитесь, что marker непустой, Git не изменился и browser/re-auth не
+9. Убедитесь, что marker непустой, Git не изменился и browser/re-auth не
    запускался. Только после этого boundary считается операционно подтверждённой.
 
 ## Что запрещено

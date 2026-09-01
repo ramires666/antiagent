@@ -3,7 +3,7 @@
 Дата: 2026-09-01
 
 Статус: A–B и C1 выполнены; C2 config установлен, post-restart smoke ожидается;
-этап D следующий
+этап D выполнен, этап E следующий
 
 Основные компоненты: `agy_server.py`, `agent_manager.py`, MCP-конфигурация Codex
 
@@ -172,15 +172,19 @@ review существующих пользовательских изменен�
 Критерий приёмки: при host-side запуске используется существующий keyring без
 повторного OAuth; при sandboxed запуске возвращается profile/network code.
 
-### Этап D — CLI auth/profile preflight (P0, зависит от CLI)
+### Этап D — CLI auth/profile preflight (P0, выполнен для CLI 1.1.23)
 
-- [ ] Предпочесть официальный `agy auth status --json`/`agy doctor --json`, если
-      CLI предоставит стабильный non-interactive contract.
-- [ ] До появления официального contract не парсить keyring и не изобретать
+- [x] Проверить официальный command surface: в CLI `1.1.23` отсутствуют
+      `agy auth` и `agy doctor`; использовать их только после появления
+      стабильного non-interactive JSON contract.
+- [x] До появления официального contract не парсить keyring и не изобретать
       undocumented home variables.
-- [ ] Не запускать browser OAuth автоматически после profile/network denial.
-- [ ] Отделить optional telemetry failure от обязательного Gemini endpoint.
-- [ ] Добавить короткий bounded probe без Playwright.
+- [x] Wrapper и doctor не запускают browser OAuth; внутреннее поведение CLI
+      диагностируется только по финальному bounded result.
+- [x] Не выполнять network/telemetry probe без официального endpoint contract;
+      doctor возвращает `network_probe=not_run`.
+- [x] Добавить короткий bounded doctor без Playwright: `agy --version`, wrapper
+      state write, boundary declaration и Git preflight.
 
 Критерий приёмки: пять искусственных сценариев — missing auth, unreadable
 profile, non-writable state, denied network, OAuth timeout — возвращают разные

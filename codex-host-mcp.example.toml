@@ -16,6 +16,7 @@ enabled_tools = [
   "antigravity_agent_wait",
   "antigravity_agent_interrupt",
   "antigravity_agent_followup",
+  "antigravity_doctor",
 ]
 
 [mcp_servers.antigravity_cli_executor.env]

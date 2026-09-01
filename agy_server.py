@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -68,6 +69,9 @@ MAX_STDERR_CHARS = 16_384
 MAX_GIT_STATUS_BYTES = 1_000_000
 MAX_GIT_STATUS_PATH_LENGTH = 4_096
 MAX_GIT_STATUS_PATHS = 10_000
+MAX_GIT_ROOT_BYTES = 32_768
+MAX_PROBE_STDERR_BYTES = 16_384
+MAX_VERSION_BYTES = 128
 MAX_PROMPT_CHARS = 24_000
 MAX_WINDOWS_COMMAND_LINE_UNITS = 32_767
 _LOCK_DIRECTORY: Path | None = None
@@ -159,6 +163,27 @@ AgentManagerErrorType = Literal[
     "state_unavailable",
     "capacity_reached",
 ]
+WorkspaceDiagnostic = Literal[
+    "ready",
+    "path_not_found",
+    "path_outside_allowed_root",
+    "workspace_not_git",
+    "workspace_not_root",
+    "git_trust_denied",
+    "git_unavailable",
+]
+DoctorErrorType = Literal[
+    "invalid_request",
+    "boundary_unverified",
+    "cli_unavailable",
+    "state_unavailable",
+    "path_not_found",
+    "path_outside_allowed_root",
+    "workspace_not_git",
+    "workspace_not_root",
+    "git_trust_denied",
+    "git_unavailable",
+]
 _TERMINAL_AGENT_STATUSES = ("completed", "failed", "interrupted")
 MAX_AGENT_WAIT_SECONDS = 60.0
 _AGENT_STORE: AgentStore | None = None
@@ -214,6 +239,14 @@ class GitPreflight(NamedTuple):
 
 class GitStatusSnapshot(NamedTuple):
     entries: dict[str, object]
+
+
+class BoundedProbeResult(NamedTuple):
+    returncode: int | None
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+    output_limit: bool = False
 
 
 class PostflightInfo(NamedTuple):
@@ -425,6 +458,21 @@ class AntigravityCliOutput(BaseModel):
     changed_paths: list[str]
     postflight_complete: bool
     requires_review: bool
+
+
+class AntigravityDoctorOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    checks_passed: bool
+    cli_available: bool
+    cli_version: str | None
+    execution_boundary_declared: bool
+    state_writable: bool
+    workspace_status: WorkspaceDiagnostic
+    auth_probe: Literal["unsupported"]
+    network_probe: Literal["not_run"]
+    oauth_ready: Literal["unknown"]
+    error_type: DoctorErrorType | None
 
 
 class AgentSnapshotOutput(BaseModel):
@@ -702,6 +750,129 @@ def _resolve_cli() -> Path | None:
     return None
 
 
+def _run_bounded_probe(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> BoundedProbeResult:
+    """Run a small local probe without retaining unbounded child output."""
+    if stdout_limit < 0 or stderr_limit < 0 or timeout_seconds <= 0:
+        return BoundedProbeResult(None, b"", b"")
+
+    kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "env": _child_environment(),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "shell": False,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(argv, **kwargs)
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return BoundedProbeResult(None, b"", b"")
+
+    job = _create_windows_job(process.pid)
+    streams = (process.stdout, process.stderr)
+    limits = (stdout_limit, stderr_limit)
+    output = [b"", b""]
+    reader_failed = [False, False]
+    exceeded = threading.Event()
+
+    def read_stream(index: int) -> None:
+        stream = streams[index]
+        if stream is None:
+            reader_failed[index] = True
+            return
+        chunks: list[bytes] = []
+        size = 0
+        try:
+            while True:
+                remaining = limits[index] - size
+                data = stream.read(min(65_536, max(1, remaining + 1)))
+                if not data:
+                    break
+                if len(data) > remaining:
+                    exceeded.set()
+                    return
+                chunks.append(data)
+                size += len(data)
+            output[index] = b"".join(chunks)
+        except (OSError, ValueError):
+            reader_failed[index] = True
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(target=read_stream, args=(index,), daemon=True)
+        for index in range(2)
+    ]
+    for reader in readers:
+        reader.start()
+
+    timed_out = False
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while process.poll() is None and not exceeded.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                process.wait(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+
+        if exceeded.is_set() or timed_out:
+            _kill_process_tree(process)
+            try:
+                process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+
+        for reader in readers:
+            reader.join(timeout=2)
+        if any(reader.is_alive() for reader in readers):
+            _kill_process_tree(process)
+            for stream in streams:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            for reader in readers:
+                reader.join(timeout=0.5)
+            reader_failed = [True, True]
+    finally:
+        _close_windows_job(job)
+
+    output_limit = exceeded.is_set()
+    if timed_out or output_limit or any(reader_failed):
+        output = [b"", b""]
+    return BoundedProbeResult(
+        process.returncode,
+        output[0],
+        output[1],
+        timed_out=timed_out,
+        output_limit=output_limit,
+    )
+
+
 def _git_preflight(directory: str | Path | None = None) -> GitPreflight:
     try:
         base = Path.cwd().resolve()
@@ -716,33 +887,25 @@ def _git_preflight(directory: str | Path | None = None) -> GitPreflight:
         git = _resolve_executable("git")
         if git is None:
             return GitPreflight(None, "git_unavailable")
-        completed = subprocess.run(
+        completed = _run_bounded_probe(
             [str(git), "rev-parse", "--show-toplevel"],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-            shell=False,
-            env=_child_environment(),
+            cwd=cwd,
+            timeout_seconds=5,
+            stdout_limit=MAX_GIT_ROOT_BYTES,
+            stderr_limit=MAX_PROBE_STDERR_BYTES,
         )
-    except subprocess.CalledProcessError as exc:
-        stderr = str(getattr(exc, "stderr", "") or "").lower()
-        if "dubious ownership" in stderr or "safe.directory" in stderr:
-            return GitPreflight(None, "git_trust_denied")
-        return GitPreflight(None, "workspace_not_git")
-    except subprocess.TimeoutExpired:
-        return GitPreflight(None, "git_unavailable")
     except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError):
         return GitPreflight(None, "git_unavailable")
 
-    if getattr(completed, "returncode", 0) != 0:
-        stderr = str(getattr(completed, "stderr", "") or "").lower()
+    if completed.timed_out or completed.output_limit or completed.returncode is None:
+        return GitPreflight(None, "git_unavailable")
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace").lower()
         if "dubious ownership" in stderr or "safe.directory" in stderr:
             return GitPreflight(None, "git_trust_denied")
         return GitPreflight(None, "workspace_not_git")
     try:
-        raw_root = completed.stdout.strip()
+        raw_root = completed.stdout.decode("utf-8").strip()
         if not raw_root:
             return GitPreflight(None, "workspace_not_git")
         root = Path(raw_root).resolve()
@@ -955,23 +1118,35 @@ def _cli_result_failed_for_review(cli_result: object) -> bool:
 
 
 def _probe_cli_version(cli: Path) -> str | None:
+    completed = _run_bounded_probe(
+        [str(cli), "--version"],
+        cwd=cli.parent,
+        timeout_seconds=5,
+        stdout_limit=MAX_VERSION_BYTES,
+        stderr_limit=MAX_PROBE_STDERR_BYTES,
+    )
+    if (
+        completed.returncode != 0
+        or completed.timed_out
+        or completed.output_limit
+    ):
+        return None
     try:
-        completed = subprocess.run(
-            [str(cli), "--version"],
-            cwd=str(cli.parent),
-            env=_child_environment(),
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-            shell=False,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError):
+        version = completed.stdout.decode("ascii").strip()
+    except UnicodeDecodeError:
         return None
-    if completed.returncode != 0:
-        return None
-    version = completed.stdout.strip()
     return version if _VERSION_RE.fullmatch(version) else None
+
+
+def _probe_state_writable() -> bool:
+    """Check wrapper state writes without returning or logging its path."""
+    try:
+        directory = prepare_state_dir()
+        with tempfile.TemporaryFile(dir=directory):
+            pass
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _prompt(task: str, context: str, verification: str) -> str:
@@ -1074,7 +1249,8 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
                 raise OSError("taskkill unavailable")
             completed = subprocess.run(
                 [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 timeout=10,
                 check=False,
                 shell=False,
@@ -2183,6 +2359,64 @@ async def antigravity_cli_execute(
     return _tool_result(result)
 
 
+@mcp.tool()
+async def antigravity_doctor(
+    working_directory: Annotated[str, SkipValidation] = "",
+) -> AntigravityDoctorOutput:
+    """Run local preflight checks without probing OAuth, keyring, or network."""
+    if not isinstance(working_directory, str):
+        return AntigravityDoctorOutput(
+            checks_passed=False,
+            cli_available=False,
+            cli_version=None,
+            execution_boundary_declared=_execution_boundary_declared(),
+            state_writable=False,
+            workspace_status="path_not_found",
+            auth_probe="unsupported",
+            network_probe="not_run",
+            oauth_ready="unknown",
+            error_type="invalid_request",
+        )
+
+    preflight = _git_preflight(working_directory or None)
+    workspace_status = cast(
+        WorkspaceDiagnostic,
+        "ready"
+        if preflight.root is not None
+        else (preflight.error_type or "workspace_not_git"),
+    )
+    cli = _resolve_cli()
+    cli_version = (
+        await asyncio.to_thread(_probe_cli_version, cli) if cli is not None else None
+    )
+    cli_available = cli is not None and cli_version is not None
+    state_writable = await asyncio.to_thread(_probe_state_writable)
+    boundary_declared = _execution_boundary_declared()
+
+    error_type: DoctorErrorType | None = None
+    if not boundary_declared:
+        error_type = "boundary_unverified"
+    elif not cli_available:
+        error_type = "cli_unavailable"
+    elif not state_writable:
+        error_type = "state_unavailable"
+    elif workspace_status != "ready":
+        error_type = cast(DoctorErrorType, workspace_status)
+
+    return AntigravityDoctorOutput(
+        checks_passed=error_type is None,
+        cli_available=cli_available,
+        cli_version=cli_version,
+        execution_boundary_declared=boundary_declared,
+        state_writable=state_writable,
+        workspace_status=workspace_status,
+        auth_probe="unsupported",
+        network_probe="not_run",
+        oauth_ready="unknown",
+        error_type=error_type,
+    )
+
+
 async def _redact_tool_validation_error(ctx, call_next):
     result = await call_next(ctx)
     if (
@@ -2201,9 +2435,13 @@ async def _redact_tool_validation_error(ctx, call_next):
 mcp.middleware.append(_redact_tool_validation_error)
 
 
+def _execution_boundary_declared() -> bool:
+    return os.environ.get(EXECUTION_BOUNDARY_ENV) == "host"
+
+
 def _check_execution_boundary() -> bool:
     """Check the operator-declared process boundary without exposing its value."""
-    if os.environ.get(EXECUTION_BOUNDARY_ENV) == "host":
+    if _execution_boundary_declared():
         return True
     logger.warning(
         "Host execution boundary is not declared; OAuth readiness is unverified"

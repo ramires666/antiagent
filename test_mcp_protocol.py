@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent
 SERVER = ROOT / "agy_server.py"
 FIXTURE = ROOT / "_mcp_protocol_fixture.py"
 TOOL_NAME = "antigravity_cli_execute"
+DOCTOR_NAME = "antigravity_doctor"
 LIFECYCLE_TOOLS = {
     "antigravity_agent_spawn",
     "antigravity_agent_status",
@@ -83,7 +84,10 @@ class MCPProtocolTest(unittest.TestCase):
     @staticmethod
     def _server_parameters(cwd: Path, *, trust_repo: bool) -> StdioServerParameters:
         fake_cli = Path(os.environ["SYSTEMROOT"]) / "System32" / "where.exe"
-        env = {"ANTIGRAVITY_CLI_PATH": str(fake_cli)}
+        env = {
+            "ANTIGRAVITY_CLI_PATH": str(fake_cli),
+            "ANTIAGENT_EXECUTION_BOUNDARY": "host",
+        }
         if trust_repo:
             # The managed test sandbox runs under a different SID than the checkout.
             env.update({
@@ -116,7 +120,18 @@ class MCPProtocolTest(unittest.TestCase):
                         listed = await session.list_tools()
                         self.assertEqual(
                             {tool.name for tool in listed.tools},
-                            LIFECYCLE_TOOLS | {TOOL_NAME},
+                            LIFECYCLE_TOOLS | {TOOL_NAME, DOCTOR_NAME},
+                        )
+                        doctor = await session.call_tool(DOCTOR_NAME, {})
+                        self.assertFalse(doctor.is_error)
+                        self.assertEqual(
+                            doctor.structured_content["auth_probe"], "unsupported"
+                        )
+                        self.assertEqual(
+                            doctor.structured_content["network_probe"], "not_run"
+                        )
+                        self.assertEqual(
+                            doctor.structured_content["oauth_ready"], "unknown"
                         )
                         tool = next(
                             tool for tool in listed.tools if tool.name == TOOL_NAME

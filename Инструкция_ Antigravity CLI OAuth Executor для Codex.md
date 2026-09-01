@@ -57,6 +57,13 @@ Allow rules минимальны: чтение workspace, необходимые
 
 Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`.
 
+`antigravity_doctor` выполняет только локальный preflight: bounded
+`agy --version`, boundary declaration, пробную запись wrapper state и Git
+preflight. В Antigravity CLI `1.1.23` нет официальных `auth`/`doctor`
+subcommands, поэтому tool честно возвращает `auth_probe=unsupported`,
+`network_probe=not_run`, `oauth_ready=unknown`. Он не читает профиль/keyring и
+не может запустить browser OAuth.
+
 Persistent manager добавляет шесть tools:
 
 - `antigravity_agent_spawn` — валидирует тот же request, сохраняет `queued`, запускает background task и сразу возвращает `agent_id`;
@@ -98,6 +105,7 @@ enabled_tools = [
   'antigravity_agent_wait',
   'antigravity_agent_followup',
   'antigravity_agent_interrupt',
+  'antigravity_doctor',
   'antigravity_cli_execute',
 ]
 
@@ -105,7 +113,7 @@ enabled_tools = [
 ANTIAGENT_EXECUTION_BOUNDARY = 'host'
 ```
 
-В этом checkout готовый project-scoped шаблон находится в `.codex/config.toml`, а custom Codex-agent — в `.codex/agents/antigravity_worker.toml`. `experimental_environment='local'` исключает remote executor placement, но само по себе не доказывает доступ к Windows keyring. Boundary подтверждается только read-only live smoke после полного restart; подробности — в `HOST_SIDE_DEPLOYMENT.md`. Agent использует `gpt-5.6-luna` только как дешёвый proxy внутри native Codex thread, имеет `sandbox_mode=read-only` и MCP allowlist из семи tools; фактическую coding-задачу выполняет Gemini/Antigravity. Для другого проекта замените абсолютные пути на его trusted root и `.venv`. Указывайте Python из `.venv`; не подставляйте глобальный `python` или глобальный MCP. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому `tool_timeout_sec` Codex должен быть 900 секунд.
+В этом checkout готовый project-scoped шаблон находится в `.codex/config.toml`, а custom Codex-agent — в `.codex/agents/antigravity_worker.toml`. `experimental_environment='local'` исключает remote executor placement, но само по себе не доказывает доступ к Windows keyring. Boundary подтверждается только read-only live smoke после полного restart; подробности — в `HOST_SIDE_DEPLOYMENT.md`. Agent использует `gpt-5.6-luna` только как дешёвый proxy внутри native Codex thread, имеет `sandbox_mode=read-only` и MCP allowlist из восьми tools; фактическую coding-задачу выполняет Gemini/Antigravity. Для другого проекта замените абсолютные пути на его trusted root и `.venv`. Указывайте Python из `.venv`; не подставляйте глобальный `python` или глобальный MCP. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому `tool_timeout_sec` Codex должен быть 900 секунд.
 
 Custom agents загружаются при старте Codex. После добавления или изменения TOML полностью перезапустите CLI/app/IDE session. Fine-grained запрета shell отдельным полем custom-agent schema нет: здесь применяются read-only sandbox, MCP allowlist и developer instructions. Родительский Codex остаётся владельцем lifecycle/UI, разрешений, diff review и тестов.
 
@@ -119,7 +127,7 @@ agy --version
 
 Acceptance criteria:
 
-1. `tools/list` возвращает семь tools; schema валидирует `low|medium|high`, default `medium`, `plan`, `accept-edits`, boolean `acknowledge_review` (default `false`), optional UUID `conversation_id` и строковый `working_directory`.
+1. `tools/list` возвращает восемь tools; schema валидирует `low|medium|high`, default `medium`, `plan`, `accept-edits`, boolean `acknowledge_review` (default `false`), optional UUID `conversation_id` и строковый `working_directory`; doctor schema не содержит credentials или profile path.
 2. `working_directory` разрешается как абсолютный путь или относительно process cwd; пустой default использует process cwd. После canonical resolve путь обязан быть process cwd или его descendant и точным Git-root; выход через `..`, symlink или junction и остальные каталоги отклоняются. Subprocess получает этот абсолютный Git-root в `cwd`.
 3. Adapter передаёт `--sandbox` и `--disable-slash-commands`.
 4. stdout JSON, malformed JSON, non-zero exit и timeout дают безопасный структурированный ответ.

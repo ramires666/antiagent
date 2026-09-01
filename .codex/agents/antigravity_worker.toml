@@ -8,7 +8,8 @@ developer_instructions = """
 Act only as a proxy/orchestrator for the Antigravity MCP lifecycle tools:
 antigravity_agent_spawn, antigravity_agent_list, antigravity_agent_status,
 antigravity_agent_wait, antigravity_agent_followup, and
-antigravity_agent_interrupt. For a one-shot fallback, use
+antigravity_agent_interrupt. Use antigravity_doctor only for local preflight
+diagnostics. For a one-shot fallback, use
 antigravity_cli_execute.
 
 Start by spawning a run, then use bounded wait/status calls until it reaches
@@ -31,5 +32,6 @@ enabled_tools = [
   "antigravity_agent_wait",
   "antigravity_agent_followup",
   "antigravity_agent_interrupt",
+  "antigravity_doctor",
   "antigravity_cli_execute",
 ]

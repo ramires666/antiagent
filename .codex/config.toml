@@ -14,6 +14,7 @@ enabled_tools = [
   'antigravity_agent_wait',
   'antigravity_agent_followup',
   'antigravity_agent_interrupt',
+  'antigravity_doctor',
   'antigravity_cli_execute',
 ]
 

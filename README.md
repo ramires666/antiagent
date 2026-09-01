@@ -49,6 +49,10 @@ desktop app или IDE extension после изменения MCP/custom-agent 
 `ANTIAGENT_EXECUTION_BOUNDARY=host` является декларацией оператора; готовность
 подтверждается только новым read-only MCP smoke после перезапуска.
 
+Для безопасной локальной диагностики используйте `antigravity_doctor`. Он
+проверяет только версию CLI, boundary declaration, wrapper state и Git-root;
+OAuth/keyring и сеть не читаются, поэтому `oauth_ready` остаётся `unknown`.
+
 ## 3. Подключите skill
 
 Дополнительная установка для этого checkout не требуется. Codex автоматически
