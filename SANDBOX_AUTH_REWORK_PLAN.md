@@ -205,6 +205,8 @@ profile, non-writable state, denied network, OAuth timeout — возвраща�
 
 ### Этап F — budget и строгий success contract (P1)
 
+- [x] F0: текущий wrapper уже имеет bounded prompt/stdout/stderr, отвергает
+      пустой `SUCCESS` и не считает `metadata_complete` доказательством ответа.
 - [ ] Добавить лимиты `max_files`, `max_context_bytes`, `max_input_tokens`,
       `max_tool_calls`.
 - [ ] Публиковать usage даже для `no_content` и failed runs.
@@ -217,7 +219,7 @@ profile, non-writable state, denied network, OAuth timeout — возвраща�
 
 ### Этап G — lifecycle и concurrency (P2)
 
-- [x] Перед каждым новым `spawn` и `list` выполнять bounded reconciliation;
+- [x] G0: перед каждым новым `spawn` и `list` выполнять bounded reconciliation;
       старые orphaned local tasks получают `manager_lost` и освобождают capacity.
 - [ ] После рестарта немедленно завершать совсем свежие orphaned tasks либо
       ввести полноценный lease/heartbeat recovery (отдельный ADR).
