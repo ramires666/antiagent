@@ -2148,7 +2148,7 @@ def _scoped_agent(agent_id: object) -> tuple[AgentSnapshot | None, AgentOperatio
             message="agent_id must be a 32-character lowercase hexadecimal ID",
         )
     try:
-        snapshot = _get_agent_store().get(normalized)
+        snapshot = _reconcile_agent_store().get(normalized)
     except Exception:
         return None, _agent_operation_result(
             error_type="state_unavailable", message="Agent state is unavailable"

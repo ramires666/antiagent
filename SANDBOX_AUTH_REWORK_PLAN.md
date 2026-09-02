@@ -230,7 +230,8 @@ primitives scoped execution не запускается и не выдаётся
 
 ### Этап G — lifecycle и concurrency (P2)
 
-- [x] G0: перед каждым новым `spawn` и `list` выполнять bounded reconciliation;
+- [x] G0: перед `spawn`, `list`, `status`, `wait`, `interrupt` и `followup`
+      выполнять bounded reconciliation;
       старые orphaned local tasks получают `manager_lost` и освобождают capacity.
 - [ ] После рестарта немедленно завершать совсем свежие orphaned tasks либо
       ввести полноценный lease/heartbeat recovery (отдельный ADR).
