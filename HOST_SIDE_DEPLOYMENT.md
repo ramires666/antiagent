@@ -58,6 +58,10 @@ placeholder на абсолютный путь shim; `cwd` намеренно н
 будущий официальный non-interactive `agy auth status --json`, если CLI
 предоставит стабильный контракт.
 
+Post-restart smoke 2 сентября 2026 года завершился `SUCCESS` без browser/re-auth:
+marker `ANTIAGENT_POST_RESTART_OAUTH_OK_20260902`, CLI `1.1.24`, run
+`56667d0c878b4a318efc2707525160d1`, `total_tokens=16565`, Git не изменён.
+
 ## Настройка
 
 1. Откройте обычный PowerShell под тем Windows-пользователем, который уже

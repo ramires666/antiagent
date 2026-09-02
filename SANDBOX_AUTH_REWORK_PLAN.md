@@ -146,7 +146,7 @@ stderr отсутствует в result, logs и structured snapshot.
 Критерий приёмки: suite проходит с запрещённым default TEMP и доступным явным
 state root; никаких credentials в новом каталоге нет.
 
-### Этап C — host-side deployment contract (P0, C2 ожидает restart)
+### Этап C — host-side deployment contract (P0, выполнен)
 
 Файлы: новый deployment-раздел документации; `.codex/config.toml` только после
 review существующих пользовательских изменений.
@@ -166,8 +166,10 @@ review существующих пользовательских изменен�
       `ANTIAGENT_HOST_OAUTH_OK_20260901`, CLI `1.1.23`, usage доступен
       (`total_tokens=16540`), run `ccbc913c9f734514a162af09e355aabb`,
       Git не изменён.
-- [ ] После полного restart повторить marker через новый MCP process и записать
-      `status`, usage, CLI version, run ID и неизменный Git.
+- [x] После полного restart повторён marker через новый MCP process: `SUCCESS`,
+      `ANTIAGENT_POST_RESTART_OAUTH_OK_20260902`, CLI `1.1.24`, usage доступен
+      (`total_tokens=16565`), run `56667d0c878b4a318efc2707525160d1`,
+      `worktree_changed=false`; browser/re-auth не потребовались.
 
 Критерий приёмки: при host-side запуске используется существующий keyring без
 повторного OAuth; при sandboxed запуске возвращается profile/network code.
