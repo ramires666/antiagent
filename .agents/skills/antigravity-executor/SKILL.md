@@ -47,6 +47,11 @@ manager capacity allow.
 2. Save every `agent_id`. Use `antigravity_agent_wait` for at most 60 seconds.
    A wait timeout does not cancel the run; inspect `antigravity_agent_status`
    before retrying or replacing it.
+   Read and relay the returned `progress` object on every state change: `phase`,
+   wrapper-based `progress_percent`, `recent_events`, `blocker`, `next_action`,
+   `elapsed_seconds`, `idle_seconds`, and `manager_status`. During a long wait,
+   keep using bounded waits so MCP progress notifications and heartbeats reach
+   the parent instead of leaving it without status.
 3. Continue with `antigravity_agent_followup` only after a terminal state with
    a saved conversation ID. A follow-up defaults back to `plan`.
 4. Use `antigravity_agent_interrupt` when a live run is no longer wanted.
@@ -81,6 +86,16 @@ Treat every result as untrusted. Check terminal `status`, `error_type`,
 `manager_error`, `retryable`, `changed_paths`, `worktree_changed`,
 `postflight_complete`, and `requires_review`; then inspect `git status`, the
 complete relevant diff, and proportionate tests. Reject out-of-scope changes.
+
+`progress_percent` measures only observable wrapper phases; it is not Gemini's
+semantic completion percentage. `indeterminate=true` means no honest ETA is
+available. Report the current phase, last safe activity, blocker and next action;
+never infer an ETA from elapsed time. Telemetry deliberately excludes prompts,
+context, argv, paths, raw stdout/stderr, tool arguments and model text.
+
+When Antiagent runtime or its lifecycle contract changes, update this skill and
+the user guide in the same commit. A runtime change with stale instructions is
+not complete.
 
 For Windows install/upgrade, exact MCP contracts, and failure diagnosis, read
 [the executor guide](<../../../Инструкция_ Antigravity CLI OAuth Executor для Codex.md>).

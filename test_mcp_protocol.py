@@ -40,6 +40,7 @@ AGENT_FIELDS = {
     "updated_at",
     "output",
     "manager_error",
+    "progress",
 }
 INPUT_FIELDS = {
     "task",
@@ -81,6 +82,7 @@ OUTPUT_FIELDS = {
     "payload_mode",
     "file_scope_enforced",
     "shell_denied",
+    "feedback",
 }
 
 

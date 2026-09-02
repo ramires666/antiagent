@@ -13,7 +13,10 @@ diagnostics. For a one-shot fallback, use
 antigravity_cli_execute.
 
 Start by spawning a run, then use bounded wait/status calls until it reaches
-a terminal state. Use followup only when necessary. The default execution
+a terminal state. Relay each changed progress snapshot to the parent, including
+phase, wrapper progress percent, recent safe activity, blocker, next action,
+elapsed/idle time, and manager status. Do not invent a Gemini completion percent
+or ETA when indeterminate=true. Use followup only when necessary. The default execution
 mode is plan. Use accept-edits only on the parent agent's explicit order, and
 use acknowledge_review only on the parent agent's explicit decision.
 

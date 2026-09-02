@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -147,8 +148,89 @@ class AgentStoreTest(unittest.TestCase):
             assert stale is not None
             self.assertEqual(stale.status, "failed")
             self.assertEqual(stale.manager_error, "manager_lost")
+            self.assertEqual(stale.progress["phase"], "failed")
+            self.assertEqual(stale.progress["progress_percent"], 100)
+            self.assertEqual(stale.progress["recent_events"][-1]["code"], "manager_lost")
             self.assertEqual(store.get(queued.agent_id).status, "failed")
             self.assertEqual(store.reconcile_stale(1), 0)
+            store.close()
+
+    def test_progress_is_persisted_bounded_monotonic_and_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state" / "agents.sqlite3"
+            store = manager.AgentStore(path, owner_id="progress-owner")
+            created = store.create(workspace=directory, thinking_level="high", mode="plan")
+            self.assertEqual(created.progress["phase"], "queued")
+            store.mark_running(created.agent_id)
+            for _ in range(manager.MAX_PROGRESS_EVENTS + 5):
+                store.record_progress(
+                    created.agent_id,
+                    phase="executing",
+                    progress_percent=50,
+                    code="heartbeat",
+                    next_action="postflight_started",
+                    heartbeat=True,
+                )
+            progressed = store.record_progress(
+                created.agent_id,
+                phase="executing",
+                progress_percent=25,
+                code="cli_step",
+                step={"index": 7, "state": "DONE", "type": "agent_response"},
+            )
+            assert progressed is not None and progressed.progress is not None
+            self.assertEqual(progressed.progress["progress_percent"], 50)
+            self.assertLessEqual(
+                len(progressed.progress["recent_events"]), manager.MAX_PROGRESS_EVENTS
+            )
+            self.assertIsNotNone(progressed.progress["heartbeat_at"])
+            store.close()
+
+            restored = manager.AgentStore(path, owner_id="progress-owner")
+            persisted = restored.get(created.agent_id)
+            assert persisted is not None and persisted.progress is not None
+            self.assertEqual(persisted.progress["step"]["index"], 7)
+            terminal = restored.finish(created.agent_id, "completed")
+            assert terminal is not None and terminal.progress is not None
+            self.assertEqual(terminal.progress["phase"], "completed")
+            self.assertEqual(terminal.progress["progress_percent"], 100)
+            unchanged = restored.record_progress(
+                created.agent_id, phase="executing", progress_percent=50,
+                code="heartbeat", heartbeat=True,
+            )
+            self.assertEqual(unchanged, terminal)
+            restored.close()
+
+    def test_progress_rejects_free_form_telemetry_and_migrates_legacy_db(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agents.sqlite3"
+            db = sqlite3.connect(path)
+            db.execute("""CREATE TABLE agents (
+                agent_id TEXT PRIMARY KEY,parent_agent_id TEXT,owner_id TEXT NOT NULL,
+                workspace TEXT NOT NULL,thinking_level TEXT NOT NULL,mode TEXT NOT NULL,
+                status TEXT NOT NULL,cancel_requested INTEGER NOT NULL DEFAULT 0,
+                conversation_id TEXT,created_at TEXT NOT NULL,started_at TEXT,
+                finished_at TEXT,updated_at REAL NOT NULL,output_json TEXT,
+                manager_error TEXT)""")
+            db.commit()
+            db.close()
+            store = manager.AgentStore(path, owner_id="legacy-owner")
+            columns = {row[1] for row in store._db.execute("PRAGMA table_info(agents)")}
+            self.assertIn("progress_json", columns)
+            created = store.create(workspace=directory, thinking_level="low", mode="plan")
+            with self.assertRaises(ValueError):
+                store.record_progress(
+                    created.agent_id, phase="executing", progress_percent=50,
+                    code="TOKEN=secret",
+                )
+            safe = store.record_progress(
+                created.agent_id, phase="executing", progress_percent=50,
+                code="cli_step",
+                step={"index": 1, "state": "TOKEN=secret", "type": "TOKEN=secret"},
+                next_action="TOKEN=secret",
+            )
+            assert safe is not None
+            self.assertNotIn("TOKEN=secret", repr(safe.progress))
             store.close()
 
     def test_oversized_output_is_valid_small_json_and_keeps_conversation(self):

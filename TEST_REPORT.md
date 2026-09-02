@@ -1,20 +1,19 @@
 # Финальный отчёт тестирования
 
-Дата отчёта: 27 августа 2026 г.
-Code/config baseline: `fb9441c`
+Дата отчёта: 2 сентября 2026 г.
+Code/config baseline: Antiagent `0.3.0`
 
 ## Среда
 
 - Windows 11, build `26200`.
-- Python `3.13.4` из `.venv`.
-- MCP `2.0.0`, Pydantic `2.13.4`, AnyIO `4.14.2`.
-- Antigravity CLI (`agy`) `1.1.22`.
-- Codex CLI `0.147.0`.
-- Git `2.55.0.windows.4`.
+- Python `3.14.6` из `.venv`.
+- MCP `2.0.0`, Pydantic `2.13.5`.
+- Antigravity CLI (`agy`) `1.1.24`.
+- Git `2.55.0.windows.3`.
 
 ## Итог
 
-После добавления persistent manager deterministic suite содержит **90 тестов**, включая **6 тестов MCP STDIO**. На Windows один POSIX-only permission test ожидаемо отмечен `skipped`. Два последовательных discovery и отдельный прогон targeted suites в обратном порядке завершились `OK`; также прошли `py_compile`, `pip check`, TOML parse и `git diff --check`.
+После добавления live feedback deterministic suite содержит **134 теста**, включая **6 тестов MCP STDIO**. На Windows два POSIX-only permission test ожидаемо отмечены `skipped`. Полный discovery и отдельный прогон 118 lifecycle/protocol тестов завершились `OK`; также прошли AST parse, `pip check`, skill validation и `git diff --check`.
 
 Проверка не заявляет математическое 100% покрытие: тестируются reachable и критические error/lifecycle ветки.
 
@@ -23,29 +22,32 @@ Code/config baseline: `fb9441c`
 - Безопасное разрешение абсолютных executable-путей (`agy`, `git`, системный `taskkill`), запрет shell, Windows UTF-16 command-line budget, cleanup и exact-PID process-tree termination.
 - Межпроцессный workspace lock, общий deadline, восстановление после timeout/cancellation и отсутствие surviving descendants.
 - MCP default `mode=plan`; typed diagnostics; runtime failures возвращаются как MCP `isError=true` при сохранении structured metadata; validation/redaction не раскрывают prompt, stdout, stderr или secrets.
-- `run_id`, timestamps, duration, CLI version, retryability и completeness metadata; progress содержит run id и state.
+- `agy --output-format stream-json` читается во время выполнения; model text delta не сохраняется, наружу идут только allowlisted step index/state/type и ограниченный final result.
+- `run_id`, timestamps, duration, CLI version, retryability и completeness metadata; progress использует шкалу wrapper-этапов `0..100`, heartbeat, blocker, next action, elapsed/idle и manager status без выдуманного Gemini ETA.
 - Git preflight/postflight для `accept-edits`: bounded status snapshot, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`; persistent review marker и явный `acknowledge_review`; destructive rollback не выполняется.
 - Codex MCP timeout настроен на `900` секунд при wrapper timeout `840` секунд.
 - Удалены legacy SDK-файлы и зависимость `google-antigravity`; остался один production path через OAuth CLI.
-- Добавлен stdlib SQLite `AgentStore`: persistence между process instances, условные transitions, terminal immutability, stale reconciliation, capacity 32, terminal history 1000 и output limit 256 KiB; prompt/context/verification не сохраняются.
+- Добавлен stdlib SQLite `AgentStore`: additive migration `progress_json`, persistence между process instances, условные transitions, terminal immutability, heartbeat-aware stale reconciliation, capacity 32, terminal history 1000 и output limit 256 KiB; prompt/context/verification не сохраняются.
+- Recent activity ограничена 16 allowlisted событиями, последовательные heartbeat coalesce; произвольные code/step/next-action и raw stdout/stderr в telemetry не попадают.
 - Добавлены lifecycle tools `spawn/list/status/wait/followup/interrupt`; follow-up использует валидированный UUID `--conversation`, wait ограничен 60 секундами на call, interrupt работает через общий SQLite cancel flag между store/process instances.
 - Добавлен project-scoped `.codex/agents/antigravity_worker.toml` и обязательное правило cost-first routing в `AGENTS.md`; Codex остаётся владельцем UI/lifecycle, review и тестов.
 
 ## Реальный STDIO MCP-контур
 
-`test_mcp_protocol.py` запускает отдельный STDIO process и настоящий `mcp.ClientSession`: initialize, семь tools в `tools/list`, схемы, synchronous call, полный lifecycle `spawn/wait/followup/list/interrupt`, unknown/missing/wrong arguments, redaction, non-Git cwd, progress, cancellation и последовательный call после ошибки. Fixture подменяет только CLI response и использует отдельную временную SQLite БД, поэтому deterministic tests offline и не требуют OAuth.
+`test_mcp_protocol.py` запускает отдельный STDIO process и настоящий `mcp.ClientSession`: initialize, восемь tools в `tools/list`, схемы, synchronous call, полный lifecycle `spawn/wait/followup/list/interrupt`, unknown/missing/wrong arguments, redaction, non-Git cwd, progress `0..100`, cancellation и последовательный call после ошибки. Fixture подменяет только CLI response и использует отдельную временную SQLite БД, поэтому deterministic tests offline и не требуют OAuth.
 
 ## Live smoke
 
 - Authenticated `agy` OAuth smoke в `plan`: **успешно**, контрольный marker найден в ответе, Git не изменён.
 - Изолированный `accept-edits` smoke: **SUCCESS**; изменён только `README.txt`, postflight complete, полный diff просмотрен; временный test repository удалён.
 - Новый managed lifecycle smoke был повторно запущен после реализации manager: lifecycle дошёл до terminal `failed`, Git остался неизменным; внешний Antigravity provider в это время вернул usage limit. Это внешний лимит, поэтому новый OAuth success не заявляется и повторный запрос автоматически не выполнялся.
+- Отдельный реальный `agy 1.1.24 --output-format stream-json` smoke подтвердил события `init`, `step_update` и `result`; MCP wrapper после обновления пакета и перезапуска Codex ещё требует повторного live smoke.
 
 Это единственная проверка, зависящая от внешней OAuth-сессии и реального CLI; она не входит в deterministic count.
 
 ## Ограничения
 
-Postflight fingerprint использует `git status` и метаданные файлов, а не content hashes. Автоматического rollback нет: partial/unknown state оставляет `requires_review=true` и требует явного решения оператора.
+Postflight fingerprint использует `git status` и метаданные файлов, а не content hashes. Автоматического rollback нет: partial/unknown state оставляет `requires_review=true` и требует явного решения оператора. `progress_percent` отражает только наблюдаемые wrapper phases; внутренний процент и ETA Gemini намеренно не заявляются.
 
 ## Tracked-secret scan
 

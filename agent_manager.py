@@ -21,8 +21,33 @@ TERMINAL_STATUSES = ("completed", "failed", "interrupted")
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_HISTORY = 1000
 MAX_ACTIVE_AGENTS = 32
+MAX_PROGRESS_EVENTS = 16
 STATE_DIR_ENV = "ANTIAGENT_STATE_DIR"
 _STATE_DIRECTORY: Path | None = None
+
+_PROGRESS_MESSAGES = {
+    "scheduled": "Agent scheduled",
+    "manager_started": "Agent manager started",
+    "preflight_started": "Preflight checks started",
+    "waiting_for_workspace": "Waiting for workspace lock",
+    "workspace_acquired": "Workspace lock acquired",
+    "cli_started": "Antigravity CLI started",
+    "cli_step": "Antigravity CLI reported a step",
+    "heartbeat": "Agent is still running",
+    "postflight_started": "Postflight review started",
+    "result_validation": "Result validation started",
+    "cancel_requested": "Cancellation requested",
+    "completed": "Agent completed",
+    "failed": "Agent failed",
+    "interrupted": "Agent interrupted",
+    "manager_lost": "Agent manager heartbeat was lost",
+}
+_PROGRESS_PHASES = {
+    "queued", "preflight", "waiting_for_workspace", "executing", "postflight",
+    "validating_result", "completed", "failed", "interrupted",
+}
+_STEP_STATES = {"PENDING", "RUNNING", "DONE", "FAILED", "CANCELLED", "UNKNOWN"}
+_STEP_TYPES = {"user_input", "agent_response", "tool", "thinking", "plan", "unknown"}
 
 
 @dataclass(frozen=True)
@@ -41,6 +66,7 @@ class AgentSnapshot:
     updated_at: float
     output: dict[str, Any] | None
     manager_error: str | None
+    progress: dict[str, Any] | None
 
 
 class AgentCapacityError(RuntimeError):
@@ -174,9 +200,15 @@ class AgentStore:
                 finished_at TEXT,
                 updated_at REAL NOT NULL,
                 output_json TEXT,
-                manager_error TEXT
+                manager_error TEXT,
+                progress_json TEXT
             )"""
         )
+        columns = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(agents)")
+        }
+        if "progress_json" not in columns:
+            self._db.execute("ALTER TABLE agents ADD COLUMN progress_json TEXT")
         if os.name != "nt":
             os.chmod(self.path, 0o600)
 
@@ -201,6 +233,14 @@ class AgentStore:
                 parsed = None
             if isinstance(parsed, dict):
                 output = parsed
+        progress: dict[str, Any] | None = None
+        if row["progress_json"] is not None:
+            try:
+                parsed_progress = json.loads(row["progress_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed_progress = None
+            if isinstance(parsed_progress, dict):
+                progress = parsed_progress
         return AgentSnapshot(
             agent_id=row["agent_id"],
             parent_agent_id=row["parent_agent_id"],
@@ -216,6 +256,7 @@ class AgentStore:
             updated_at=float(row["updated_at"]),
             output=output,
             manager_error=row["manager_error"],
+            progress=progress,
         )
 
     def _fetch(self, agent_id: str) -> AgentSnapshot | None:
@@ -240,6 +281,7 @@ class AgentStore:
         agent_id = agent_id or uuid.uuid4().hex
         created_at, updated_at = _now()
         workspace = _canonical_workspace(workspace)
+        progress_json = self._initial_progress(created_at)
         with self._lock:
             try:
                 self._begin()
@@ -253,12 +295,13 @@ class AgentStore:
                 self._db.execute(
                     """INSERT INTO agents (
                         agent_id,parent_agent_id,owner_id,workspace,thinking_level,mode,
-                        status,cancel_requested,conversation_id,created_at,updated_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                        status,cancel_requested,conversation_id,created_at,updated_at,
+                        progress_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         agent_id, parent_agent_id, self.owner_id, workspace,
                         thinking_level, mode, "queued", 0, conversation_id,
-                        created_at, updated_at,
+                        created_at, updated_at, progress_json,
                     ),
                 )
                 # ponytail: retain 1000 terminal rows; add archival storage only when history needs exceed this cap.
@@ -317,11 +360,168 @@ class AgentStore:
         with self._lock:
             try:
                 self._begin()
-                self._db.execute(
-                    """UPDATE agents SET status='running',started_at=?,updated_at=?
-                       WHERE agent_id=? AND owner_id=? AND status='queued'""",
-                    (started_at, updated_at, agent_id, self.owner_id),
+                row = self._db.execute(
+                    "SELECT * FROM agents WHERE agent_id=? AND owner_id=?",
+                    (agent_id, self.owner_id),
+                ).fetchone()
+                progress_json = self._updated_progress_json(
+                    row, phase="preflight", progress_percent=10,
+                    code="manager_started", at=started_at,
+                    next_action="preflight_started",
                 )
+                self._db.execute(
+                    """UPDATE agents SET status='running',started_at=?,updated_at=?,
+                       progress_json=? WHERE agent_id=? AND owner_id=? AND status='queued'""",
+                    (started_at, updated_at, progress_json, agent_id, self.owner_id),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            return self._fetch(agent_id)
+
+    @staticmethod
+    def _initial_progress(at: str) -> str:
+        return json.dumps({
+            "version": 1,
+            "phase": "queued",
+            "progress_percent": 5,
+            "progress_basis": "wrapper_phase",
+            "indeterminate": True,
+            "last_event_at": at,
+            "heartbeat_at": None,
+            "deadline_at": None,
+            "recent_events": [{
+                "sequence": 1, "timestamp": at, "code": "scheduled",
+                "message": _PROGRESS_MESSAGES["scheduled"],
+                "progress_percent": 5,
+            }],
+            "blocker": None,
+            "next_action": "preflight_started",
+            "step": None,
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _decode_progress(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None or row["progress_json"] is None:
+            return {}
+        try:
+            value = json.loads(row["progress_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def _updated_progress_json(
+        cls,
+        row: sqlite3.Row | None,
+        *,
+        phase: str,
+        progress_percent: int,
+        code: str,
+        at: str,
+        blocker_code: str | None = None,
+        next_action: str | None = None,
+        deadline_at: str | None = None,
+        step: dict[str, Any] | None = None,
+        heartbeat: bool = False,
+    ) -> str:
+        if code not in _PROGRESS_MESSAGES:
+            raise ValueError("invalid progress event code")
+        if phase not in _PROGRESS_PHASES:
+            raise ValueError("invalid progress phase")
+        if next_action is not None and next_action not in _PROGRESS_MESSAGES:
+            next_action = None
+        safe_step = None
+        if isinstance(step, dict):
+            index = step.get("index")
+            state = step.get("state")
+            step_type = step.get("type")
+            if isinstance(index, int) and not isinstance(index, bool) and index >= 0:
+                safe_step = {
+                    "index": index,
+                    "state": state if state in _STEP_STATES else "UNKNOWN",
+                    "type": step_type if step_type in _STEP_TYPES else "unknown",
+                }
+        current = cls._decode_progress(row)
+        old_percent = current.get("progress_percent", 0)
+        if not isinstance(old_percent, int) or isinstance(old_percent, bool):
+            old_percent = 0
+        percent = max(old_percent, min(100, max(0, int(progress_percent))))
+        events = current.get("recent_events")
+        events = list(events) if isinstance(events, list) else []
+        event = {
+            "sequence": (
+                max((item.get("sequence", 0) for item in events if isinstance(item, dict)), default=0) + 1
+            ),
+            "timestamp": at,
+            "code": code,
+            "message": _PROGRESS_MESSAGES[code],
+            "progress_percent": percent,
+        }
+        if heartbeat and events and isinstance(events[-1], dict) and events[-1].get("code") == "heartbeat":
+            event["sequence"] = events[-1].get("sequence", event["sequence"])
+            events[-1] = event
+        else:
+            events.append(event)
+        events = events[-MAX_PROGRESS_EVENTS:]
+        blocker = None
+        if blocker_code:
+            if blocker_code not in _PROGRESS_MESSAGES:
+                raise ValueError("invalid blocker code")
+            blocker = {
+                "code": blocker_code,
+                "message": _PROGRESS_MESSAGES[blocker_code],
+                "retryable": blocker_code == "waiting_for_workspace",
+            }
+        value = {
+            "version": 1,
+            "phase": phase,
+            "progress_percent": percent,
+            "progress_basis": "wrapper_phase",
+            "indeterminate": phase not in ("completed", "failed", "interrupted"),
+            "last_event_at": at,
+            "heartbeat_at": at if heartbeat else current.get("heartbeat_at"),
+            "deadline_at": deadline_at if deadline_at is not None else current.get("deadline_at"),
+            "recent_events": events,
+            "blocker": blocker,
+            "next_action": next_action,
+            "step": safe_step,
+        }
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def record_progress(
+        self,
+        agent_id: str,
+        *,
+        phase: str,
+        progress_percent: int,
+        code: str,
+        blocker_code: str | None = None,
+        next_action: str | None = None,
+        deadline_at: str | None = None,
+        step: dict[str, Any] | None = None,
+        heartbeat: bool = False,
+    ) -> AgentSnapshot | None:
+        at, updated_at = _now()
+        with self._lock:
+            try:
+                self._begin()
+                row = self._db.execute(
+                    "SELECT * FROM agents WHERE agent_id=? AND owner_id=?",
+                    (agent_id, self.owner_id),
+                ).fetchone()
+                if row is not None and row["status"] not in TERMINAL_STATUSES:
+                    progress_json = self._updated_progress_json(
+                        row, phase=phase, progress_percent=progress_percent,
+                        code=code, at=at, blocker_code=blocker_code,
+                        next_action=next_action, deadline_at=deadline_at,
+                        step=step, heartbeat=heartbeat,
+                    )
+                    self._db.execute(
+                        "UPDATE agents SET progress_json=?,updated_at=? WHERE agent_id=? AND owner_id=?",
+                        (progress_json, updated_at, agent_id, self.owner_id),
+                    )
                 self._db.commit()
             except Exception:
                 self._db.rollback()
@@ -357,13 +557,22 @@ class AgentStore:
         with self._lock:
             try:
                 self._begin()
+                row = self._db.execute(
+                    "SELECT * FROM agents WHERE agent_id=? AND owner_id=?",
+                    (agent_id, self.owner_id),
+                ).fetchone()
+                progress_json = self._updated_progress_json(
+                    row, phase=status, progress_percent=100, code=status,
+                    at=finished_at, next_action=None,
+                )
                 self._db.execute(
                     """UPDATE agents SET status=?,finished_at=?,updated_at=?,output_json=?,
-                       conversation_id=COALESCE(?,conversation_id),manager_error=?
+                       conversation_id=COALESCE(?,conversation_id),manager_error=?,
+                       progress_json=?
                        WHERE agent_id=? AND owner_id=? AND status NOT IN ('completed','failed','interrupted')""",
                     (
                         status, finished_at, updated_at, output_json, conversation_id,
-                        manager_error, agent_id, self.owner_id,
+                        manager_error, progress_json, agent_id, self.owner_id,
                     ),
                 )
                 self._db.commit()
@@ -373,13 +582,27 @@ class AgentStore:
             return self._fetch(agent_id)
 
     def request_cancel(self, agent_id: str) -> AgentSnapshot | None:
+        at, updated_at = _now()
         with self._lock:
             try:
                 self._begin()
+                row = self._db.execute(
+                    "SELECT * FROM agents WHERE agent_id=? AND owner_id=?",
+                    (agent_id, self.owner_id),
+                ).fetchone()
+                if row is None or row["status"] in TERMINAL_STATUSES:
+                    self._db.commit()
+                    return self._fetch(agent_id)
+                progress_json = self._updated_progress_json(
+                    row,
+                    phase="queued" if row["status"] == "queued" else "executing",
+                    progress_percent=0, code="cancel_requested", at=at,
+                    next_action="interrupted",
+                )
                 self._db.execute(
-                    """UPDATE agents SET cancel_requested=1,updated_at=?
+                    """UPDATE agents SET cancel_requested=1,updated_at=?,progress_json=?
                        WHERE agent_id=? AND owner_id=? AND status NOT IN ('completed','failed','interrupted')""",
-                    (time.time(), agent_id, self.owner_id),
+                    (updated_at, progress_json, agent_id, self.owner_id),
                 )
                 self._db.commit()
             except Exception:
@@ -399,14 +622,25 @@ class AgentStore:
         with self._lock:
             try:
                 self._begin()
-                cursor = self._db.execute(
-                    """UPDATE agents SET status='failed',finished_at=?,updated_at=?,
-                       manager_error='manager_lost'
-                       WHERE owner_id=? AND status IN ('queued','running') AND updated_at<?""",
-                    (finished_at, time.time(), self.owner_id, cutoff),
-                )
+                rows = self._db.execute(
+                    """SELECT * FROM agents WHERE owner_id=?
+                       AND status IN ('queued','running') AND updated_at<?""",
+                    (self.owner_id, cutoff),
+                ).fetchall()
+                updated_at = time.time()
+                for row in rows:
+                    progress_json = self._updated_progress_json(
+                        row, phase="failed", progress_percent=100,
+                        code="manager_lost", at=finished_at,
+                    )
+                    self._db.execute(
+                        """UPDATE agents SET status='failed',finished_at=?,updated_at=?,
+                           manager_error='manager_lost',progress_json=?
+                           WHERE agent_id=? AND owner_id=?""",
+                        (finished_at, updated_at, progress_json, row["agent_id"], self.owner_id),
+                    )
                 self._db.commit()
-                return cursor.rowcount
+                return len(rows)
             except Exception:
                 self._db.rollback()
                 raise

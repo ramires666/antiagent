@@ -1,6 +1,6 @@
 # MCP test matrix
 
-Актуально для code/config baseline `fb9441c` (27 августа 2026 г.). Автоматические тесты offline, кроме отдельно отмеченного authenticated live smoke.
+Актуально для Antiagent `0.3.0` (2 сентября 2026 г.). Автоматические тесты offline, кроме отдельно отмеченного authenticated live smoke.
 
 ## MCP protocol — 6 тестов
 
@@ -10,8 +10,8 @@
 | Schema и valid call | `task` обязателен, defaults `thinking_level=medium`, `mode=plan`, единственный `payload_mode=workspace`; structured output валиден |
 | Unknown/missing/wrong/invalid arguments | Без падения process, без запуска Git/CLI и без утечки входных данных |
 | Runtime error | MCP `isError=true`, structured metadata сохранена, stderr/secrets redacted |
-| Progress/cancellation/sequential call | `run_id` и state видимы, cleanup завершён, следующая операция работает |
-| Persistent lifecycle | `spawn/wait/status/list/followup/interrupt`, terminal output, lineage и отсутствие prompt в snapshot |
+| Progress/cancellation/sequential call | Числовая шкала `0..100`, safe phase/activity, cleanup завершён, следующая операция работает |
+| Persistent lifecycle | `spawn/wait/status/list/followup/interrupt`, terminal output, lineage, durable progress и отсутствие prompt в snapshot |
 
 ## Persistent agent manager
 
@@ -23,8 +23,10 @@
 | Cancel через второе SQLite connection | Running executor замечает flag, отменяется и освобождает workspace lock |
 | Follow-up после `accept-edits` | Conversation продолжена, но новый безопасный default снова `plan` |
 | Stale `queued|running` | `failed`, `manager_error=manager_lost` |
+| Durable progress | Migration старой БД; monotonic wrapper percent; heartbeat обновляет liveness; terminal immutable |
+| Event ring | Не более 16 allowlisted событий; heartbeat coalescing; free-form telemetry и секреты отвергаются |
 | Capacity/history/output bounds | 32 active, 1000 terminal, 256 KiB result; безопасные typed errors |
-| SQLite schema | Нет `task`, `context`, `verification`; `owner_id` и DB path не выдаются snapshot’ом |
+| SQLite schema | `progress_json` мигрируется additively; нет `task`, `context`, `verification`; `owner_id` и DB path не выдаются snapshot’ом |
 
 ## Input/workspace
 
@@ -32,7 +34,7 @@
 
 ## Process and security
 
-Проверяются executable resolution, exact argv, отсутствие shell и dangerous permission bypass, safe child environment, spawn/OSError, timeout, cancellation, bounded stdout/stderr, reader failure, Windows Job Object/exact PID tree kill и POSIX fallback. Output не включает raw stderr, prompt, environment или secrets; truncation — head + marker + tail.
+Проверяются executable resolution, exact argv с `--output-format stream-json`, отсутствие shell и dangerous permission bypass, safe child environment, spawn/OSError, timeout, cancellation, bounded stdout/stderr, reader failure, Windows Job Object/exact PID tree kill и POSIX fallback. NDJSON parser сохраняет только final result и allowlisted step metadata; output/progress не включают text delta, raw stderr, prompt, environment или secrets.
 
 ## Git postflight
 

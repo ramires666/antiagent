@@ -8,6 +8,7 @@
 
 - MCP server `agy_server.py`;
 - persistent manager с lifecycle tools;
+- безопасная live-телеметрия wrapper-этапов и `agy stream-json`;
 - переносимый установщик `antiagent-codex-install`;
 - custom Codex agent `.codex/agents/antigravity_worker.toml`;
 - repo-scoped skill `.agents/skills/antigravity-executor/SKILL.md`.
@@ -132,6 +133,14 @@ wrapper возвращает typed `verification_failed`; значение marke
 число tool-запросов, но не является технической границей доступа. При
 `permission_denied` не включайте `--dangerously-skip-permissions`: используйте
 узкий интерактивный запуск либо native fallback.
+
+Во время выполнения `execute` и `agent_wait` отправляют MCP progress с общей
+шкалой `0..100`. В durable snapshot поле `progress` содержит текущую фазу,
+последние 16 безопасных событий, blocker, следующее действие, heartbeat,
+elapsed/idle и принадлежность manager process. Процент отражает только этапы
+оболочки (`progress_basis=wrapper_phase`), а `indeterminate=true` честно означает,
+что внутренний процент и ETA Gemini неизвестны. Из телеметрии исключены prompt,
+context, пути, argv, raw stdout/stderr, tool arguments и текст ответа модели.
 
 ## 6. Проверка проекта
 

@@ -28,6 +28,7 @@ OUTPUT_FIELDS = {
     "preexisting_dirty", "worktree_changed", "changed_paths",
     "postflight_complete", "requires_review",
     "payload_mode", "file_scope_enforced", "shell_denied",
+    "feedback",
 }
 DOCTOR_FIELDS = {
     "checks_passed", "cli_available", "cli_version",
@@ -1045,7 +1046,7 @@ class AgyServerTest(unittest.TestCase):
         expected_argv = [
             str(cli), "-p", "PROMPT", "--mode", "plan", "--model",
             "gemini-3.7-flash-high", "--effort", "high", "--output-format",
-            "json", "--print-timeout", "5s", "--sandbox",
+            "stream-json", "--print-timeout", "5s", "--sandbox",
             "--disable-slash-commands", "--add-dir", str(workspace),
         ]
         self.assertEqual(
@@ -1068,7 +1069,9 @@ class AgyServerTest(unittest.TestCase):
                     return self.returncode
 
             process = FakeProcess()
-            process.stdout.feed_data(b"stdout")
+            process.stdout.feed_data(
+                b'{"event":"result","result":{"status":"SUCCESS","response":"stdout"}}\n'
+            )
             process.stdout.feed_eof()
             process.stderr.feed_eof()
 
@@ -1096,7 +1099,10 @@ class AgyServerTest(unittest.TestCase):
             expected_kwargs["start_new_session"] = True
         self.assertEqual(captured, {"args": tuple(expected_argv), "kwargs": expected_kwargs})
         create_job.assert_called_once_with(91)
-        self.assertEqual(result, (0, "stdout", False))
+        self.assertEqual(
+            result,
+            (0, '{"status":"SUCCESS","response":"stdout"}', False),
+        )
 
     def test_subprocess_spawn_failures_are_safe(self):
         for error in (OSError("no executable"), ValueError("bad argv")):
@@ -2626,11 +2632,13 @@ class AgyServerTest(unittest.TestCase):
         ):
             result = asyncio.run(server.antigravity_cli_execute("x", ctx=ctx))
         self.assertEqual(result, {"status": "SUCCESS"})
-        self.assertEqual(ctx.calls, [
-            (1, None, "queued"),
-            (2, None, "running"),
-            (3, None, "done"),
+        self.assertEqual(ctx.calls[:3], [
+            (5, 100, "queued"),
+            (35, 100, "running"),
+            (95, 100, "done"),
         ])
+        self.assertEqual(ctx.calls[3][:2], (100, 100))
+        self.assertIn("state=success progress=100%", ctx.calls[3][2])
 
     def test_concurrent_context_progress_is_serialized(self):
         class FakeContext:
@@ -2677,10 +2685,12 @@ class AgyServerTest(unittest.TestCase):
         result, ctx = asyncio.run(scenario())
         self.assertEqual(result, {"status": "SUCCESS"})
         self.assertEqual(ctx.max_active, 1)
-        self.assertEqual(ctx.calls, [
-            (1, None, "first"),
-            (2, None, "second"),
+        self.assertEqual(ctx.calls[:2], [
+            (35, 100, "first"),
+            (35, 100, "second"),
         ])
+        self.assertEqual(ctx.calls[2][:2], (100, 100))
+        self.assertIn("state=success progress=100%", ctx.calls[2][2])
 
     def test_progress_callback_failure_is_generic_and_nonfatal(self):
         async def progress(_message):
@@ -2698,6 +2708,109 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(result["result"], "ok")
         self.assertIn("MCP progress notification failed", "\n".join(logs.output))
         self.assertNotIn("PROGRESS_CALLBACK_SECRET", "\n".join(logs.output))
+
+    def test_stream_json_reports_safe_steps_and_returns_only_final_result(self):
+        async def scenario():
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            events = [
+                {"event": "init", "init": {"conversation_id": "conv-safe"}},
+                {"event": "step_update", "step_update": {
+                    "step_index": 3, "state": "DONE", "step_type": "agent_response",
+                    "text_delta": "TOKEN=stream-secret",
+                }},
+                {"event": "result", "result": {
+                    "status": "SUCCESS", "response": "public", "usage": {},
+                }},
+            ]
+            stdout.feed_data(
+                ("\n".join(json.dumps(event) for event in events) + "\n").encode()
+            )
+            stdout.feed_eof()
+            stderr.feed_eof()
+
+            class FakeProcess:
+                returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = FakeProcess()
+            process.stdout = stdout
+            process.stderr = stderr
+            updates = []
+
+            async def callback(update):
+                updates.append(update)
+
+            token = server._LIFECYCLE_CALLBACK.set(callback)
+            try:
+                result = await server._collect_stream_output(process)
+            finally:
+                server._LIFECYCLE_CALLBACK.reset(token)
+            return result, updates
+
+        (stdout, exceeded, stderr), updates = asyncio.run(scenario())
+        self.assertFalse(exceeded)
+        self.assertEqual(stderr, b"")
+        payload = json.loads(stdout)
+        self.assertEqual(payload["response"], "public")
+        self.assertEqual(payload["conversation_id"], "conv-safe")
+        self.assertEqual(updates[0].step, {
+            "index": 3, "state": "DONE", "type": "agent_response",
+        })
+        self.assertNotIn("stream-secret", repr(updates))
+        self.assertNotIn("stream-secret", stdout.decode())
+
+    def test_agent_wait_relays_bounded_safe_progress(self):
+        class FakeContext:
+            def __init__(self):
+                self.calls = []
+
+            async def report_progress(self, progress, total, message):
+                self.calls.append((progress, total, message))
+
+        async def scenario(store, agent_id, ctx):
+            async def finish():
+                await asyncio.sleep(0.05)
+                store.record_progress(
+                    agent_id, phase="executing", progress_percent=50,
+                    code="cli_step",
+                    step={"index": 2, "state": "DONE", "type": "tool"},
+                    next_action="postflight_started",
+                )
+                await asyncio.sleep(0.05)
+                store.finish(agent_id, "completed")
+
+            finisher = asyncio.create_task(finish())
+            result = await server.antigravity_agent_wait(agent_id, 2, ctx=ctx)
+            await finisher
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = server.AgentStore(
+                Path(directory) / "agents.sqlite3", owner_id="wait-progress"
+            )
+            snapshot = store.create(
+                workspace=directory, thinking_level="medium", mode="plan"
+            )
+            store.mark_running(snapshot.agent_id)
+            ctx = FakeContext()
+            with patch.object(server, "_AGENT_STORE", store), patch(
+                "agy_server._snapshot_in_scope", return_value=True
+            ):
+                result = asyncio.run(scenario(store, snapshot.agent_id, ctx))
+            data = result_data(result)
+            self.assertEqual(data["agent"]["status"], "completed")
+            self.assertEqual(data["agent"]["progress"]["progress_percent"], 100)
+            self.assertTrue(ctx.calls)
+            self.assertEqual(ctx.calls[-1][:2], (100, 100))
+            self.assertEqual(
+                [call[0] for call in ctx.calls],
+                sorted(call[0] for call in ctx.calls),
+            )
+            self.assertNotIn("secret", repr(ctx.calls).lower())
+            store.close()
 
 
 if __name__ == "__main__":

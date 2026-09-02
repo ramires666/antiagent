@@ -7,6 +7,7 @@ wrapper deliberately does not read .env files or API-key environment values.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import ctypes
 import errno
 import hashlib
@@ -98,6 +99,7 @@ _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 ProgressCallback = Callable[[str], Awaitable[None]]
+LifecycleCallback = Callable[["LifecycleUpdate"], Awaitable[None]]
 ErrorType = Literal[
     "invalid_request",
     "path_not_found",
@@ -208,6 +210,7 @@ class RunInfo:
     _started_monotonic: float = field(default_factory=time.monotonic, repr=False)
     finished_at: str | None = None
     duration_seconds: float | None = None
+    feedback: dict[str, Any] | None = None
 
     def finish(self) -> None:
         if self.finished_at is None:
@@ -235,6 +238,40 @@ class CliRunResult:
         if isinstance(other, CliRunResult):
             return self.__dict__ == other.__dict__
         return NotImplemented
+
+
+@dataclass(frozen=True)
+class LifecycleUpdate:
+    phase: str
+    progress_percent: int
+    code: str
+    blocker_code: str | None = None
+    next_action: str | None = None
+    deadline_at: str | None = None
+    step: dict[str, Any] | None = None
+    heartbeat: bool = False
+
+
+_LIFECYCLE_CALLBACK: contextvars.ContextVar[LifecycleCallback | None] = (
+    contextvars.ContextVar("antiagent_lifecycle_callback", default=None)
+)
+_LIFECYCLE_MESSAGES = {
+    "scheduled": "Agent scheduled",
+    "manager_started": "Agent manager started",
+    "preflight_started": "Preflight checks started",
+    "waiting_for_workspace": "Waiting for workspace lock",
+    "workspace_acquired": "Workspace lock acquired",
+    "cli_started": "Antigravity CLI started",
+    "cli_step": "Antigravity CLI reported a step",
+    "heartbeat": "Agent is still running",
+    "postflight_started": "Postflight review started",
+    "result_validation": "Result validation started",
+    "cancel_requested": "Cancellation requested",
+    "completed": "Agent completed",
+    "failed": "Agent failed",
+    "interrupted": "Agent interrupted",
+    "manager_lost": "Agent manager heartbeat was lost",
+}
 
 
 class GitPreflight(NamedTuple):
@@ -436,6 +473,52 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
     ]
 
 
+class ProgressEventOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sequence: int
+    timestamp: str
+    code: str
+    message: str
+    progress_percent: int
+
+
+class ProgressBlockerOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    message: str
+    retryable: bool
+
+
+class ProgressStepOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    state: str
+    type: str
+
+
+class AgentProgressOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int
+    phase: str
+    progress_percent: int
+    progress_basis: Literal["wrapper_phase"]
+    indeterminate: bool
+    last_event_at: str | None
+    heartbeat_at: str | None
+    deadline_at: str | None
+    recent_events: list[ProgressEventOutput]
+    blocker: ProgressBlockerOutput | None
+    next_action: str | None
+    step: ProgressStepOutput | None
+    elapsed_seconds: float
+    idle_seconds: float | None
+    manager_status: str
+
+
 class AntigravityCliOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -466,6 +549,7 @@ class AntigravityCliOutput(BaseModel):
     payload_mode: PayloadMode
     file_scope_enforced: bool
     shell_denied: bool
+    feedback: AgentProgressOutput | None
 
 
 class AntigravityDoctorOutput(BaseModel):
@@ -500,6 +584,7 @@ class AgentSnapshotOutput(BaseModel):
     updated_at: float
     output: dict[str, Any] | None
     manager_error: str | None
+    progress: AgentProgressOutput | None
 
 
 class AgentOperationOutput(BaseModel):
@@ -546,6 +631,147 @@ def _timeout_seconds() -> int:
     return min(value, MAX_TIMEOUT_SECONDS)
 
 
+def _parse_timestamp(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _apply_run_update(run: RunInfo, update: LifecycleUpdate) -> None:
+    if update.code not in _LIFECYCLE_MESSAGES:
+        return
+    current = dict(run.feedback or {})
+    old_percent = current.get("progress_percent", 0)
+    if not isinstance(old_percent, int) or isinstance(old_percent, bool):
+        old_percent = 0
+    percent = max(old_percent, min(100, max(0, update.progress_percent)))
+    at = _timestamp()
+    events = current.get("recent_events")
+    events = list(events) if isinstance(events, list) else []
+    event = {
+        "sequence": max(
+            (item.get("sequence", 0) for item in events if isinstance(item, dict)),
+            default=0,
+        ) + 1,
+        "timestamp": at,
+        "code": update.code,
+        "message": _LIFECYCLE_MESSAGES[update.code],
+        "progress_percent": percent,
+    }
+    if (
+        update.heartbeat
+        and events
+        and isinstance(events[-1], dict)
+        and events[-1].get("code") == "heartbeat"
+    ):
+        event["sequence"] = events[-1].get("sequence", event["sequence"])
+        events[-1] = event
+    else:
+        events.append(event)
+    blocker = None
+    if update.blocker_code in _LIFECYCLE_MESSAGES:
+        blocker = {
+            "code": update.blocker_code,
+            "message": _LIFECYCLE_MESSAGES[update.blocker_code],
+            "retryable": update.blocker_code == "waiting_for_workspace",
+        }
+    run.feedback = {
+        "version": 1,
+        "phase": update.phase,
+        "progress_percent": percent,
+        "progress_basis": "wrapper_phase",
+        "indeterminate": update.phase not in _TERMINAL_AGENT_STATUSES,
+        "last_event_at": at,
+        "heartbeat_at": at if update.heartbeat else current.get("heartbeat_at"),
+        "deadline_at": update.deadline_at or current.get("deadline_at"),
+        "recent_events": events[-16:],
+        "blocker": blocker,
+        "next_action": update.next_action,
+        "step": update.step,
+    }
+
+
+async def _emit_lifecycle(
+    run: RunInfo,
+    callback: LifecycleCallback | None,
+    update: LifecycleUpdate,
+) -> None:
+    _apply_run_update(run, update)
+    if callback is None:
+        return
+    try:
+        await asyncio.wait_for(callback(update), timeout=1)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Agent lifecycle persistence failed")
+
+
+async def _emit_lifecycle_callback(
+    callback: LifecycleCallback | None,
+    update: LifecycleUpdate,
+) -> None:
+    if callback is None:
+        return
+    try:
+        await asyncio.wait_for(callback(update), timeout=1)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Agent lifecycle persistence failed")
+
+
+def _feedback_view(
+    progress: dict[str, Any] | None,
+    *,
+    started_at: str | None,
+    updated_at: float | None,
+    manager_status: str,
+    event_limit: int = 16,
+) -> dict[str, Any] | None:
+    if not isinstance(progress, dict):
+        return None
+    value = dict(progress)
+    events = value.get("recent_events")
+    value["recent_events"] = (
+        [item for item in events if isinstance(item, dict)][-event_limit:]
+        if isinstance(events, list)
+        else []
+    )
+    now = time.time()
+    started = _parse_timestamp(started_at)
+    last_event = _parse_timestamp(value.get("last_event_at")) or updated_at
+    value["elapsed_seconds"] = round(max(0.0, now - (started or now)), 3)
+    value["idle_seconds"] = (
+        round(max(0.0, now - last_event), 3) if last_event is not None else None
+    )
+    value["manager_status"] = manager_status
+    return value
+
+
+def _snapshot_manager_status(snapshot: AgentSnapshot) -> str:
+    if snapshot.status in _TERMINAL_AGENT_STATUSES:
+        return "terminal"
+    if snapshot.agent_id in _AGENT_TASKS:
+        return "local"
+    return "durable_only"
+
+
+def _snapshot_output(snapshot: AgentSnapshot, *, event_limit: int = 16) -> dict[str, Any]:
+    value = asdict(snapshot)
+    value["progress"] = _feedback_view(
+        snapshot.progress,
+        started_at=snapshot.started_at or snapshot.created_at,
+        updated_at=snapshot.updated_at,
+        manager_status=_snapshot_manager_status(snapshot),
+        event_limit=event_limit,
+    )
+    return value
+
+
 async def _emit_progress(progress: ProgressCallback | None, message: str) -> None:
     if progress is None:
         return
@@ -563,6 +789,43 @@ async def _progress_heartbeat(progress: ProgressCallback, run_id: str = "") -> N
             await asyncio.sleep(12)
             await _emit_progress(
                 progress, f"run_id={run_id} state=running"
+            )
+    except asyncio.CancelledError:
+        return
+
+
+async def _lifecycle_heartbeat(
+    run: RunInfo, callback: LifecycleCallback | None,
+) -> None:
+    try:
+        while True:
+            await asyncio.sleep(12)
+            current = run.feedback or {}
+            await _emit_lifecycle(
+                run,
+                callback,
+                LifecycleUpdate(
+                    phase=str(current.get("phase") or "executing"),
+                    progress_percent=int(current.get("progress_percent") or 35),
+                    code="heartbeat",
+                    blocker_code=(
+                        current.get("blocker", {}).get("code")
+                        if isinstance(current.get("blocker"), dict)
+                        else None
+                    ),
+                    next_action=(
+                        current.get("next_action")
+                        if isinstance(current.get("next_action"), str)
+                        else None
+                    ),
+                    deadline_at=(
+                        current.get("deadline_at")
+                        if isinstance(current.get("deadline_at"), str)
+                        else None
+                    ),
+                    step=current.get("step") if isinstance(current.get("step"), dict) else None,
+                    heartbeat=True,
+                ),
             )
     except asyncio.CancelledError:
         return
@@ -592,6 +855,17 @@ def _empty_result(
     payload_mode: PayloadMode = "workspace",
 ) -> dict[str, Any]:
     run = run_info or RunInfo()
+    terminal_phase = "completed" if status == "SUCCESS" else "failed"
+    if not run.feedback or run.feedback.get("phase") not in _TERMINAL_AGENT_STATUSES:
+        _apply_run_update(
+            run,
+            LifecycleUpdate(
+                phase=terminal_phase,
+                progress_percent=100,
+                code=terminal_phase,
+                next_action=None,
+            ),
+        )
     run.finish()
     if len(result) <= MAX_RESULT_CHARS:
         safe_result, truncated = result, False
@@ -633,6 +907,12 @@ def _empty_result(
         "payload_mode": payload_mode,
         "file_scope_enforced": False,
         "shell_denied": False,
+        "feedback": _feedback_view(
+            run.feedback,
+            started_at=run.started_at,
+            updated_at=None,
+            manager_status="inline",
+        ),
     }
 
 
@@ -658,7 +938,7 @@ def _agent_operation_result(
 ) -> AgentOperationOutput:
     result = {
         "ok": error_type is None,
-        "agent": asdict(agent) if agent is not None else None,
+        "agent": _snapshot_output(agent) if agent is not None else None,
         "wait_timed_out": wait_timed_out,
         "error_type": error_type,
     }
@@ -682,7 +962,7 @@ def _agent_list_result(
 ) -> AgentListOutput:
     result = {
         "ok": error_type is None,
-        "agents": [asdict(agent) for agent in agents or []],
+        "agents": [_snapshot_output(agent, event_limit=3) for agent in agents or []],
         "error_type": error_type,
     }
     if error_type is None:
@@ -1376,6 +1656,109 @@ async def _collect_output(
             await asyncio.gather(*pending, return_exceptions=True)
 
 
+def _safe_stream_step(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    index = value.get("step_index")
+    state = value.get("state")
+    step_type = value.get("step_type")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        return None
+    safe_states = {"PENDING", "RUNNING", "DONE", "FAILED", "CANCELLED"}
+    safe_types = {
+        "user_input", "agent_response", "tool", "thinking", "plan", "unknown",
+    }
+    return {
+        "index": index,
+        "state": state if state in safe_states else "UNKNOWN",
+        "type": step_type if step_type in safe_types else "unknown",
+    }
+
+
+async def _collect_stream_output(
+    process: asyncio.subprocess.Process,
+) -> tuple[bytes, bool, bytes]:
+    """Consume agy's NDJSON stream and retain only its bounded final result."""
+    if process.stdout is None:
+        return b"", False, b""
+    stderr_task = asyncio.create_task(_read_bounded(process.stderr, MAX_STDERR_CHARS))
+    total = 0
+    buffer = b""
+    result_payload: dict[str, Any] | None = None
+    conversation_id: str | None = None
+    callback = _LIFECYCLE_CALLBACK.get()
+
+    async def consume(line: bytes) -> None:
+        nonlocal result_payload, conversation_id
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            return
+        if not isinstance(event, dict):
+            return
+        event_name = event.get("event")
+        if event_name == "init":
+            init = event.get("init")
+            if isinstance(init, dict):
+                conversation_id = _conversation_id(init)
+            return
+        if event_name == "step_update":
+            step = _safe_stream_step(event.get("step_update"))
+            if step is not None and callback is not None:
+                await _emit_lifecycle_callback(
+                    callback,
+                    LifecycleUpdate(
+                        phase="executing",
+                        progress_percent=50,
+                        code="cli_step",
+                        next_action="postflight_started",
+                        step=step,
+                    ),
+                )
+            return
+        if event_name == "result":
+            value = event.get("result")
+            if isinstance(value, dict):
+                result_payload = dict(value)
+
+    try:
+        while True:
+            chunk = await process.stdout.read(65_536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_STDOUT_CHARS:
+                stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
+                return b"", True, b""
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                await consume(line)
+        if buffer:
+            await consume(buffer)
+        await process.wait()
+        stderr, stderr_exceeded = await stderr_task
+        if stderr_exceeded:
+            return b"", True, b""
+        if result_payload is None:
+            return b"", False, stderr
+        if conversation_id is not None and "conversation_id" not in result_payload:
+            result_payload["conversation_id"] = conversation_id
+        encoded = json.dumps(
+            result_payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > MAX_STDOUT_CHARS:
+            return b"", True, b""
+        return encoded, False, stderr
+    finally:
+        if not stderr_task.done():
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+
+
 async def _run_cli(
     argv: list[str], cwd: Path, timeout_seconds: float | None = None
 ) -> CliRunResult:
@@ -1401,7 +1784,13 @@ async def _run_cli(
         return CliRunResult(None, "", False)
 
     job = _create_windows_job(process.pid)
-    communication = asyncio.create_task(_collect_output(process))
+    stream_json = any(
+        argv[index:index + 2] == ["--output-format", "stream-json"]
+        for index in range(max(0, len(argv) - 1))
+    )
+    communication = asyncio.create_task(
+        _collect_stream_output(process) if stream_json else _collect_output(process)
+    )
     try:
         # Shield the pipe-draining task: cancelling it on Windows can leave
         # Proactor pipe transports behind after taskkill.
@@ -1669,7 +2058,7 @@ def _build_argv(
         "--effort",
         thinking_level,
         "--output-format",
-        "json",
+        "stream-json",
         "--print-timeout",
         f"{max(1, timeout_seconds - 5)}s",
         "--sandbox",
@@ -1779,6 +2168,7 @@ async def execute_with_antigravity_cli(
     thinking_level: ThinkingLevel,
     mode: Mode,
     progress: ProgressCallback | None = None,
+    lifecycle: LifecycleCallback | None = None,
     run_info: RunInfo | None = None,
     acknowledge_review: bool = False,
     conversation_id: str | None = None,
@@ -1791,6 +2181,14 @@ async def execute_with_antigravity_cli(
             "ERROR", "conversation_id must be a UUID", thinking_level, mode,
             error_type="invalid_request", run_info=run,
         )
+    await _emit_lifecycle(
+        run,
+        lifecycle,
+        LifecycleUpdate(
+            phase="preflight", progress_percent=10,
+            code="preflight_started", next_action="waiting_for_workspace",
+        ),
+    )
     cli = _resolve_cli()
     if cli is None:
         return _empty_result(
@@ -1800,6 +2198,9 @@ async def execute_with_antigravity_cli(
     cli_version = await asyncio.to_thread(_probe_cli_version, cli)
     timeout_seconds = _timeout_seconds()
     deadline = asyncio.get_running_loop().time() + timeout_seconds
+    deadline_at = datetime.fromtimestamp(
+        time.time() + timeout_seconds, timezone.utc
+    ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     argv = _build_argv(
         cli, workspace, prompt, thinking_level, mode, timeout_seconds,
         conversation_id,
@@ -1809,12 +2210,31 @@ async def execute_with_antigravity_cli(
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise WorkspaceLockTimeout
+        await _emit_lifecycle(
+            run,
+            lifecycle,
+            LifecycleUpdate(
+                phase="waiting_for_workspace", progress_percent=20,
+                code="waiting_for_workspace",
+                blocker_code="waiting_for_workspace",
+                next_action="workspace_acquired", deadline_at=deadline_at,
+            ),
+        )
         async with locked_workspace(workspace, remaining):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise WorkspaceLockTimeout
             await _emit_progress(
                 progress, f"run_id={run.run_id} state=running"
+            )
+            await _emit_lifecycle(
+                run,
+                lifecycle,
+                LifecycleUpdate(
+                    phase="preflight", progress_percent=30,
+                    code="workspace_acquired", next_action="cli_started",
+                    deadline_at=deadline_at,
+                ),
             )
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -1834,11 +2254,37 @@ async def execute_with_antigravity_cli(
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     raise WorkspaceLockTimeout
-                cli_result = await _run_cli(argv, workspace, remaining)
+                await _emit_lifecycle(
+                    run,
+                    lifecycle,
+                    LifecycleUpdate(
+                        phase="executing", progress_percent=35,
+                        code="cli_started", next_action="postflight_started",
+                        deadline_at=deadline_at,
+                    ),
+                )
+
+                async def stream_lifecycle(update: LifecycleUpdate) -> None:
+                    await _emit_lifecycle(run, lifecycle, update)
+
+                token = _LIFECYCLE_CALLBACK.set(stream_lifecycle)
+                try:
+                    cli_result = await _run_cli(argv, workspace, remaining)
+                finally:
+                    _LIFECYCLE_CALLBACK.reset(token)
                 execution_failed = _cli_result_failed_for_review(
                     cli_result, expected_marker
                 )
             finally:
+                await _emit_lifecycle(
+                    run,
+                    lifecycle,
+                    LifecycleUpdate(
+                        phase="postflight", progress_percent=85,
+                        code="postflight_started", next_action="result_validation",
+                        deadline_at=deadline_at,
+                    ),
+                )
                 after = _git_status_snapshot(workspace) if mode == "accept-edits" else None
                 postflight = _postflight_info(
                     before,
@@ -1855,13 +2301,16 @@ async def execute_with_antigravity_cli(
             assert cli_result is not None
             return cli_result, postflight
 
-    heartbeat: asyncio.Task[None] | None = None
+    heartbeat_tasks: list[asyncio.Task[None]] = []
     try:
         await _emit_progress(progress, f"run_id={run.run_id} state=queued")
         if progress is not None:
-            heartbeat = asyncio.create_task(
+            heartbeat_tasks.append(asyncio.create_task(
                 _progress_heartbeat(progress, run.run_id)
-            )
+            ))
+        heartbeat_tasks.append(asyncio.create_task(
+            _lifecycle_heartbeat(run, lifecycle)
+        ))
         # The lock and CLI share one deadline.  _run_cli owns its cancellation
         # cleanup, so a second outer wait_for would race the typed lock error.
         cli_result, postflight = await run_serialized()
@@ -1913,10 +2362,21 @@ async def execute_with_antigravity_cli(
             postflight=PostflightInfo(None, None, [], False, True),
         )
     finally:
-        if heartbeat is not None:
+        for heartbeat in heartbeat_tasks:
             heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+        if heartbeat_tasks:
+            await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
         run.finish()
+
+    await _emit_lifecycle(
+        run,
+        lifecycle,
+        LifecycleUpdate(
+            phase="validating_result", progress_percent=95,
+            code="result_validation", next_action="completed",
+            deadline_at=deadline_at,
+        ),
+    )
 
     if timed_out:
         classified = _classify_cli_failure(stderr)
@@ -2034,6 +2494,21 @@ async def execute_with_antigravity_cli(
 async def _run_managed_agent(agent_id: str, prepared: PreparedExecution) -> None:
     store = _get_agent_store()
     execution: asyncio.Task[dict[str, Any]] | None = None
+
+    async def persist_progress(update: LifecycleUpdate) -> None:
+        await asyncio.to_thread(
+            store.record_progress,
+            agent_id,
+            phase=update.phase,
+            progress_percent=update.progress_percent,
+            code=update.code,
+            blocker_code=update.blocker_code,
+            next_action=update.next_action,
+            deadline_at=update.deadline_at,
+            step=update.step,
+            heartbeat=update.heartbeat,
+        )
+
     try:
         snapshot = store.get(agent_id)
         if snapshot is None:
@@ -2050,6 +2525,7 @@ async def _run_managed_agent(agent_id: str, prepared: PreparedExecution) -> None
                 prompt=prepared.prompt,
                 thinking_level=prepared.thinking_level,
                 mode=prepared.mode,
+                lifecycle=persist_progress,
                 acknowledge_review=prepared.acknowledge_review,
                 conversation_id=prepared.conversation_id,
                 expected_marker=prepared.expected_marker,
@@ -2252,6 +2728,7 @@ async def antigravity_agent_list(
 async def antigravity_agent_wait(
     agent_id: Annotated[str, SkipValidation],
     timeout_seconds: Annotated[float, SkipValidation] = 30.0,
+    ctx: Context | None = None,
 ) -> AgentOperationOutput:
     """Wait up to 60 seconds for an agent to reach a terminal state."""
     if (
@@ -2268,7 +2745,44 @@ async def antigravity_agent_wait(
         return error
     assert snapshot is not None
     deadline = asyncio.get_running_loop().time() + float(timeout_seconds)
+    last_signature: tuple[object, ...] | None = None
+    last_notification = 0.0
     while snapshot.status not in _TERMINAL_AGENT_STATUSES:
+        progress = snapshot.progress or {}
+        signature = (
+            snapshot.status,
+            progress.get("phase"),
+            progress.get("progress_percent"),
+            progress.get("last_event_at"),
+        )
+        now = asyncio.get_running_loop().time()
+        if ctx is not None and (
+            signature != last_signature or now - last_notification >= 5.0
+        ):
+            percent = progress.get("progress_percent", 0)
+            percent = percent if isinstance(percent, int) else 0
+            blocker = progress.get("blocker")
+            blocker_code = (
+                blocker.get("code") if isinstance(blocker, dict) else None
+            )
+            next_action = progress.get("next_action")
+            message = (
+                f"agent_id={snapshot.agent_id} status={snapshot.status} "
+                f"phase={progress.get('phase') or snapshot.status} "
+                f"progress={percent}%"
+            )
+            if blocker_code:
+                message += f" blocker={blocker_code}"
+            if isinstance(next_action, str):
+                message += f" next={next_action}"
+            try:
+                await ctx.report_progress(percent, 100, message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("MCP wait progress notification failed")
+            last_signature = signature
+            last_notification = now
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             return _agent_operation_result(snapshot, wait_timed_out=True)
@@ -2277,6 +2791,17 @@ async def antigravity_agent_wait(
         if error is not None:
             return error
         assert snapshot is not None
+    if ctx is not None:
+        try:
+            await ctx.report_progress(
+                100,
+                100,
+                f"agent_id={snapshot.agent_id} status={snapshot.status} progress=100%",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("MCP wait progress notification failed")
     return _agent_operation_result(snapshot)
 
 
@@ -2406,16 +2931,43 @@ async def antigravity_cli_execute(
         assert error is not None
         return _tool_result(error)
 
-    progress_count = 0
     progress_lock = asyncio.Lock()
+    last_progress = 0
 
     async def report_progress(message: str) -> None:
-        nonlocal progress_count
+        nonlocal last_progress
         if ctx is None:
             return
         async with progress_lock:
-            progress_count += 1
-            await ctx.report_progress(progress_count, None, message)
+            if "queued" in message:
+                target = 5
+            elif "done" in message or "complete" in message:
+                target = 95
+            else:
+                target = 35
+            last_progress = max(last_progress, target)
+            await ctx.report_progress(last_progress, 100, message)
+
+    async def report_lifecycle(update: LifecycleUpdate) -> None:
+        nonlocal last_progress
+        if ctx is None:
+            return
+        async with progress_lock:
+            last_progress = max(last_progress, update.progress_percent)
+            message = (
+                f"run_id={run.run_id} phase={update.phase} "
+                f"progress={last_progress}% activity={update.code}"
+            )
+            if update.blocker_code:
+                message += f" blocker={update.blocker_code}"
+            if update.next_action:
+                message += f" next={update.next_action}"
+            if update.step is not None:
+                message += (
+                    f" step={update.step.get('index')}"
+                    f"/{update.step.get('state')}/{update.step.get('type')}"
+                )
+            await ctx.report_progress(last_progress, 100, message)
 
     result = await execute_with_antigravity_cli(
         workspace=prepared.workspace,
@@ -2423,11 +2975,24 @@ async def antigravity_cli_execute(
         thinking_level=prepared.thinking_level,
         mode=prepared.mode,
         progress=report_progress if ctx is not None else None,
+        lifecycle=report_lifecycle if ctx is not None else None,
         run_info=run,
         acknowledge_review=prepared.acknowledge_review,
         conversation_id=prepared.conversation_id,
         expected_marker=prepared.expected_marker,
     )
+    if ctx is not None:
+        try:
+            async with progress_lock:
+                await ctx.report_progress(
+                    100,
+                    100,
+                    f"run_id={run.run_id} state={str(result.get('status')).lower()} progress=100%",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("MCP progress notification failed")
     return _tool_result(result)
 
 
