@@ -363,6 +363,64 @@ class AgyServerTest(unittest.TestCase):
         self.assertTrue(data["conversation_id_available"])
         self.assertTrue(data["metadata_complete"])
 
+    def test_expected_marker_is_required_without_echoing_it(self):
+        payload = {
+            "status": "SUCCESS",
+            "response": "completed without the sentinel",
+            "usage": {"total_tokens": 7},
+        }
+        marker = "PRIVATE_TEST_MARKER_20260902"
+        result = server._success_result(
+            payload, "low", "plan", run_info=server.RunInfo(),
+            cli_version="1.1.23", exit_code=0, expected_marker=marker,
+        )
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["error_type"], "verification_failed")
+        self.assertNotIn(marker, json.dumps(result))
+        self.assertEqual(result["usage"], {"total_tokens": 7})
+        self.assertTrue(result["usage_available"])
+
+        accepted = server._success_result(
+            {**payload, "response": f"done {marker}"}, "low", "plan",
+            run_info=server.RunInfo(), cli_version="1.1.23", exit_code=0,
+            expected_marker=marker,
+        )
+        self.assertEqual(accepted["status"], "SUCCESS")
+
+    def test_failed_structured_payload_preserves_allowlisted_usage(self):
+        payload = json.dumps({
+            "status": "ERROR",
+            "response": "failed",
+            "usage": {"input_tokens": 11, "secret": "discard-me"},
+        })
+        with patch(
+            "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+        ), patch(
+            "agy_server._probe_cli_version", return_value="1.1.23"
+        ), patch(
+            "agy_server._run_cli",
+            new=AsyncMock(return_value=server.CliRunResult(2, payload, False)),
+        ):
+            result = asyncio.run(server.execute_with_antigravity_cli(
+                workspace=Path("C:/repo"), prompt="x",
+                thinking_level="low", mode="plan",
+            ))
+        self.assertEqual(result["status"], "ERROR")
+        self.assertEqual(result["usage"], {"input_tokens": 11})
+        self.assertTrue(result["usage_available"])
+        self.assertNotIn("discard-me", json.dumps(result))
+
+    def test_expected_marker_validation_happens_before_git(self):
+        for marker in ("", "x" * 257, 1):
+            with self.subTest(marker=marker), patch(
+                "agy_server._git_preflight"
+            ) as preflight:
+                result = asyncio.run(server.antigravity_cli_execute(
+                    "x", expected_marker=marker
+                ))
+            self.assertEqual(result_data(result)["error_type"], "invalid_request")
+            preflight.assert_not_called()
+
     def test_cli_version_probe_declares_strict_output_bounds(self):
         completed = server.BoundedProbeResult(0, b"1.1.22\n", b"")
         with patch("agy_server._run_bounded_probe", return_value=completed) as run:

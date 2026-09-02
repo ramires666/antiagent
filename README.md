@@ -105,6 +105,12 @@ $antigravity-executor разрешаю выполнить предложенны
 Antigravity не получает задачи на архитектуру, security, destructive-операции,
 секреты, commit или push. Финальное решение всегда остаётся за основным Codex.
 
+Для задачи с машинно проверяемым ответом можно передать `expected_marker`
+(непустая строка до 256 символов). Если успешный ответ не содержит marker,
+wrapper возвращает typed `verification_failed`; значение marker в ошибке и
+логах не повторяется. Structured failed runs сохраняют только allowlisted
+счётчики usage.
+
 ## 6. Проверка проекта
 
 ```powershell

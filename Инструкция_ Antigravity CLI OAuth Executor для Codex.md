@@ -53,7 +53,7 @@ Allow rules минимальны: чтение workspace, необходимые
 
 ## MCP-контракт
 
-Совместимый синхронный tool `antigravity_cli_execute` принимает `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`), `mode` (`plan|accept-edits`, default `plan`), `acknowledge_review` (boolean, default `false`) и optional UUID `conversation_id`. Для каждого editing-вызова оператор должен явно выбрать `mode=accept-edits`. `acknowledge_review=true` нужен только после ручной проверки partial/unknown результата, когда wrapper вернул `review_required`.
+Совместимый синхронный tool `antigravity_cli_execute` принимает `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`), `mode` (`plan|accept-edits`, default `plan`), `acknowledge_review` (boolean, default `false`), optional UUID `conversation_id` и optional `expected_marker` (непустая строка до 256 символов). Для каждого editing-вызова оператор должен явно выбрать `mode=accept-edits`. `acknowledge_review=true` нужен только после ручной проверки partial/unknown результата, когда wrapper вернул `review_required`. Если непустой успешный ответ не содержит marker, wrapper возвращает `verification_failed`, не повторяя marker в ошибке или логах. Structured failed/no-content результаты сохраняют только allowlisted usage counters.
 
 Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`.
 
@@ -130,7 +130,7 @@ agy --version
 
 Acceptance criteria:
 
-1. `tools/list` возвращает восемь tools; schema валидирует `low|medium|high`, default `medium`, `plan`, `accept-edits`, boolean `acknowledge_review` (default `false`), optional UUID `conversation_id` и строковый `working_directory`; doctor schema не содержит credentials или profile path.
+1. `tools/list` возвращает восемь tools; schema валидирует `low|medium|high`, default `medium`, `plan`, `accept-edits`, boolean `acknowledge_review` (default `false`), optional UUID `conversation_id`, bounded `expected_marker` и строковый `working_directory`; doctor schema не содержит credentials или profile path.
 2. `working_directory` разрешается как абсолютный путь или относительно process cwd; пустой default использует process cwd. После canonical resolve путь обязан быть process cwd или его descendant и точным Git-root; выход через `..`, symlink или junction и остальные каталоги отклоняются. Subprocess получает этот абсолютный Git-root в `cwd`.
 3. Adapter передаёт `--sandbox` и `--disable-slash-commands`.
 4. stdout JSON, malformed JSON, non-zero exit и timeout дают безопасный структурированный ответ.

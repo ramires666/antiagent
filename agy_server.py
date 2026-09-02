@@ -124,6 +124,7 @@ ErrorType = Literal[
     "permission_denied",
     "policy_denied",
     "no_content",
+    "verification_failed",
     "review_required",
     "review_state_unavailable",
 ]
@@ -156,6 +157,7 @@ AgentManagerErrorType = Literal[
     "permission_denied",
     "policy_denied",
     "no_content",
+    "verification_failed",
     "review_required",
     "review_state_unavailable",
     "agent_not_found",
@@ -519,6 +521,7 @@ class PreparedExecution:
     mode: Mode
     acknowledge_review: bool
     conversation_id: str | None
+    expected_marker: str | None
 
 
 def _timeout_seconds() -> int:
@@ -1499,6 +1502,7 @@ def _prepare_execution(
     mode: object,
     acknowledge_review: object,
     conversation_id: object,
+    expected_marker: object,
     run_info: RunInfo,
 ) -> tuple[PreparedExecution | None, dict[str, Any] | None]:
     def invalid(
@@ -1528,6 +1532,12 @@ def _prepare_execution(
         )
     if not isinstance(acknowledge_review, bool):
         return invalid("acknowledge_review must be a boolean")
+    if expected_marker is not None and (
+        not isinstance(expected_marker, str)
+        or not expected_marker
+        or len(expected_marker) > 256
+    ):
+        return invalid("expected_marker must be a non-empty string up to 256 characters")
     normalized_conversation_id: str | None = None
     if conversation_id is not None:
         normalized_conversation_id = _input_conversation_id(conversation_id)
@@ -1559,12 +1569,14 @@ def _prepare_execution(
         mode=cast(Mode, mode),
         acknowledge_review=acknowledge_review,
         conversation_id=normalized_conversation_id,
+        expected_marker=cast(str | None, expected_marker),
     ), None
 
 
 def _success_result(
     payload: dict[str, Any], level: str, mode: str, *,
     run_info: RunInfo, cli_version: str | None, exit_code: int | None,
+    expected_marker: str | None = None,
 ) -> dict[str, Any]:
     response = payload.get("response", "")
     usage, usage_available = _usage_info(payload)
@@ -1582,6 +1594,15 @@ def _success_result(
         return _empty_result(
             "ERROR", "Antigravity CLI returned no content", level, mode,
             error_type="no_content", run_info=run_info,
+            cli_version=cli_version, exit_code=exit_code, usage=usage,
+            usage_available=usage_available,
+            conversation_id=conversation_id,
+            conversation_id_available=conversation_id_available,
+        )
+    if expected_marker is not None and expected_marker not in response:
+        return _empty_result(
+            "ERROR", "Antigravity CLI response failed verification", level, mode,
+            error_type="verification_failed", run_info=run_info,
             cli_version=cli_version, exit_code=exit_code, usage=usage,
             usage_available=usage_available,
             conversation_id=conversation_id,
@@ -1741,6 +1762,7 @@ async def execute_with_antigravity_cli(
     run_info: RunInfo | None = None,
     acknowledge_review: bool = False,
     conversation_id: str | None = None,
+    expected_marker: str | None = None,
 ) -> dict[str, Any]:
     """Execute one authenticated CLI process; also used by the live smoke."""
     run = run_info or RunInfo()
@@ -1921,6 +1943,11 @@ async def execute_with_antigravity_cli(
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         classified = _classify_cli_failure(stderr, payload_for_classification)
+        usage, usage_available = (
+            _usage_info(payload_for_classification)
+            if payload_for_classification is not None
+            else ({}, False)
+        )
         error_type = classified or "cli_error"
         message = (
             _CLI_FAILURE_MESSAGES[classified]
@@ -1932,6 +1959,7 @@ async def execute_with_antigravity_cli(
             "ERROR", message, thinking_level, mode,
             error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
+            usage=usage, usage_available=usage_available,
             postflight=postflight,
         )
     try:
@@ -1952,6 +1980,7 @@ async def execute_with_antigravity_cli(
             postflight=postflight,
         )
     if payload.get("status") != "SUCCESS":
+        usage, usage_available = _usage_info(payload)
         classified = _classify_cli_failure(stderr, payload)
         error_type = classified or "cli_error"
         message = (
@@ -1964,11 +1993,13 @@ async def execute_with_antigravity_cli(
             "ERROR", message, thinking_level, mode,
             error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
+            usage=usage, usage_available=usage_available,
             postflight=postflight,
         )
     return _success_result(
         payload, thinking_level, mode, run_info=run,
         cli_version=cli_version, exit_code=_safe_exit_code(returncode),
+        expected_marker=expected_marker,
     ) | {
         "preexisting_dirty": postflight.preexisting_dirty,
         "worktree_changed": postflight.worktree_changed,
@@ -1999,6 +2030,7 @@ async def _run_managed_agent(agent_id: str, prepared: PreparedExecution) -> None
                 mode=prepared.mode,
                 acknowledge_review=prepared.acknowledge_review,
                 conversation_id=prepared.conversation_id,
+                expected_marker=prepared.expected_marker,
             )
         )
         while not execution.done():
@@ -2108,6 +2140,7 @@ async def antigravity_agent_spawn(
     thinking_level: Annotated[ThinkingLevel, SkipValidation] = "medium",
     mode: Annotated[Mode, SkipValidation] = "plan",
     acknowledge_review: Annotated[bool, SkipValidation] = False,
+    expected_marker: Annotated[str | None, SkipValidation] = None,
 ) -> AgentOperationOutput:
     """Start a durable Antigravity task and immediately return its agent ID."""
     prepared, error = _prepare_execution(
@@ -2119,6 +2152,7 @@ async def antigravity_agent_spawn(
         mode=mode,
         acknowledge_review=acknowledge_review,
         conversation_id=None,
+        expected_marker=expected_marker,
         run_info=RunInfo(),
     )
     if prepared is None:
@@ -2263,6 +2297,7 @@ async def antigravity_agent_followup(
     thinking_level: Annotated[ThinkingLevel | None, SkipValidation] = None,
     mode: Annotated[Mode, SkipValidation] = "plan",
     acknowledge_review: Annotated[bool, SkipValidation] = False,
+    expected_marker: Annotated[str | None, SkipValidation] = None,
 ) -> AgentOperationOutput:
     """Continue a terminal agent's authenticated Antigravity conversation."""
     parent, error = _scoped_agent(agent_id)
@@ -2285,6 +2320,7 @@ async def antigravity_agent_followup(
         mode=mode,
         acknowledge_review=acknowledge_review,
         conversation_id=parent.conversation_id,
+        expected_marker=expected_marker,
         run_info=RunInfo(),
     )
     if prepared is None:
@@ -2321,6 +2357,7 @@ async def antigravity_cli_execute(
     mode: Annotated[Mode, SkipValidation] = "plan",
     acknowledge_review: Annotated[bool, SkipValidation] = False,
     conversation_id: Annotated[str | None, SkipValidation] = None,
+    expected_marker: Annotated[str | None, SkipValidation] = None,
     ctx: Context | None = None,
 ) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
@@ -2334,6 +2371,7 @@ async def antigravity_cli_execute(
         mode=mode,
         acknowledge_review=acknowledge_review,
         conversation_id=conversation_id,
+        expected_marker=expected_marker,
         run_info=run,
     )
     if prepared is None:
@@ -2360,6 +2398,7 @@ async def antigravity_cli_execute(
         run_info=run,
         acknowledge_review=prepared.acknowledge_review,
         conversation_id=prepared.conversation_id,
+        expected_marker=prepared.expected_marker,
     )
     return _tool_result(result)
 

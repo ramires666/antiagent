@@ -209,9 +209,11 @@ profile, non-writable state, denied network, OAuth timeout — возвраща�
       пустой `SUCCESS` и не считает `metadata_complete` доказательством ответа.
 - [ ] Добавить лимиты `max_files`, `max_context_bytes`, `max_input_tokens`,
       `max_tool_calls`.
-- [ ] Публиковать usage даже для `no_content` и failed runs.
-- [ ] Разрешить expected marker или JSON Schema для проверяемых задач.
-- [ ] Не принимать `metadata_complete=true` как доказательство полезного ответа.
+- [x] Публиковать allowlisted usage для `no_content` и structured failed runs.
+- [x] Разрешить optional `expected_marker` для проверяемых задач; отсутствие
+      marker даёт `verification_failed` без echo самого marker.
+- [x] Не принимать `metadata_complete=true` как доказательство полезного ответа:
+      content и marker проверяются отдельно.
 - [ ] Отдельно учитывать cache-read и tool-generated context.
 
 Критерий приёмки: пустой ответ и выход за budget завершаются typed error до
