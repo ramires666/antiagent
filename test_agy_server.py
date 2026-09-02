@@ -27,6 +27,7 @@ OUTPUT_FIELDS = {
     "conversation_id_available",
     "preexisting_dirty", "worktree_changed", "changed_paths",
     "postflight_complete", "requires_review",
+    "payload_mode", "file_scope_enforced", "shell_denied",
 }
 DOCTOR_FIELDS = {
     "checks_passed", "cli_available", "cli_version",
@@ -435,6 +436,22 @@ class AgyServerTest(unittest.TestCase):
                 ))
             self.assertEqual(result_data(result)["error_type"], "invalid_request")
             preflight.assert_not_called()
+
+    def test_scoped_payload_modes_fail_closed_before_git_or_cli(self):
+        for payload_mode in ("prompt_only", "scoped_files"):
+            with self.subTest(payload_mode=payload_mode), patch(
+                "agy_server._git_preflight"
+            ) as preflight, patch("agy_server._resolve_cli") as resolve_cli:
+                result = asyncio.run(server.antigravity_cli_execute(
+                    "x", payload_mode=payload_mode
+                ))
+            data = result_data(result)
+            self.assertEqual(data["error_type"], "scope_enforcement_unavailable")
+            self.assertEqual(data["payload_mode"], payload_mode)
+            self.assertFalse(data["file_scope_enforced"])
+            self.assertFalse(data["shell_denied"])
+            preflight.assert_not_called()
+            resolve_cli.assert_not_called()
 
     def test_cli_version_probe_declares_strict_output_bounds(self):
         completed = server.BoundedProbeResult(0, b"1.1.22\n", b"")

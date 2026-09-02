@@ -194,6 +194,9 @@ profile, non-writable state, denied network, OAuth timeout — возвраща�
 
 ### Этап E — payload manifest и узкие permissions (P1)
 
+- [x] E0: legacy execution явно называется `payload_mode=workspace` и сообщает
+      `file_scope_enforced=false`, `shell_denied=false`; `prompt_only` и
+      `scoped_files` fail-closed до Git/CLI как `scope_enforcement_unavailable`.
 - [ ] Разделить `prompt_only` и `scoped_files`.
 - [ ] Добавить dry-run manifest: relative path, bytes, hash, destination.
 - [ ] Требовать отдельное approval для приватного external payload.
@@ -204,6 +207,10 @@ profile, non-writable state, denied network, OAuth timeout — возвраща�
 
 Критерий приёмки: задача с одним разрешённым файлом не может читать соседний
 файл или запускать shell; approval manifest совпадает с фактическим payload.
+
+Strict Stage E заблокирован upstream CLI `1.1.24`: в публичном command surface
+нет file allowlist и принудительного deny-shell. До появления обоих enforcement
+primitives scoped execution не запускается и не выдаётся за изолированное.
 
 ### Этап F — budget и строгий success contract (P1)
 

@@ -57,6 +57,12 @@ Allow rules минимальны: чтение workspace, необходимые
 
 Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`.
 
+Legacy execution имеет `payload_mode=workspace` и возвращает
+`file_scope_enforced=false`, `shell_denied=false`. CLI `1.1.24` не имеет
+официальных file allowlist/mandatory deny-shell primitives, поэтому запросы
+`prompt_only` и `scoped_files` fail-closed как
+`scope_enforcement_unavailable` до Git preflight и subprocess.
+
 `antigravity_doctor` выполняет только локальный preflight: bounded
 `agy --version`, boundary declaration, пробную запись wrapper state и Git
 preflight. В Antigravity CLI `1.1.23` нет официальных `auth`/`doctor`

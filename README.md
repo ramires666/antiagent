@@ -114,6 +114,11 @@ wrapper возвращает typed `verification_failed`; значение marke
 логах не повторяется. Structured failed runs сохраняют только allowlisted
 счётчики usage.
 
+Текущий CLI `1.1.24` не предоставляет строгий file allowlist/deny-shell.
+Обычный запуск явно имеет `payload_mode=workspace`; запросы `prompt_only` и
+`scoped_files` завершаются до CLI кодом `scope_enforcement_unavailable`.
+Результат всегда сообщает `file_scope_enforced` и `shell_denied`.
+
 ## 6. Проверка проекта
 
 ```powershell

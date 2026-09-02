@@ -58,6 +58,7 @@ EXECUTION_BOUNDARY_ENV = "ANTIAGENT_EXECUTION_BOUNDARY"
 
 ThinkingLevel = Literal["low", "medium", "high"]
 Mode = Literal["plan", "accept-edits"]
+PayloadMode = Literal["workspace", "prompt_only", "scoped_files"]
 THINKING_LEVELS = ("low", "medium", "high")
 MODES = ("plan", "accept-edits")
 DEFAULT_TIMEOUT_SECONDS = 840
@@ -125,6 +126,7 @@ ErrorType = Literal[
     "policy_denied",
     "no_content",
     "verification_failed",
+    "scope_enforcement_unavailable",
     "review_required",
     "review_state_unavailable",
 ]
@@ -158,6 +160,7 @@ AgentManagerErrorType = Literal[
     "policy_denied",
     "no_content",
     "verification_failed",
+    "scope_enforcement_unavailable",
     "review_required",
     "review_state_unavailable",
     "agent_not_found",
@@ -460,6 +463,9 @@ class AntigravityCliOutput(BaseModel):
     changed_paths: list[str]
     postflight_complete: bool
     requires_review: bool
+    payload_mode: PayloadMode
+    file_scope_enforced: bool
+    shell_denied: bool
 
 
 class AntigravityDoctorOutput(BaseModel):
@@ -522,6 +528,7 @@ class PreparedExecution:
     acknowledge_review: bool
     conversation_id: str | None
     expected_marker: str | None
+    payload_mode: PayloadMode
 
 
 def _timeout_seconds() -> int:
@@ -582,6 +589,7 @@ def _empty_result(
     usage_available: bool = False,
     conversation_id_available: bool = False,
     postflight: PostflightInfo | None = None,
+    payload_mode: PayloadMode = "workspace",
 ) -> dict[str, Any]:
     run = run_info or RunInfo()
     run.finish()
@@ -622,6 +630,9 @@ def _empty_result(
         "changed_paths": postflight.changed_paths,
         "postflight_complete": postflight.postflight_complete,
         "requires_review": postflight.requires_review,
+        "payload_mode": payload_mode,
+        "file_scope_enforced": False,
+        "shell_denied": False,
     }
 
 
@@ -1508,6 +1519,7 @@ def _prepare_execution(
     acknowledge_review: object,
     conversation_id: object,
     expected_marker: object,
+    payload_mode: object,
     run_info: RunInfo,
 ) -> tuple[PreparedExecution | None, dict[str, Any] | None]:
     def invalid(
@@ -1534,6 +1546,15 @@ def _prepare_execution(
     if mode not in MODES:
         return invalid(
             "mode must be plan or accept-edits", cast(str, thinking_level), None,
+        )
+    if payload_mode not in ("workspace", "prompt_only", "scoped_files"):
+        return invalid("payload_mode must be workspace, prompt_only, or scoped_files")
+    if payload_mode != "workspace":
+        return None, _empty_result(
+            "ERROR", "Requested payload scope cannot be enforced by this CLI",
+            cast(str, thinking_level), cast(str, mode),
+            error_type="scope_enforcement_unavailable", run_info=run_info,
+            payload_mode=cast(PayloadMode, payload_mode),
         )
     if not isinstance(acknowledge_review, bool):
         return invalid("acknowledge_review must be a boolean")
@@ -1575,6 +1596,7 @@ def _prepare_execution(
         acknowledge_review=acknowledge_review,
         conversation_id=normalized_conversation_id,
         expected_marker=cast(str | None, expected_marker),
+        payload_mode=cast(PayloadMode, payload_mode),
     ), None
 
 
@@ -2148,6 +2170,7 @@ async def antigravity_agent_spawn(
     mode: Annotated[Mode, SkipValidation] = "plan",
     acknowledge_review: Annotated[bool, SkipValidation] = False,
     expected_marker: Annotated[str | None, SkipValidation] = None,
+    payload_mode: Annotated[PayloadMode, SkipValidation] = "workspace",
 ) -> AgentOperationOutput:
     """Start a durable Antigravity task and immediately return its agent ID."""
     prepared, error = _prepare_execution(
@@ -2160,6 +2183,7 @@ async def antigravity_agent_spawn(
         acknowledge_review=acknowledge_review,
         conversation_id=None,
         expected_marker=expected_marker,
+        payload_mode=payload_mode,
         run_info=RunInfo(),
     )
     if prepared is None:
@@ -2305,6 +2329,7 @@ async def antigravity_agent_followup(
     mode: Annotated[Mode, SkipValidation] = "plan",
     acknowledge_review: Annotated[bool, SkipValidation] = False,
     expected_marker: Annotated[str | None, SkipValidation] = None,
+    payload_mode: Annotated[PayloadMode, SkipValidation] = "workspace",
 ) -> AgentOperationOutput:
     """Continue a terminal agent's authenticated Antigravity conversation."""
     parent, error = _scoped_agent(agent_id)
@@ -2328,6 +2353,7 @@ async def antigravity_agent_followup(
         acknowledge_review=acknowledge_review,
         conversation_id=parent.conversation_id,
         expected_marker=expected_marker,
+        payload_mode=payload_mode,
         run_info=RunInfo(),
     )
     if prepared is None:
@@ -2365,6 +2391,7 @@ async def antigravity_cli_execute(
     acknowledge_review: Annotated[bool, SkipValidation] = False,
     conversation_id: Annotated[str | None, SkipValidation] = None,
     expected_marker: Annotated[str | None, SkipValidation] = None,
+    payload_mode: Annotated[PayloadMode, SkipValidation] = "workspace",
     ctx: Context | None = None,
 ) -> AntigravityCliOutput:
     """Execute one coding task through the locally authenticated agy CLI."""
@@ -2379,6 +2406,7 @@ async def antigravity_cli_execute(
         acknowledge_review=acknowledge_review,
         conversation_id=conversation_id,
         expected_marker=expected_marker,
+        payload_mode=payload_mode,
         run_info=run,
     )
     if prepared is None:
