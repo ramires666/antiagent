@@ -18,31 +18,34 @@ class PackagingTest(unittest.TestCase):
             "agy_server:main",
         )
         self.assertEqual(
+            project["project"]["scripts"]["antiagent-codex-install"],
+            "antiagent_setup:main",
+        )
+        self.assertEqual(
             set(project["tool"]["setuptools"]["py-modules"]),
-            {"agy_server", "agent_manager"},
+            {"agy_server", "agent_manager", "antiagent_setup"},
         )
         self.assertIn("mcp[cli]==2.0.0", project["project"]["dependencies"])
 
-    def test_distributed_mcp_configs_have_no_machine_paths_or_fixed_cwd(self):
-        for relative_path in (
-            Path(".codex/config.toml"),
-            Path("codex-host-mcp.example.toml"),
-        ):
-            with self.subTest(path=str(relative_path)):
-                raw = (ROOT / relative_path).read_text(encoding="utf-8")
-                with (ROOT / relative_path).open("rb") as stream:
-                    config = tomllib.load(stream)
-                executor = config["mcp_servers"]["antigravity_cli_executor"]
-                expected = (
-                    "antiagent-mcp"
-                    if relative_path == Path(".codex/config.toml")
-                    else "<ABSOLUTE-PIPX-SHIM-PATH>"
-                )
-                self.assertEqual(executor["command"], expected)
-                self.assertNotIn("args", executor)
-                self.assertNotIn("cwd", executor)
-                self.assertNotRegex(raw, r"(?i)\b[a-z]:[\\/]")
-                self.assertNotIn("ANTIAGENT_STATE_DIR", executor.get("env", {}))
+    def test_project_config_does_not_override_user_launcher(self):
+        raw = (ROOT / ".codex/config.toml").read_text(encoding="utf-8")
+        with (ROOT / ".codex/config.toml").open("rb") as stream:
+            config = tomllib.load(stream)
+        self.assertNotIn("mcp_servers", config)
+        self.assertNotIn("command", config)
+        self.assertNotRegex(raw, r"(?i)\b[a-z]:[\\/]")
+
+    def test_host_config_template_has_no_machine_paths_or_fixed_cwd(self):
+        relative_path = Path("codex-host-mcp.example.toml")
+        raw = (ROOT / relative_path).read_text(encoding="utf-8")
+        with (ROOT / relative_path).open("rb") as stream:
+            config = tomllib.load(stream)
+        executor = config["mcp_servers"]["antigravity_cli_executor"]
+        self.assertEqual(executor["command"], "<ABSOLUTE-PIPX-SHIM-PATH>")
+        self.assertNotIn("args", executor)
+        self.assertNotIn("cwd", executor)
+        self.assertNotRegex(raw, r"(?i)\b[a-z]:[\\/]")
+        self.assertNotIn("ANTIAGENT_STATE_DIR", executor.get("env", {}))
 
     def test_user_level_registration_uses_resolved_absolute_launcher(self):
         for relative_path in (
@@ -52,7 +55,7 @@ class PackagingTest(unittest.TestCase):
         ):
             with self.subTest(path=str(relative_path)):
                 raw = (ROOT / relative_path).read_text(encoding="utf-8")
-                self.assertIn("Get-Command antiagent-mcp -CommandType Application", raw)
+                self.assertIn("python.exe -m antiagent_setup", raw)
                 self.assertNotIn(" -- antiagent-mcp\n", raw)
 
 

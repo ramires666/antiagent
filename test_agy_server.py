@@ -127,30 +127,11 @@ class AgyServerTest(unittest.TestCase):
         run.assert_called_once_with(transport="stdio")
         self.assertEqual(calls, ["check", "run"])
 
-    def test_project_config_declares_local_host_boundary(self):
+    def test_project_config_does_not_override_user_registration(self):
         config_path = Path(__file__).resolve().parent / ".codex" / "config.toml"
         with config_path.open("rb") as stream:
             config = tomllib.load(stream)
-        executor = config["mcp_servers"]["antigravity_cli_executor"]
-        self.assertEqual(executor["command"], "antiagent-mcp")
-        self.assertNotIn("args", executor)
-        self.assertNotIn("cwd", executor)
-        self.assertEqual(executor["experimental_environment"], "local")
-        self.assertEqual(executor["env"], {server.EXECUTION_BOUNDARY_ENV: "host"})
-        self.assertEqual(executor["tool_timeout_sec"], 900)
-        self.assertEqual(
-            set(executor["enabled_tools"]),
-            {
-                "antigravity_agent_spawn",
-                "antigravity_agent_list",
-                "antigravity_agent_status",
-                "antigravity_agent_wait",
-                "antigravity_agent_followup",
-                "antigravity_agent_interrupt",
-                "antigravity_doctor",
-                "antigravity_cli_execute",
-            },
-        )
+        self.assertNotIn("mcp_servers", config)
 
     def test_doctor_reports_local_checks_without_claiming_oauth(self):
         with patch("agy_server._resolve_cli", return_value=Path("C:/agy.exe")), patch(

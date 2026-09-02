@@ -8,9 +8,9 @@
 
 - MCP server `agy_server.py`;
 - persistent manager с lifecycle tools;
+- переносимый установщик `antiagent-codex-install`;
 - custom Codex agent `.codex/agents/antigravity_worker.toml`;
-- repo-scoped skill `.agents/skills/antigravity-executor/SKILL.md`;
-- готовая MCP-конфигурация `.codex/config.toml`.
+- repo-scoped skill `.agents/skills/antigravity-executor/SKILL.md`.
 
 ## 1. Подготовьте Antigravity и Python
 
@@ -38,7 +38,7 @@ agy --version
 py -m pip install --user pipx
 py -m pipx ensurepath
 py -m pipx install .
-Get-Command antiagent-mcp
+.\.venv\Scripts\python.exe -m antiagent_setup --dry-run
 ```
 
 После изменения исходников обновляйте установленное приложение из текущего
@@ -46,20 +46,19 @@ checkout командой `py -m pipx install --force .`.
 
 ## 3. Подключите MCP к Codex один раз
 
-Зарегистрируйте абсолютный путь установленной команды в пользовательской
-конфигурации. Не задавайте `cwd`: MCP наследует Git-root текущей Codex-сессии.
-Абсолютный путь обязателен, иначе Windows может выбрать одноимённый executable
-из недоверенного текущего проекта:
+Запустите установщик: он находит pipx shim и Codex CLI независимо от буквы
+диска и имени пользователя, затем регистрирует абсолютный launcher в
+пользовательской конфигурации. `cwd` не задаётся: MCP наследует Git-root текущей
+Codex-сессии. Абсолютный путь обязателен, иначе Windows может не найти bare
+команду или выбрать одноимённый executable из недоверенного текущего проекта:
 
 ```powershell
-$AntiagentMcp = (Get-Command antiagent-mcp -CommandType Application -ErrorAction Stop).Source
-codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- $AntiagentMcp
-codex.cmd mcp get antigravity_cli_executor
+.\.venv\Scripts\python.exe -m antiagent_setup
 ```
 
-Файл `.codex/config.toml` содержит bare project-scoped вариант исключительно
-для доверенной разработки самого Antiagent. Не копируйте его как глобальную
-регистрацию для запуска из произвольных репозиториев.
+Не добавляйте дублирующий `[mcp_servers.antigravity_cli_executor]` в проектный
+`.codex/config.toml`: project-scoped таблица перекрывает пользовательский
+абсолютный launcher и снова делает запуск зависимым от `PATH`.
 
 Запускайте Codex из Git-root целевого проекта и полностью перезапустите CLI,
 desktop app или IDE extension после изменения MCP-конфигурации.

@@ -90,9 +90,7 @@ Persistent manager добавляет шесть tools:
 py -m pip install --user pipx
 py -m pipx ensurepath
 py -m pipx install .
-$AntiagentMcp = (Get-Command antiagent-mcp -CommandType Application -ErrorAction Stop).Source
-codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- $AntiagentMcp
-codex.cmd mcp get antigravity_cli_executor
+.\.venv\Scripts\python.exe -m antiagent_setup
 ```
 
 После добавления перезапустите Codex CLI, IDE extension или desktop app. Они используют общую MCP-конфигурацию. Для локального STDIO server поле MCP `Auth` может отображаться как `Unsupported`: OAuth выполняет вложенный `agy` через Windows Credential Manager, а не MCP-транспорт.
@@ -122,7 +120,7 @@ enabled_tools = [
 ANTIAGENT_EXECUTION_BOUNDARY = 'host'
 ```
 
-В этом checkout готовый project-scoped шаблон находится в `.codex/config.toml`, а custom Codex-agent — в `.codex/agents/antigravity_worker.toml`. `experimental_environment='local'` исключает remote executor placement, но само по себе не доказывает доступ к Windows keyring. Boundary подтверждается только read-only live smoke после полного restart; подробности — в `HOST_SIDE_DEPLOYMENT.md`. Agent использует `gpt-5.6-luna` только как дешёвый proxy внутри native Codex thread, имеет `sandbox_mode=read-only` и MCP allowlist из восьми tools; фактическую coding-задачу выполняет Gemini/Antigravity. Для другого проекта копируются только нужные worker/skill-файлы; глобальную MCP-регистрацию и пути менять не нужно. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому `tool_timeout_sec` Codex должен быть 900 секунд.
+Project-scoped MCP-таблицу намеренно не храните в `.codex/config.toml`: она перекрывает пользовательский абсолютный launcher и при отсутствии pipx shim в `PATH` ломает старт с `program not found`. Custom Codex-agent находится в `.codex/agents/antigravity_worker.toml`. Local placement само по себе не доказывает доступ к Windows keyring. Boundary подтверждается только read-only live smoke после полного restart; подробности — в `HOST_SIDE_DEPLOYMENT.md`. Agent использует `gpt-5.6-luna` только как дешёвый proxy внутри native Codex thread, имеет `sandbox_mode=read-only` и MCP allowlist из восьми tools; фактическую coding-задачу выполняет Gemini/Antigravity. Для другого проекта копируются только нужные worker/skill-файлы; глобальную MCP-регистрацию и пути менять не нужно. Не коммитьте keyring exports, токены, `.env` или временные sandbox artifacts. Wrapper timeout — 840 секунд, поэтому user-level `tool_timeout_sec` при ручной настройке Codex должен быть 900 секунд.
 
 Custom agents загружаются при старте Codex. После добавления или изменения TOML полностью перезапустите CLI/app/IDE session. Fine-grained запрета shell отдельным полем custom-agent schema нет: здесь применяются read-only sandbox, MCP allowlist и developer instructions. Родительский Codex остаётся владельцем lifecycle/UI, разрешений, diff review и тестов.
 

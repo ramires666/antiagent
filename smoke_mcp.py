@@ -9,6 +9,8 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from antiagent_setup import resolve_mcp_launcher
+
 
 EXPECTED_TOOLS = {
     "antigravity_agent_spawn",
@@ -22,11 +24,11 @@ EXPECTED_TOOLS = {
 }
 
 
-async def probe(workspace: Path) -> dict[str, object]:
+async def probe(workspace: Path, launcher: Path) -> dict[str, object]:
     environment = dict(os.environ)
     environment["ANTIAGENT_EXECUTION_BOUNDARY"] = "host"
     parameters = StdioServerParameters(
-        command="antiagent-mcp",
+        command=str(launcher),
         cwd=str(workspace),
         env=environment,
     )
@@ -56,8 +58,14 @@ def main() -> None:
         default=".",
         help="Exact Git-root to use as the inherited MCP working directory.",
     )
-    workspace = Path(parser.parse_args().workspace).resolve()
-    print(json.dumps(asyncio.run(probe(workspace)), ensure_ascii=False, indent=2))
+    parser.add_argument(
+        "--launcher",
+        help="Optional absolute antiagent-mcp path; otherwise resolve the pipx launcher.",
+    )
+    args = parser.parse_args()
+    workspace = Path(args.workspace).resolve()
+    launcher = resolve_mcp_launcher(args.launcher)
+    print(json.dumps(asyncio.run(probe(workspace, launcher)), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

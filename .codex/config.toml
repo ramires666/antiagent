@@ -1,20 +1,4 @@
-[mcp_servers.antigravity_cli_executor]
-command = 'antiagent-mcp'
-experimental_environment = 'local'
-enabled = true
-required = true
-startup_timeout_sec = 30
-tool_timeout_sec = 900
-enabled_tools = [
-  'antigravity_agent_spawn',
-  'antigravity_agent_list',
-  'antigravity_agent_status',
-  'antigravity_agent_wait',
-  'antigravity_agent_followup',
-  'antigravity_agent_interrupt',
-  'antigravity_doctor',
-  'antigravity_cli_execute',
-]
-
-[mcp_servers.antigravity_cli_executor.env]
-ANTIAGENT_EXECUTION_BOUNDARY = 'host'
+# MCP is registered once at user level by `antiagent-codex-install`.
+# A project-level command would override that absolute launcher path and make
+# startup depend on the parent process PATH, so this trusted checkout keeps no
+# duplicate server registration.

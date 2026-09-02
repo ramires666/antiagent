@@ -73,18 +73,20 @@ marker `ANTIAGENT_POST_RESTART_OAUTH_OK_20260902`, CLI `1.1.24`, run
    py -m pip install --user pipx
    py -m pipx ensurepath
    py -m pipx install .
-   Get-Command antiagent-mcp -ErrorAction Stop
+   .\.venv\Scripts\python.exe -m antiagent_setup --dry-run
    ```
 
-3. Зарегистрируйте одну пользовательскую MCP-команду без `cwd`:
+3. Зарегистрируйте одну пользовательскую MCP-команду без `cwd`. Установщик
+   сам находит абсолютные пути pipx shim и Codex CLI:
 
    ```powershell
-   $AntiagentMcp = (Get-Command antiagent-mcp -CommandType Application -ErrorAction Stop).Source
-   codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- $AntiagentMcp
+   .\.venv\Scripts\python.exe -m antiagent_setup
    ```
 
-4. Не держите конкурирующие регистрации одного MCP. Project-scoped шаблон
-   нужен только для разработки самого Antiagent.
+4. Не держите конкурирующие регистрации одного MCP. В частности, удалите
+   project-scoped таблицу `[mcp_servers.antigravity_cli_executor]`: она имеет
+   приоритет над пользовательским абсолютным launcher и может вернуть ошибку
+   `program not found`.
 5. Полностью перезапустите Codex. State root и MCP environment фиксируются при
    старте процесса.
 6. Проверьте регистрацию через `codex mcp get antigravity_cli_executor`.
