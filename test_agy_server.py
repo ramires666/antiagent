@@ -418,7 +418,7 @@ class AgyServerTest(unittest.TestCase):
             self.assertEqual(result_data(result)["error_type"], "invalid_request")
             preflight.assert_not_called()
 
-    def test_scoped_payload_modes_fail_closed_before_git_or_cli(self):
+    def test_unsupported_payload_modes_are_invalid_before_git_or_cli(self):
         for payload_mode in ("prompt_only", "scoped_files"):
             with self.subTest(payload_mode=payload_mode), patch(
                 "agy_server._git_preflight"
@@ -427,8 +427,8 @@ class AgyServerTest(unittest.TestCase):
                     "x", payload_mode=payload_mode
                 ))
             data = result_data(result)
-            self.assertEqual(data["error_type"], "scope_enforcement_unavailable")
-            self.assertEqual(data["payload_mode"], payload_mode)
+            self.assertEqual(data["error_type"], "invalid_request")
+            self.assertEqual(data["payload_mode"], "workspace")
             self.assertFalse(data["file_scope_enforced"])
             self.assertFalse(data["shell_denied"])
             preflight.assert_not_called()
@@ -1125,7 +1125,7 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(result, (None, "", False))
         create.assert_not_awaited()
 
-    def test_argv_has_sandbox_no_shell_and_low_medium_high(self):
+    def test_argv_has_sandbox_and_low_medium_high(self):
         for level in ("low", "medium", "high"):
             result, argv = self._execute(level=level)
             self.assertEqual(result["status"], "SUCCESS")
@@ -1133,7 +1133,6 @@ class AgyServerTest(unittest.TestCase):
             self.assertIn("--sandbox", argv)
             self.assertIn("--disable-slash-commands", argv)
             self.assertNotIn("--dangerously-skip-permissions", argv)
-            self.assertNotIn("--shell", argv)
 
     def test_dangerous_flag_is_absent_in_both_modes(self):
         _, plan_argv = self._execute(mode="plan")

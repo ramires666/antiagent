@@ -98,6 +98,23 @@ marker `ANTIAGENT_POST_RESTART_OAUTH_OK_20260902`, CLI `1.1.24`, run
 9. Убедитесь, что marker непустой, Git не изменился и browser/re-auth не
    запускался. Только после этого boundary считается операционно подтверждённой.
 
+## Безопасное обновление на Windows
+
+Полностью закройте Codex CLI, desktop app и IDE. Из Git-root Antiagent
+выполните:
+
+```powershell
+py -m antiagent_upgrade
+```
+
+Модуль запускается из source checkout, через Toolhelp API проверяет отсутствие
+активного `antiagent-mcp.exe` и fail-closed завершается до `pipx`, если процесс
+найден или проверка недоступна. Он не завершает процессы автоматически. После
+успешного `pipx` upgrade модуль обновляет пользовательскую MCP-регистрацию.
+Запустите новый верхнеуровневый процесс Codex, затем выполните
+`antigravity_doctor` и live read-only smoke. `codex mcp get` подтверждает
+сохранённую конфигурацию, но не snapshot уже работающей сессии, OAuth или сеть.
+
 ## Что запрещено
 
 - копировать `.gemini`, cookie, OAuth token или keyring между пользователями;

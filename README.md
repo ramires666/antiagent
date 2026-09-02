@@ -41,8 +41,20 @@ py -m pipx install .
 .\.venv\Scripts\python.exe -m antiagent_setup --dry-run
 ```
 
-После изменения исходников обновляйте установленное приложение из текущего
-checkout командой `py -m pipx install --force .`.
+После изменения исходников полностью закройте Codex CLI, desktop app и IDE,
+затем обновляйте установленное приложение из текущего checkout безопасной
+командой:
+
+```powershell
+py -m antiagent_upgrade
+```
+
+Команда сначала через Windows Toolhelp API доказывает, что
+`antiagent-mcp.exe` не запущен, и только затем вызывает `pipx`. Если проверка
+процессов невозможна или найден активный MCP, обновление завершается до любых
+изменений. Процессы автоматически не завершаются. После успешного обновления
+команда заново регистрирует абсолютный launcher; Codex нужно полностью
+перезапустить и проверить через `antigravity_doctor` и live read-only smoke.
 
 ## 3. Подключите MCP к Codex один раз
 
@@ -114,9 +126,12 @@ wrapper возвращает typed `verification_failed`; значение marke
 счётчики usage.
 
 Текущий CLI `1.1.24` не предоставляет строгий file allowlist/deny-shell.
-Обычный запуск явно имеет `payload_mode=workspace`; запросы `prompt_only` и
-`scoped_files` завершаются до CLI кодом `scope_enforcement_unavailable`.
-Результат всегда сообщает `file_scope_enforced` и `shell_denied`.
+Поэтому публичная MCP-схема допускает только `payload_mode=workspace`, а
+результат честно сообщает `file_scope_enforced=false` и `shell_denied=false`.
+Передавайте минимальный контекст и относительные `@file`-ссылки; это уменьшает
+число tool-запросов, но не является технической границей доступа. При
+`permission_denied` не включайте `--dangerously-skip-permissions`: используйте
+узкий интерактивный запуск либо native fallback.
 
 ## 6. Проверка проекта
 

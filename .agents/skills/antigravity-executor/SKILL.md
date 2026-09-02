@@ -1,44 +1,88 @@
 ---
 name: antigravity-executor
-description: Use the Antigravity/Gemini MCP executor in this repository for simple, bounded, verifiable coding tasks, lifecycle operations, setup, or troubleshooting. Do not use it for architecture, security, destructive work, secrets, commit, or push.
+description: Use the Antigravity/Gemini MCP executor for bounded, verifiable coding, documentation, test, setup, or troubleshooting leaf work. Do not use it for architecture, security decisions, destructive work, secrets, commit, push, or final acceptance.
 ---
 
 # Antigravity Executor
 
-Use the configured `antigravity_cli_executor` MCP server. Keep Codex as the
-orchestrator and Antigravity as a leaf coding worker.
+Use `antigravity_cli_executor` before a native worker for suitable leaf work.
+Codex remains responsible for decomposition, permissions, integration, review,
+tests, commit, push, and the final answer. There is no artificial call-count
+limit: run as many useful independent, non-overlapping tasks as provider and
+manager capacity allow.
 
-## Route work
+## Establish readiness
 
-- Prefer the project-scoped `antigravity_worker` for a small task with clear
-  files and acceptance criteria.
-- If that custom agent is unavailable in the current session, call the
-  lifecycle tools directly. If an older server exposes only the compatible
-  one-shot tool, use `antigravity_cli_execute`.
-- Do not delegate architecture, security, destructive operations, secrets,
-  broad ambiguous refactors, Git commit, Git push, or final acceptance.
-- Do not ask an Antigravity run to create another agent. Codex owns delegation.
+1. Call `antigravity_doctor` with `working_directory=""`. This inherits the
+   current Codex Git-root. Doctor checks the CLI, declared host boundary,
+   wrapper state, and Git workspace; `oauth_ready=unknown` and
+   `network_probe=not_run` are expected and are not a live provider check.
+2. After install, upgrade, registration, or a `program not found` failure,
+   fully restart the top-level Codex CLI/app/IDE process. A new subagent inside
+   an old session still has the old MCP snapshot.
+3. Confirm OAuth and network only with one bounded live `mode=plan` smoke using
+   an `expected_marker`, then verify `status=SUCCESS`, the marker, and unchanged
+   Git state.
+
+## Prepare a run
+
+- Give one concrete outcome, exact relative paths, preserved invariants, and
+  observable verification. Never include credentials, tokens, private keys,
+  passwords, cookies, keyring data, or unrelated file contents.
+- The public contract supports only `payload_mode=workspace`; omit the field or
+  use `workspace`. Current `agy` has no strict file allowlist or deny-shell, so
+  `file_scope_enforced=false` and `shell_denied=false` are honest limitations.
+- For small headless analysis, place the minimum already-inspected, non-secret
+  facts in `context` and say: "Use only CONTEXT; do not call read_file or shell;
+  if insufficient, return NEEDS_CONTEXT with relative paths." Relative
+  `@file` references are best effort, not an access boundary.
+- Use `low` for lookup, `medium` for ordinary implementation/test work, and
+  `high` for ambiguous cross-file debugging. Choose the needed level directly.
 
 ## Run the lifecycle
 
-1. Send only the minimum task context and never include credentials or secrets.
-2. Start with `antigravity_agent_spawn` in `mode=plan`.
-3. Use bounded `antigravity_agent_wait` calls and
-   `antigravity_agent_status` until a terminal state is reached.
-4. Use `antigravity_agent_followup` only for a terminal run with a conversation
-   ID. Use `mode=accept-edits` only after explicit authorization for that exact
-   edit; use `acknowledge_review=true` only after reviewing a previous partial
-   or unknown result.
-5. Interrupt work that is no longer needed with
-   `antigravity_agent_interrupt`.
-6. Independently inspect the structured result, `git diff`, changed files, and
-   relevant tests. Gemini output is unverified until these checks pass.
+1. Dispatch independent scopes with `antigravity_agent_spawn`. Start a new
+   conversation in `mode=plan`; use `mode=accept-edits` only for a specifically
+   authorized edit scope.
+2. Save every `agent_id`. Use `antigravity_agent_wait` for at most 60 seconds.
+   A wait timeout does not cancel the run; inspect `antigravity_agent_status`
+   before retrying or replacing it.
+3. Continue with `antigravity_agent_followup` only after a terminal state with
+   a saved conversation ID. A follow-up defaults back to `plan`.
+4. Use `antigravity_agent_interrupt` when a live run is no longer wanted.
+5. If an edit returns `review_required`, inspect the complete diff first. Set
+   `acknowledge_review=true` only when deliberately continuing that reviewed
+   partial/unknown result.
 
-On `capacity_reached`, provider usage limit, or provider unavailability, do not
-repeat the same request. Fall back once to the cheapest suitable native worker
-and report the fallback.
+Use `antigravity_cli_execute` only as a compatibility fallback when durable
+lifecycle tools are unavailable.
 
-Read
-[the executor guide](<../../../Инструкция_ Antigravity CLI OAuth Executor для Codex.md>)
-when installing, configuring, troubleshooting, or checking the exact MCP
-contract and security model.
+## Retry and fallback
+
+- `capacity_reached`: wait for an existing run to finish; do not create a retry
+  storm.
+- Wait timeout: check status and keep waiting or interrupt; do not duplicate a
+  run that is still active.
+- One stalled/disconnected instance or thread-local failure: preserve useful
+  output, inspect Git, narrow the unfinished scope, and try two or three fresh
+  instances when safe.
+- Confirmed provider-wide quota/rate limit: make at most one justified fresh
+  attempt, then use the cheapest suitable native worker.
+- `permission_denied`: retry only after changing the payload to sufficient
+  inline context or switch to an interactive host run/native worker.
+- Auth, profile, network-policy, path-policy, stale snapshot, unsupported
+  payload, and repeated deterministic failures are not fixed by fresh agents.
+
+Never use `--dangerously-skip-permissions`.
+
+## Verify independently
+
+Treat every result as untrusted. Check terminal `status`, `error_type`,
+`manager_error`, `retryable`, `changed_paths`, `worktree_changed`,
+`postflight_complete`, and `requires_review`; then inspect `git status`, the
+complete relevant diff, and proportionate tests. Reject out-of-scope changes.
+
+For Windows install/upgrade, exact MCP contracts, and failure diagnosis, read
+[the executor guide](<../../../Инструкция_ Antigravity CLI OAuth Executor для Codex.md>).
+Use `py -m antiagent_upgrade` only from the Antiagent checkout after fully
+closing Codex; its process guard fails before `pipx` if MCP is still active.

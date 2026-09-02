@@ -58,7 +58,7 @@ EXECUTION_BOUNDARY_ENV = "ANTIAGENT_EXECUTION_BOUNDARY"
 
 ThinkingLevel = Literal["low", "medium", "high"]
 Mode = Literal["plan", "accept-edits"]
-PayloadMode = Literal["workspace", "prompt_only", "scoped_files"]
+PayloadMode = Literal["workspace"]
 THINKING_LEVELS = ("low", "medium", "high")
 MODES = ("plan", "accept-edits")
 DEFAULT_TIMEOUT_SECONDS = 840
@@ -1547,15 +1547,8 @@ def _prepare_execution(
         return invalid(
             "mode must be plan or accept-edits", cast(str, thinking_level), None,
         )
-    if payload_mode not in ("workspace", "prompt_only", "scoped_files"):
-        return invalid("payload_mode must be workspace, prompt_only, or scoped_files")
     if payload_mode != "workspace":
-        return None, _empty_result(
-            "ERROR", "Requested payload scope cannot be enforced by this CLI",
-            cast(str, thinking_level), cast(str, mode),
-            error_type="scope_enforcement_unavailable", run_info=run_info,
-            payload_mode=cast(PayloadMode, payload_mode),
-        )
+        return invalid("payload_mode must be workspace")
     if not isinstance(acknowledge_review, bool):
         return invalid("acknowledge_review must be a boolean")
     if expected_marker is not None and (

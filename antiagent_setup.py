@@ -65,7 +65,8 @@ def resolve_mcp_launcher(
     if resolved is None:
         raise SetupError(
             "antiagent-mcp launcher not found. Install/update the package with "
-            "'py -m pipx install --force .' or pass --launcher <absolute-path>."
+            "'py -m antiagent_upgrade' from the Antiagent checkout or pass "
+            "--launcher <absolute-path>."
         )
     if not resolved.is_absolute():
         raise SetupError("Resolved antiagent-mcp launcher is not absolute")

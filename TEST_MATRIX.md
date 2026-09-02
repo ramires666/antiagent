@@ -6,8 +6,8 @@
 
 | Сценарий | Ожидаемый результат |
 |---|---|
-| STDIO initialize и `tools/list` | Согласованный MCP и семь documented tools |
-| Schema и valid call | `task` обязателен, defaults `thinking_level=medium`, `mode=plan`; structured output валиден |
+| STDIO initialize и `tools/list` | Согласованный MCP и восемь documented tools |
+| Schema и valid call | `task` обязателен, defaults `thinking_level=medium`, `mode=plan`, единственный `payload_mode=workspace`; structured output валиден |
 | Unknown/missing/wrong/invalid arguments | Без падения process, без запуска Git/CLI и без утечки входных данных |
 | Runtime error | MCP `isError=true`, structured metadata сохранена, stderr/secrets redacted |
 | Progress/cancellation/sequential call | `run_id` и state видимы, cleanup завершён, следующая операция работает |

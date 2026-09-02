@@ -53,19 +53,20 @@ Allow rules минимальны: чтение workspace, необходимые
 
 ## MCP-контракт
 
-Совместимый синхронный tool `antigravity_cli_execute` принимает `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`), `mode` (`plan|accept-edits`, default `plan`), `acknowledge_review` (boolean, default `false`), optional UUID `conversation_id` и optional `expected_marker` (непустая строка до 256 символов). Для каждого editing-вызова оператор должен явно выбрать `mode=accept-edits`. `acknowledge_review=true` нужен только после ручной проверки partial/unknown результата, когда wrapper вернул `review_required`. Если непустой успешный ответ не содержит marker, wrapper возвращает `verification_failed`, не повторяя marker в ошибке или логах. Structured failed/no-content результаты сохраняют только allowlisted usage counters.
+Совместимый синхронный tool `antigravity_cli_execute` принимает `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`), `mode` (`plan|accept-edits`, default `plan`), `acknowledge_review` (boolean, default `false`), optional UUID `conversation_id`, optional `expected_marker` (непустая строка до 256 символов) и единственный поддерживаемый `payload_mode=workspace`. Для каждого editing-вызова оператор должен явно выбрать `mode=accept-edits`. `acknowledge_review=true` нужен только после ручной проверки partial/unknown результата, когда wrapper вернул `review_required`. Если непустой успешный ответ не содержит marker, wrapper возвращает `verification_failed`, не повторяя marker в ошибке или логах. Structured failed/no-content результаты сохраняют только allowlisted usage counters.
 
-Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`.
+Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`, `payload_mode`, `file_scope_enforced`, `shell_denied`.
 
-Legacy execution имеет `payload_mode=workspace` и возвращает
+Execution имеет `payload_mode=workspace` и возвращает
 `file_scope_enforced=false`, `shell_denied=false`. CLI `1.1.24` не имеет
-официальных file allowlist/mandatory deny-shell primitives, поэтому запросы
-`prompt_only` и `scoped_files` fail-closed как
-`scope_enforcement_unavailable` до Git preflight и subprocess.
+официальных file allowlist/mandatory deny-shell primitives, поэтому
+неподдерживаемые `prompt_only` и `scoped_files` удалены из публичной MCP-схемы.
+Относительный `@file` и запрет shell в prompt уменьшают вероятность лишних
+tool-запросов, но не являются технической границей.
 
 `antigravity_doctor` выполняет только локальный preflight: bounded
 `agy --version`, boundary declaration, пробную запись wrapper state и Git
-preflight. В Antigravity CLI `1.1.23` нет официальных `auth`/`doctor`
+preflight. В проверенном Antigravity CLI `1.1.24` нет официальных `auth`/`doctor`
 subcommands, поэтому tool честно возвращает `auth_probe=unsupported`,
 `network_probe=not_run`, `oauth_ready=unknown`. Он не читает профиль/keyring и
 не может запустить browser OAuth.
@@ -92,6 +93,17 @@ py -m pipx ensurepath
 py -m pipx install .
 .\.venv\Scripts\python.exe -m antiagent_setup
 ```
+
+Для последующих обновлений сначала полностью закройте все Codex-клиенты, затем
+из этого source checkout используйте только fail-closed путь:
+
+```powershell
+py -m antiagent_upgrade
+```
+
+Он проверяет отсутствие активного `antiagent-mcp.exe` до запуска `pipx`, не
+завершает процессы автоматически, обновляет регистрацию только после успешной
+установки и требует полный restart плюс `doctor`/live smoke.
 
 После добавления перезапустите Codex CLI, IDE extension или desktop app. Они используют общую MCP-конфигурацию. Для локального STDIO server поле MCP `Auth` может отображаться как `Unsupported`: OAuth выполняет вложенный `agy` через Windows Credential Manager, а не MCP-транспорт.
 

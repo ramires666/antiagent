@@ -23,7 +23,7 @@ class PackagingTest(unittest.TestCase):
         )
         self.assertEqual(
             set(project["tool"]["setuptools"]["py-modules"]),
-            {"agy_server", "agent_manager", "antiagent_setup"},
+            {"agy_server", "agent_manager", "antiagent_setup", "antiagent_upgrade"},
         )
         self.assertIn("mcp[cli]==2.0.0", project["project"]["dependencies"])
 
@@ -57,6 +57,17 @@ class PackagingTest(unittest.TestCase):
                 raw = (ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertIn("python.exe -m antiagent_setup", raw)
                 self.assertNotIn(" -- antiagent-mcp\n", raw)
+
+    def test_docs_do_not_recommend_unsafe_raw_force_upgrade(self):
+        for relative_path in (
+            Path("README.md"),
+            Path("HOST_SIDE_DEPLOYMENT.md"),
+            Path("КАК_ПОЛЬЗОВАТЬСЯ.md"),
+            Path("Инструкция_ Antigravity CLI OAuth Executor для Codex.md"),
+        ):
+            with self.subTest(path=str(relative_path)):
+                raw = (ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertNotIn("pipx install --force", raw)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,8 @@ INPUT_FIELDS = {
     "working_directory",
     "acknowledge_review",
     "conversation_id",
+    "expected_marker",
+    "payload_mode",
 }
 OUTPUT_FIELDS = {
     "status",
@@ -76,6 +78,9 @@ OUTPUT_FIELDS = {
     "changed_paths",
     "postflight_complete",
     "requires_review",
+    "payload_mode",
+    "file_scope_enforced",
+    "shell_denied",
 }
 
 
@@ -166,6 +171,17 @@ class MCPProtocolTest(unittest.TestCase):
                         )
                         self.assertIsNone(
                             schema["properties"]["conversation_id"]["default"]
+                        )
+                        self.assertIsNone(
+                            schema["properties"]["expected_marker"]["default"]
+                        )
+                        self.assertEqual(
+                            schema["properties"]["payload_mode"]["enum"],
+                            ["workspace"],
+                        )
+                        self.assertEqual(
+                            schema["properties"]["payload_mode"]["default"],
+                            "workspace",
                         )
                         self.assertIsNotNone(tool.output_schema)
                         assert tool.output_schema is not None

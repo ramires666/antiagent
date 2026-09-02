@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "antiagent-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "Portable Antigravity CLI MCP executor for Codex"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,4 +15,4 @@ antiagent-mcp = "agy_server:main"
 antiagent-codex-install = "antiagent_setup:main"
 
 [tool.setuptools]
-py-modules = ["agy_server", "agent_manager", "antiagent_setup"]
+py-modules = ["agy_server", "agent_manager", "antiagent_setup", "antiagent_upgrade"]
