@@ -1098,7 +1098,9 @@ def _clear_review_marker(marker: Path) -> bool:
         return False
 
 
-def _cli_result_failed_for_review(cli_result: object) -> bool:
+def _cli_result_failed_for_review(
+    cli_result: object, expected_marker: str | None = None
+) -> bool:
     if isinstance(cli_result, CliRunResult):
         returncode, stdout, timed_out = (
             cli_result.returncode,
@@ -1118,10 +1120,13 @@ def _cli_result_failed_for_review(cli_result: object) -> bool:
         payload = json.loads(str(stdout).strip())
     except (TypeError, ValueError, json.JSONDecodeError):
         return True
+    if not isinstance(payload, dict) or payload.get("status") != "SUCCESS":
+        return True
+    response = payload.get("response", "")
     return not (
-        isinstance(payload, dict)
-        and payload.get("status") == "SUCCESS"
-        and isinstance(payload.get("response", ""), str)
+        isinstance(response, str)
+        and bool(response.strip())
+        and (expected_marker is None or expected_marker in response)
     )
 
 
@@ -1815,7 +1820,9 @@ async def execute_with_antigravity_cli(
                 if remaining <= 0:
                     raise WorkspaceLockTimeout
                 cli_result = await _run_cli(argv, workspace, remaining)
-                execution_failed = _cli_result_failed_for_review(cli_result)
+                execution_failed = _cli_result_failed_for_review(
+                    cli_result, expected_marker
+                )
             finally:
                 after = _git_status_snapshot(workspace) if mode == "accept-edits" else None
                 postflight = _postflight_info(

@@ -387,6 +387,21 @@ class AgyServerTest(unittest.TestCase):
         )
         self.assertEqual(accepted["status"], "SUCCESS")
 
+    def test_expected_marker_miss_is_failure_for_edit_review(self):
+        missing = server.CliRunResult(
+            0, json.dumps({"status": "SUCCESS", "response": "edited"}), False
+        )
+        present = server.CliRunResult(
+            0, json.dumps({"status": "SUCCESS", "response": "edited MARK"}), False
+        )
+        self.assertTrue(server._cli_result_failed_for_review(missing, "MARK"))
+        self.assertFalse(server._cli_result_failed_for_review(present, "MARK"))
+        self.assertTrue(server._cli_result_failed_for_review(
+            server.CliRunResult(
+                0, json.dumps({"status": "SUCCESS", "response": "   "}), False
+            )
+        ))
+
     def test_failed_structured_payload_preserves_allowlisted_usage(self):
         payload = json.dumps({
             "status": "ERROR",
