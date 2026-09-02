@@ -84,7 +84,8 @@ Persistent manager добавляет шесть tools:
 py -m pip install --user pipx
 py -m pipx ensurepath
 py -m pipx install .
-codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- antiagent-mcp
+$AntiagentMcp = (Get-Command antiagent-mcp -CommandType Application -ErrorAction Stop).Source
+codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- $AntiagentMcp
 codex.cmd mcp get antigravity_cli_executor
 ```
 
@@ -94,7 +95,7 @@ codex.cmd mcp get antigravity_cli_executor
 
 ```toml
 [mcp_servers.antigravity_cli_executor]
-command = 'antiagent-mcp'
+command = '<ABSOLUTE-PIPX-SHIM-PATH>'
 experimental_environment = 'local'
 enabled = true
 required = true

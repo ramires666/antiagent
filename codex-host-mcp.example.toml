@@ -1,6 +1,6 @@
 # Portable template used after installing the `antiagent-mcp` command in PATH.
 [mcp_servers.antigravity_cli_executor]
-command = 'antiagent-mcp'
+command = '<ABSOLUTE-PIPX-SHIM-PATH>'
 experimental_environment = "local"
 enabled = true
 required = true

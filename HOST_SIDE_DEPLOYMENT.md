@@ -36,16 +36,15 @@ stdio server в remote executor. Оно само по себе не доказы
 - [Codex configuration reference](https://developers.openai.com/codex/config-reference/)
 - [Codex MCP configuration](https://developers.openai.com/codex/mcp/)
 
-Используйте [codex-host-mcp.example.toml](codex-host-mcp.example.toml) как
-переносимый шаблон после установки команды `antiagent-mcp` через `pipx`. Он не
-содержит путь к checkout и намеренно не задаёт `cwd`: process наследует Git-root
-текущей Codex-сессии.
+Используйте [codex-host-mcp.example.toml](codex-host-mcp.example.toml) как inert
+шаблон после установки `antiagent-mcp` через `pipx`. Перед применением замените
+placeholder на абсолютный путь shim; `cwd` намеренно не задаётся.
 
 ## Обязательные свойства host process
 
 1. MCP process и ручной `agy` работают под одним Windows SID.
-2. Команда `antiagent-mcp` разрешается через пользовательский `PATH`, а MCP не
-   закреплён за диском, checkout или целевым проектом.
+2. User-level MCP запускается по заранее разрешённому абсолютному пути pipx
+   shim, а не через поиск bare-команды из текущего project cwd.
 3. Унаследованный process cwd является точным Git-root текущего проекта.
 4. State root по умолчанию в `%LOCALAPPDATA%\antiagent` доступен только этому
    пользователю и допускает создание
@@ -76,7 +75,8 @@ stdio server в remote executor. Оно само по себе не доказы
 3. Зарегистрируйте одну пользовательскую MCP-команду без `cwd`:
 
    ```powershell
-   codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- antiagent-mcp
+   $AntiagentMcp = (Get-Command antiagent-mcp -CommandType Application -ErrorAction Stop).Source
+   codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- $AntiagentMcp
    ```
 
 4. Не держите конкурирующие регистрации одного MCP. Project-scoped шаблон

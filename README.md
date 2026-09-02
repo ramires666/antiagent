@@ -46,17 +46,20 @@ checkout командой `py -m pipx install --force .`.
 
 ## 3. Подключите MCP к Codex один раз
 
-Зарегистрируйте установленную команду в пользовательской конфигурации. Не
-задавайте `cwd`: MCP наследует Git-root текущей Codex-сессии, поэтому одна
-регистрация безопасно работает с разными проектами:
+Зарегистрируйте абсолютный путь установленной команды в пользовательской
+конфигурации. Не задавайте `cwd`: MCP наследует Git-root текущей Codex-сессии.
+Абсолютный путь обязателен, иначе Windows может выбрать одноимённый executable
+из недоверенного текущего проекта:
 
 ```powershell
-codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- antiagent-mcp
+$AntiagentMcp = (Get-Command antiagent-mcp -CommandType Application -ErrorAction Stop).Source
+codex.cmd mcp add antigravity_cli_executor --env ANTIAGENT_EXECUTION_BOUNDARY=host -- $AntiagentMcp
 codex.cmd mcp get antigravity_cli_executor
 ```
 
-Файл `.codex/config.toml` содержит тот же переносимый project-scoped вариант
-для разработки самого Antiagent. В нём также нет абсолютного пути и `cwd`.
+Файл `.codex/config.toml` содержит bare project-scoped вариант исключительно
+для доверенной разработки самого Antiagent. Не копируйте его как глобальную
+регистрацию для запуска из произвольных репозиториев.
 
 Запускайте Codex из Git-root целевого проекта и полностью перезапустите CLI,
 desktop app или IDE extension после изменения MCP-конфигурации.
