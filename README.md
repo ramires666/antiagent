@@ -4,6 +4,10 @@
 локальный stdio MCP process. Codex управляет задачей, разрешениями, review и
 тестами, а Gemini/Antigravity выполняет небольшую leaf coding-задачу.
 
+Исторические воспроизводимые сигнатуры отказов CLI, sandbox, OAuth и headless
+permissions собраны в
+[`UPSTREAM_AGY_FAILURE_REPORT_2026-09-01.md`](UPSTREAM_AGY_FAILURE_REPORT_2026-09-01.md).
+
 В репозитории уже находятся:
 
 - MCP server `agy_server.py`;
