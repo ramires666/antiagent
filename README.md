@@ -60,6 +60,8 @@ py -m antiagent_upgrade
 изменений. Процессы автоматически не завершаются. После успешного обновления
 команда заново регистрирует абсолютный launcher; Codex нужно полностью
 перезапустить и проверить через `antigravity_doctor` и live read-only smoke.
+Точная последовательность действий и критерии готовности описаны в
+[`POST_UPDATE_ACTIVATION.md`](POST_UPDATE_ACTIVATION.md).
 
 ## 3. Подключите MCP к Codex один раз
 

@@ -41,7 +41,8 @@
 - Новый run всегда начинать в `plan`. `accept-edits` разрешён только по явному поручению основного агента для конкретной задачи. `acknowledge_review=true` разрешён только после фактического review предыдущих изменений основным агентом.
 - После Antigravity основной агент обязан самостоятельно проверить structured result, `git diff`, изменённые файлы и релевантные тесты. Ответ Gemini без проверки не считается выполненной задачей.
 - При `capacity_reached`, usage limit или недоступности Antigravity не повторять один и тот же запрос: один раз перейти к самому дешёвому подходящему native субагенту и сообщить о fallback.
-- Любое изменение wire-контракта, lifecycle, запуска или диагностики Antiagent в том же commit обязано обновлять repo-scoped skill `.agents/skills/antigravity-executor/SKILL.md` и связанную пользовательскую инструкцию. Изменение runtime без синхронизации skill считается незавершённым.
+- Любое изменение wire-контракта, lifecycle, запуска или диагностики Antiagent в том же commit обязано обновлять repo-scoped skill `.agents/skills/antigravity-executor/SKILL.md`, связанную пользовательскую инструкцию и post-update runbook `POST_UPDATE_ACTIVATION.md`. Изменение runtime без синхронизации этих инструкций считается незавершённым.
+- После изменения runtime, установки, регистрации или MCP-схемы нельзя считать обновлённый Antiagent активным только потому, что изменились исходники или создан новый субагент. Обязательный operational handoff описан в `POST_UPDATE_ACTIVATION.md`: полностью закрыть все процессы Codex, выполнить `py -m antiagent_upgrade`, запустить новый верхнеуровневый процесс Codex, проверить `antigravity_doctor`, строгий `smoke_mcp.py` и один bounded live marker smoke без изменения Git. Агент обязан актуализировать этот runbook в том же изменении, если любой шаг, команда или критерий готовности поменялись.
 
 ## Fallback и повышение мощности
 

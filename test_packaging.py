@@ -66,11 +66,38 @@ class PackagingTest(unittest.TestCase):
             Path("README.md"),
             Path("HOST_SIDE_DEPLOYMENT.md"),
             Path("КАК_ПОЛЬЗОВАТЬСЯ.md"),
+            Path("POST_UPDATE_ACTIVATION.md"),
             Path("Инструкция_ Antigravity CLI OAuth Executor для Codex.md"),
         ):
             with self.subTest(path=str(relative_path)):
                 raw = (ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertNotIn("pipx install --force", raw)
+
+    def test_post_update_activation_runbook_is_linked_and_complete(self):
+        runbook_name = "POST_UPDATE_ACTIVATION.md"
+        runbook = (ROOT / runbook_name).read_text(encoding="utf-8")
+
+        for required_text in (
+            "py -m antiagent_upgrade",
+            "antigravity_doctor",
+            "smoke_mcp.py",
+            'mode="plan"',
+            "expected_marker",
+            "worktree_changed=false",
+            "runtime.drift_reasons=[]",
+        ):
+            with self.subTest(required_text=required_text):
+                self.assertIn(required_text, runbook)
+
+        for relative_path in (
+            Path("AGENTS.md"),
+            Path("README.md"),
+            Path("КАК_ПОЛЬЗОВАТЬСЯ.md"),
+            Path(".agents/skills/antigravity-executor/SKILL.md"),
+        ):
+            with self.subTest(path=str(relative_path)):
+                raw = (ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertIn(runbook_name, raw)
 
 
 if __name__ == "__main__":

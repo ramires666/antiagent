@@ -129,11 +129,16 @@ metadata; drift fails closed as `stale_runtime_snapshot`. Terminal
 `idle_seconds` are frozen on the first finish and are not rewritten by later
 polls or callbacks.
 
-When Antiagent runtime or its lifecycle contract changes, update this skill and
-the user guide in the same commit. A runtime change with stale instructions is
-not complete.
+When Antiagent runtime or its lifecycle contract changes, update this skill,
+the user guide, and `POST_UPDATE_ACTIVATION.md` in the same commit. A runtime
+change with stale instructions is not complete. The post-update runbook is the
+canonical operational handoff: close every Codex host, upgrade, start a new
+top-level Codex process, then run doctor, strict installed-launcher smoke, and
+one bounded live marker smoke.
 
 For Windows install/upgrade, exact MCP contracts, and failure diagnosis, read
 [the executor guide](<../../../Инструкция_ Antigravity CLI OAuth Executor для Codex.md>).
+For the exact steps required after changing or upgrading Antiagent, read
+[the post-update activation runbook](../../../POST_UPDATE_ACTIVATION.md).
 Use `py -m antiagent_upgrade` only from the Antiagent checkout after fully
 closing Codex; its process guard fails before `pipx` if MCP is still active.
