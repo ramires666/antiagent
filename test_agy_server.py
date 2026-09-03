@@ -1760,6 +1760,90 @@ class AgyServerTest(unittest.TestCase):
         )
         self.assertEqual(result_data(unknown_timeout)["error_type"], "timeout")
 
+    def test_structured_failure_codes_and_stderr_root_cause_mapping(self):
+        exact_cases = (
+            ("timeout", "You are not logged into Antigravity", "timeout"),
+            ("permission_denied", "You are not logged into Antigravity", "permission_denied"),
+            ("no_content", "", "no_content"),
+        )
+        for error_type, stderr, expected in exact_cases:
+            with self.subTest(error_type=error_type):
+                result, _ = self._execute(
+                    stdout={"status": "FAIL", "error_type": error_type},
+                    returncode=1,
+                    stderr=stderr,
+                )
+                self.assertEqual(result_data(result)["error_type"], expected)
+
+        generic, _ = self._execute(
+            stdout={"status": "FAIL", "error_type": "no_content"},
+            returncode=1,
+            stderr="connectex: socket access was forbidden",
+        )
+        self.assertEqual(result_data(generic)["error_type"], "network_denied")
+
+        derived_timeout, _ = self._execute(
+            stdout={"status": "FAIL", "error_type": "oauth_timeout"},
+            returncode=1,
+            stderr="connectex: socket access was forbidden",
+        )
+        self.assertEqual(
+            result_data(derived_timeout)["error_type"], "network_denied"
+        )
+
+        unrelated, _ = self._execute(
+            stdout={"status": "FAIL"},
+            returncode=1,
+            stderr=(
+                "Print mode: triggering interactive OAuth\n"
+                "unrelated filesystem permission denied"
+            ),
+        )
+        self.assertEqual(result_data(unrelated)["error_type"], "cli_error")
+
+    def test_zero_exit_and_empty_success_preserve_typed_root_causes(self):
+        async def run_raw(stdout, stderr, timed_out=False):
+            with patch(
+                "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
+            ), patch(
+                "agy_server._run_cli",
+                new=AsyncMock(return_value=server.CliRunResult(
+                    0, stdout, timed_out, stderr=stderr
+                )),
+            ):
+                return await server.execute_with_antigravity_cli(
+                    workspace=Path("C:/repo"), prompt="x",
+                    thinking_level="low", mode="plan",
+                )
+
+        empty_stdout = asyncio.run(run_raw(
+            "", 'Print mode: soft-denying tool confirmation "ListDir"'
+        ))
+        self.assertEqual(empty_stdout["error_type"], "permission_denied")
+
+        invalid_payload = asyncio.run(run_raw(
+            "[]", "connectex: socket access was forbidden"
+        ))
+        self.assertEqual(invalid_payload["error_type"], "network_denied")
+
+        empty_success = asyncio.run(run_raw(
+            json.dumps({"status": "SUCCESS", "response": ""}),
+            'Print mode: soft-denying tool confirmation "ListDir"',
+        ))
+        self.assertEqual(empty_success["error_type"], "permission_denied")
+
+        plain_empty_success = asyncio.run(run_raw(
+            json.dumps({"status": "SUCCESS", "response": ""}), ""
+        ))
+        self.assertEqual(plain_empty_success["error_type"], "no_content")
+
+        timed = asyncio.run(run_raw(
+            json.dumps({"status": "FAIL", "error_type": "permission_denied"}),
+            "",
+            timed_out=True,
+        ))
+        self.assertEqual(timed["error_type"], "permission_denied")
+
     def test_classified_stderr_is_not_persisted_in_agent_store(self):
         secret = "PERSISTED_STDERR_SECRET"
         result, _ = self._execute(
@@ -2762,6 +2846,148 @@ class AgyServerTest(unittest.TestCase):
         self.assertNotIn("stream-secret", repr(updates))
         self.assertNotIn("stream-secret", stdout.decode())
 
+    def test_stream_json_bounds_individual_records_not_cumulative_traffic(self):
+        async def scenario():
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            event = json.dumps({
+                "event": "step_update",
+                "step_update": {
+                    "step_index": 1, "state": "DONE", "step_type": "tool",
+                },
+            }).encode() + b"\n"
+            count = server.MAX_STDOUT_CHARS // len(event) + 2
+            for _ in range(count):
+                stdout.feed_data(event)
+            stdout.feed_data(
+                b'{"event":"result","result":'
+                b'{"status":"SUCCESS","response":"ok"}}\n'
+            )
+            stdout.feed_eof()
+            stderr.feed_eof()
+
+            class FakeProcess:
+                returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = FakeProcess()
+            process.stdout = stdout
+            process.stderr = stderr
+            return await server._collect_stream_output(process)
+
+        stdout, exceeded, stderr = asyncio.run(scenario())
+        self.assertFalse(exceeded)
+        self.assertEqual(stderr, b"")
+        self.assertEqual(json.loads(stdout)["response"], "ok")
+        self.assertLessEqual(len(stdout), server.MAX_STDOUT_CHARS)
+
+    def test_stream_json_keeps_valid_result_with_bounded_noisy_stderr(self):
+        async def scenario():
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            stdout.feed_data(
+                b'{"event":"result","result":'
+                b'{"status":"SUCCESS","response":"ok"}}\n'
+            )
+            stdout.feed_eof()
+            stderr.feed_data(b"H" * server.MAX_STDERR_CHARS)
+            stderr.feed_data(b"T" * server.MAX_STDERR_CHARS)
+            stderr.feed_eof()
+
+            class FakeProcess:
+                returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = FakeProcess()
+            process.stdout = stdout
+            process.stderr = stderr
+            return await server._collect_stream_output(process)
+
+        stdout, exceeded, stderr = asyncio.run(scenario())
+        self.assertFalse(exceeded)
+        self.assertEqual(json.loads(stdout)["response"], "ok")
+        self.assertEqual(len(stderr), server.MAX_STDERR_CHARS)
+        self.assertTrue(stderr.startswith(b"H"))
+        self.assertTrue(stderr.endswith(b"T"))
+
+    def test_stream_json_typed_missing_and_malformed_results(self):
+        async def collect(lines):
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            for line in lines:
+                stdout.feed_data(line + b"\n")
+            stdout.feed_eof()
+            stderr.feed_eof()
+
+            class FakeProcess:
+                returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = FakeProcess()
+            process.stdout = stdout
+            process.stderr = stderr
+            result, exceeded, _stderr = await server._collect_stream_output(process)
+            self.assertFalse(exceeded)
+            return json.loads(result)
+
+        valid_without_result = asyncio.run(collect([
+            b'{"event":"init","init":{"conversation_id":"conv-safe"}}',
+            b'{"event":"step_update","step_update":'
+            b'{"step_index":1,"state":"DONE","step_type":"tool"}}',
+        ]))
+        self.assertEqual(valid_without_result["error_type"], "no_content")
+        self.assertEqual(valid_without_result["conversation_id"], "conv-safe")
+
+        malformed = asyncio.run(collect([b"not-json"]))
+        self.assertEqual(malformed["error_type"], "invalid_json")
+
+        invalid_result = asyncio.run(collect([
+            b'{"event":"result","result":["not","an","object"]}',
+        ]))
+        self.assertEqual(invalid_result["error_type"], "invalid_payload")
+
+    def test_stream_init_conversation_id_replaces_invalid_final_value(self):
+        async def collect(final_id):
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            events = (
+                {"event": "init", "init": {"conversation_id": "conv-safe"}},
+                {"event": "result", "result": {
+                    "status": "SUCCESS", "response": "ok",
+                    "conversation_id": final_id,
+                }},
+            )
+            stdout.feed_data(
+                ("\n".join(json.dumps(event) for event in events) + "\n").encode()
+            )
+            stdout.feed_eof()
+            stderr.feed_eof()
+
+            class FakeProcess:
+                returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = FakeProcess()
+            process.stdout = stdout
+            process.stderr = stderr
+            result, exceeded, _stderr = await server._collect_stream_output(process)
+            self.assertFalse(exceeded)
+            return json.loads(result)
+
+        for final_id in (None, "has space", 7):
+            with self.subTest(final_id=final_id):
+                self.assertEqual(
+                    asyncio.run(collect(final_id))["conversation_id"], "conv-safe"
+                )
+
     def test_agent_wait_relays_bounded_safe_progress(self):
         class FakeContext:
             def __init__(self):
@@ -2810,6 +3036,77 @@ class AgyServerTest(unittest.TestCase):
                 sorted(call[0] for call in ctx.calls),
             )
             self.assertNotIn("secret", repr(ctx.calls).lower())
+            store.close()
+
+    def test_agent_wait_progress_cannot_exceed_wait_budget(self):
+        class HangingContext:
+            async def report_progress(self, *_args):
+                await asyncio.Event().wait()
+
+        async def scenario(store, active_id, terminal_id):
+            started = asyncio.get_running_loop().time()
+            active = await server.antigravity_agent_wait(
+                active_id, 0.02, ctx=HangingContext()
+            )
+            active_elapsed = asyncio.get_running_loop().time() - started
+
+            started = asyncio.get_running_loop().time()
+            immediate = await server.antigravity_agent_wait(
+                active_id, 0, ctx=HangingContext()
+            )
+            immediate_elapsed = asyncio.get_running_loop().time() - started
+
+            started = asyncio.get_running_loop().time()
+            terminal = await server.antigravity_agent_wait(
+                terminal_id, 0.02, ctx=HangingContext()
+            )
+            terminal_elapsed = asyncio.get_running_loop().time() - started
+
+            started = asyncio.get_running_loop().time()
+            terminal_immediate = await server.antigravity_agent_wait(
+                terminal_id, 0, ctx=HangingContext()
+            )
+            terminal_immediate_elapsed = (
+                asyncio.get_running_loop().time() - started
+            )
+            return (
+                active, active_elapsed, immediate, immediate_elapsed,
+                terminal, terminal_elapsed,
+                terminal_immediate, terminal_immediate_elapsed,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = server.AgentStore(
+                Path(directory) / "agents.sqlite3", owner_id="wait-budget"
+            )
+            active = store.create(
+                workspace=directory, thinking_level="medium", mode="plan"
+            )
+            store.mark_running(active.agent_id)
+            terminal = store.create(
+                workspace=directory, thinking_level="medium", mode="plan"
+            )
+            store.finish(terminal.agent_id, "completed")
+            with patch.object(server, "_AGENT_STORE", store), patch(
+                "agy_server._snapshot_in_scope", return_value=True
+            ):
+                values = asyncio.run(scenario(
+                    store, active.agent_id, terminal.agent_id
+                ))
+            (
+                active_result, active_elapsed, immediate, immediate_elapsed,
+                terminal_result, terminal_elapsed, terminal_immediate,
+                terminal_immediate_elapsed,
+            ) = values
+            self.assertTrue(active_result["wait_timed_out"])
+            self.assertTrue(immediate["wait_timed_out"])
+            self.assertFalse(terminal_result["wait_timed_out"])
+            self.assertFalse(terminal_immediate["wait_timed_out"])
+            self.assertLess(active_elapsed, 0.15)
+            self.assertLess(immediate_elapsed, 0.05)
+            self.assertLess(terminal_elapsed, 0.15)
+            self.assertLess(terminal_immediate_elapsed, 0.05)
+            store.finish(active.agent_id, "interrupted")
             store.close()
 
 

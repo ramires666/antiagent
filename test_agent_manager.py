@@ -155,6 +155,26 @@ class AgentStoreTest(unittest.TestCase):
             self.assertEqual(store.reconcile_stale(1), 0)
             store.close()
 
+    def test_reconcile_stale_fast_path_is_read_only_when_no_rows_are_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            created = store.create(
+                workspace=directory, thinking_level="low", mode="plan"
+            )
+            before = store.get(created.agent_id)
+            total_changes = store._db.total_changes
+
+            with patch.object(
+                store,
+                "_begin",
+                side_effect=AssertionError("read-only fast path opened a write transaction"),
+            ):
+                self.assertEqual(store.reconcile_stale(60), 0)
+
+            self.assertEqual(store._db.total_changes, total_changes)
+            self.assertEqual(store.get(created.agent_id), before)
+            store.close()
+
     def test_progress_is_persisted_bounded_monotonic_and_terminal(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state" / "agents.sqlite3"

@@ -18,7 +18,7 @@ API keys в executor не используются. OAuth выполняется
 
 ## Установка и OAuth
 
-В Windows PowerShell установите актуальную официальную версию CLI инструкцией из документации (в текущем checkout проверена версия `1.1.22`):
+В Windows PowerShell установите актуальную официальную версию CLI инструкцией из документации (в текущем checkout проверена версия `1.1.24`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://antigravity.google/cli/install.ps1 | iex"
@@ -55,6 +55,13 @@ Allow rules минимальны: чтение workspace, необходимые
 
 Совместимый синхронный tool `antigravity_cli_execute` принимает `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`), `mode` (`plan|accept-edits`, default `plan`), `acknowledge_review` (boolean, default `false`), optional UUID `conversation_id`, optional `expected_marker` (непустая строка до 256 символов) и единственный поддерживаемый `payload_mode=workspace`. Для каждого editing-вызова оператор должен явно выбрать `mode=accept-edits`. `acknowledge_review=true` нужен только после ручной проверки partial/unknown результата, когда wrapper вернул `review_required`. Если непустой успешный ответ не содержит marker, wrapper возвращает `verification_failed`, не повторяя marker в ошибке или логах. Structured failed/no-content результаты сохраняют только allowlisted usage counters.
 
+Wrapper сначала учитывает точный машинный `error_type` CLI, затем применяет
+ограниченную классификацию bounded diagnostics. Поэтому сетевой запрет, проблема
+профиля, OAuth timeout, payload policy или headless tool denial не маскируются
+как общие `invalid_json`, `no_content` либо wrapper timeout. Устаревший startup
+шум авторизации не перекрывает точный terminal code. Raw stdout/stderr при этом
+не возвращаются и не сохраняются.
+
 Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`, `payload_mode`, `file_scope_enforced`, `shell_denied`.
 
 Execution имеет `payload_mode=workspace` и возвращает
@@ -81,6 +88,13 @@ Persistent manager добавляет шесть tools:
 - `antigravity_agent_interrupt` — идемпотентно выставляет cross-process cancel flag и отменяет локальное дерево процессов.
 
 Состояния: `queued`, `running`, `completed`, `failed`, `interrupted`; terminal state не перезаписывается. SQLite store использует stdlib, не требует новой зависимости и хранится в `%LOCALAPPDATA%\antiagent\agents.sqlite3` (`XDG_STATE_HOME`/`~/.local/state/antiagent` на POSIX). В БД нет исходных prompt/task/context/verification. Result ограничен 256 KiB, history — 1000 terminal rows, active runs — 32. Stale `queued|running` получает `failed` и `manager_error=manager_lost`.
+
+`agent_wait` ограничивает также отправку progress notification: зависший клиент
+не может растянуть заданный wait timeout. Обычный poll без stale-кандидатов не
+открывает SQLite write-транзакцию, что уменьшает конкуренцию с heartbeat и
+terminal persistence. NDJSON stdout и stderr постоянно drain-ятся, но в памяти
+удерживаются только ограниченные diagnostics и финальный structured result;
+большое число промежуточных событий само по себе не считается output overflow.
 
 ## MCP-конфигурация Windows
 
@@ -144,6 +158,12 @@ agy --version
 .\.venv\Scripts\python.exe .\smoke_mcp.py <КОРЕНЬ_GIT_ПРОЕКТА>
 .\.venv\Scripts\python.exe .\smoke_agy.py
 ```
+
+`smoke_mcp.py` завершается ненулевым кодом не только при транспортной ошибке,
+но и при `checks_passed=false`, неготовом workspace/boundary/state либо
+устаревшей output schema установленного MCP. Совпадения одних имён восьми tools
+недостаточно: после upgrade требуется полный restart Codex, затем повторный
+smoke.
 
 Acceptance criteria:
 

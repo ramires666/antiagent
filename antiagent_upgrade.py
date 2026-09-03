@@ -5,6 +5,7 @@ import ctypes
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -85,7 +86,7 @@ def ensure_upgrade_is_safe(
             for name, pid in scanner()
             if name.lower() == MCP_IMAGE_NAME
         ]
-    except OSError as error:
+    except Exception as error:
         raise UpgradeError(
             "Unable to verify whether antiagent-mcp.exe is running"
         ) from error
@@ -106,6 +107,24 @@ def _project_root(source: str | None = None) -> Path:
     pyproject = root / "pyproject.toml"
     if not pyproject.is_file():
         raise UpgradeError("Antiagent source directory must contain pyproject.toml")
+    try:
+        with pyproject.open("rb") as stream:
+            metadata = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise UpgradeError(
+            "Antiagent source directory has an invalid pyproject.toml"
+        ) from error
+    project = metadata.get("project")
+    if not isinstance(project, dict) or project.get("name") != "antiagent-mcp":
+        raise UpgradeError(
+            "Antiagent source pyproject.toml must name project antiagent-mcp"
+        )
+    required = ("antiagent_setup.py", "agy_server.py", "agent_manager.py")
+    missing = [name for name in required if not (root / name).is_file()]
+    if missing:
+        raise UpgradeError(
+            "Antiagent source directory is incomplete; missing " + ", ".join(missing)
+        )
     return root
 
 
@@ -178,7 +197,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
     if not args.dry_run:
-        print("Antiagent upgraded and registered. Restart Codex completely before use.")
+        if args.no_register:
+            print(
+                "Antiagent upgraded. Codex registration was not changed. "
+                "Restart Codex completely before use."
+            )
+        else:
+            print(
+                "Antiagent upgraded and registered. "
+                "Restart Codex completely before use."
+            )
     return 0
 
 

@@ -620,6 +620,13 @@ class AgentStore:
         cutoff = time.time() - max_age_seconds
         finished_at, _ = _now()
         with self._lock:
+            candidate = self._db.execute(
+                """SELECT 1 FROM agents WHERE owner_id=?
+                   AND status IN ('queued','running') AND updated_at<? LIMIT 1""",
+                (self.owner_id, cutoff),
+            ).fetchone()
+            if candidate is None:
+                return 0
             try:
                 self._begin()
                 rows = self._db.execute(

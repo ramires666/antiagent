@@ -23,6 +23,10 @@ manager capacity allow.
 3. Confirm OAuth and network only with one bounded live `mode=plan` smoke using
    an `expected_marker`, then verify `status=SUCCESS`, the marker, and unchanged
    Git state.
+4. When validating an installed launcher with `smoke_mcp.py`, treat any nonzero
+   exit as a real failure. The smoke rejects an unhealthy doctor result and a
+   stale MCP output schema even when all eight tool names are present; upgrade,
+   fully restart Codex, and rerun it before trusting the session.
 
 ## Prepare a run
 
@@ -52,6 +56,8 @@ manager capacity allow.
    `elapsed_seconds`, `idle_seconds`, and `manager_status`. During a long wait,
    keep using bounded waits so MCP progress notifications and heartbeats reach
    the parent instead of leaving it without status.
+   A slow progress-notification consumer is bounded by the wrapper and must not
+   extend the requested wait interval.
 3. Continue with `antigravity_agent_followup` only after a terminal state with
    a saved conversation ID. A follow-up defaults back to `plan`.
 4. Use `antigravity_agent_interrupt` when a live run is no longer wanted.
@@ -79,6 +85,12 @@ lifecycle tools are unavailable.
   payload, and repeated deterministic failures are not fixed by fresh agents.
 
 Never use `--dangerously-skip-permissions`.
+
+The wrapper preserves typed root-cause failures when bounded CLI diagnostics
+are available. A soft-denied tool, profile/network failure, or structured
+terminal error must not be interpreted as generic `invalid_json`, `no_content`,
+or `timeout`. Intermediate NDJSON and diagnostic noise are drained with bounded
+retained memory; only the final structured result is returned.
 
 ## Verify independently
 

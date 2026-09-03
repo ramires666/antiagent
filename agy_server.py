@@ -30,7 +30,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal, NamedTuple, cast
+from typing import Annotated, Any, Literal, NamedTuple, cast, get_args
 
 from ctypes import wintypes
 from mcp.types import CallToolResult, TextContent
@@ -132,6 +132,7 @@ ErrorType = Literal[
     "review_required",
     "review_state_unavailable",
 ]
+_KNOWN_CLI_ERROR_TYPES = frozenset(get_args(ErrorType))
 _VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 AgentStatus = Literal["queued", "running", "completed", "failed", "interrupted"]
 AgentManagerErrorType = Literal[
@@ -193,6 +194,7 @@ DoctorErrorType = Literal[
 ]
 _TERMINAL_AGENT_STATUSES = ("completed", "failed", "interrupted")
 MAX_AGENT_WAIT_SECONDS = 60.0
+MAX_WAIT_PROGRESS_SECONDS = 0.25
 _AGENT_STORE: AgentStore | None = None
 _AGENT_TASKS: dict[str, asyncio.Task[None]] = {}
 
@@ -781,6 +783,27 @@ async def _emit_progress(progress: ProgressCallback | None, message: str) -> Non
         raise
     except Exception:
         logger.debug("MCP progress notification failed")
+
+
+async def _report_wait_progress(
+    ctx: Context | None,
+    progress: int,
+    message: str,
+    remaining_seconds: float,
+) -> None:
+    if ctx is None or remaining_seconds <= 0:
+        return
+    try:
+        await asyncio.wait_for(
+            ctx.report_progress(progress, 100, message),
+            timeout=min(MAX_WAIT_PROGRESS_SECONDS, remaining_seconds),
+        )
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        pass
+    except Exception:
+        logger.debug("MCP wait progress notification failed")
 
 
 async def _progress_heartbeat(progress: ProgressCallback, run_id: str = "") -> None:
@@ -1616,6 +1639,31 @@ async def _read_bounded(
         size += len(data)
 
 
+async def _drain_bounded(
+    stream: asyncio.StreamReader | None, limit: int
+) -> tuple[bytes, bool]:
+    """Drain a diagnostic stream while retaining only bounded head and tail."""
+    if stream is None:
+        return b"", False
+    head_limit = (limit + 1) // 2
+    tail_limit = limit - head_limit
+    head = bytearray()
+    tail = b""
+    total = 0
+    while True:
+        data = await stream.read(65_536)
+        if not data:
+            return bytes(head) + tail, total > limit
+        total += len(data)
+        head_room = head_limit - len(head)
+        if head_room > 0:
+            head.extend(data[:head_room])
+            data = data[head_room:]
+        if data:
+            if tail_limit:
+                tail = (tail + data)[-tail_limit:]
+
+
 async def _collect_output(
     process: asyncio.subprocess.Process,
 ) -> tuple[bytes, bool, bytes]:
@@ -1681,23 +1729,29 @@ async def _collect_stream_output(
     """Consume agy's NDJSON stream and retain only its bounded final result."""
     if process.stdout is None:
         return b"", False, b""
-    stderr_task = asyncio.create_task(_read_bounded(process.stderr, MAX_STDERR_CHARS))
-    total = 0
+    stderr_task = asyncio.create_task(_drain_bounded(process.stderr, MAX_STDERR_CHARS))
     buffer = b""
     result_payload: dict[str, Any] | None = None
     conversation_id: str | None = None
+    saw_valid_event = False
+    saw_malformed_event = False
+    saw_result_event = False
     callback = _LIFECYCLE_CALLBACK.get()
 
     async def consume(line: bytes) -> None:
-        nonlocal result_payload, conversation_id
+        nonlocal result_payload, conversation_id, saw_valid_event
+        nonlocal saw_malformed_event, saw_result_event
         if not line.strip():
             return
         try:
             event = json.loads(line.decode("utf-8", errors="strict"))
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            saw_malformed_event = True
             return
         if not isinstance(event, dict):
+            saw_malformed_event = True
             return
+        saw_valid_event = True
         event_name = event.get("event")
         if event_name == "init":
             init = event.get("init")
@@ -1719,33 +1773,45 @@ async def _collect_stream_output(
                 )
             return
         if event_name == "result":
+            saw_result_event = True
             value = event.get("result")
             if isinstance(value, dict):
                 result_payload = dict(value)
+            else:
+                result_payload = None
 
     try:
         while True:
             chunk = await process.stdout.read(65_536)
             if not chunk:
                 break
-            total += len(chunk)
-            if total > MAX_STDOUT_CHARS:
-                stderr_task.cancel()
-                await asyncio.gather(stderr_task, return_exceptions=True)
-                return b"", True, b""
             buffer += chunk
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
+                if len(line) > MAX_STDOUT_CHARS:
+                    stderr_task.cancel()
+                    await asyncio.gather(stderr_task, return_exceptions=True)
+                    return b"", True, b""
                 await consume(line)
+            if len(buffer) > MAX_STDOUT_CHARS:
+                stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
+                return b"", True, b""
         if buffer:
             await consume(buffer)
         await process.wait()
-        stderr, stderr_exceeded = await stderr_task
-        if stderr_exceeded:
-            return b"", True, b""
+        stderr, _stderr_exceeded = await stderr_task
         if result_payload is None:
-            return b"", False, stderr
-        if conversation_id is not None and "conversation_id" not in result_payload:
+            if saw_result_event:
+                error_type = "invalid_payload"
+            elif saw_valid_event:
+                error_type = "no_content"
+            elif saw_malformed_event:
+                error_type = "invalid_json"
+            else:
+                return b"", False, stderr
+            result_payload = {"status": "ERROR", "error_type": error_type}
+        if conversation_id is not None and _conversation_id(result_payload) is None:
             result_payload["conversation_id"] = conversation_id
         encoded = json.dumps(
             result_payload, ensure_ascii=False, separators=(",", ":")
@@ -1985,7 +2051,7 @@ def _prepare_execution(
 def _success_result(
     payload: dict[str, Any], level: str, mode: str, *,
     run_info: RunInfo, cli_version: str | None, exit_code: int | None,
-    expected_marker: str | None = None,
+    expected_marker: str | None = None, stderr: str = "",
 ) -> dict[str, Any]:
     response = payload.get("response", "")
     usage, usage_available = _usage_info(payload)
@@ -2000,9 +2066,13 @@ def _success_result(
             conversation_id_available=conversation_id_available,
         )
     if not response.strip():
+        classified = _classify_cli_failure(stderr, payload)
+        error_type = classified or "no_content"
         return _empty_result(
-            "ERROR", "Antigravity CLI returned no content", level, mode,
-            error_type="no_content", run_info=run_info,
+            "ERROR", _CLI_FAILURE_MESSAGES.get(
+                error_type, "Antigravity CLI returned no content"
+            ), level, mode,
+            error_type=error_type, run_info=run_info,
             cli_version=cli_version, exit_code=exit_code, usage=usage,
             usage_available=usage_available,
             conversation_id=conversation_id,
@@ -2076,6 +2146,11 @@ def _safe_exit_code(value: object) -> int | None:
 
 
 _CLI_FAILURE_MESSAGES: dict[ErrorType, str] = {
+    "timeout": "Antigravity CLI timed out",
+    "invalid_json": "Antigravity CLI returned invalid JSON",
+    "invalid_payload": "Antigravity CLI returned an invalid response",
+    "invalid_response": "Antigravity CLI returned an invalid response",
+    "cli_error": "Antigravity CLI task failed",
     "profile_unreadable": "Antigravity profile is not readable by the executor",
     "profile_not_writable": "Antigravity profile state is not writable by the executor",
     "network_denied": "Antigravity network access was denied",
@@ -2083,26 +2158,20 @@ _CLI_FAILURE_MESSAGES: dict[ErrorType, str] = {
     "oauth_timeout": "Antigravity OAuth did not complete",
     "permission_denied": "Antigravity tool permission was denied",
     "policy_denied": "Antigravity payload was denied by policy",
+    "no_content": "Antigravity CLI returned no content",
 }
+_GENERIC_PAYLOAD_ERRORS = frozenset((
+    "cli_error", "no_content", "invalid_json", "invalid_payload",
+    "invalid_response",
+))
+_DIAGNOSTIC_ROOT_CAUSES = frozenset((
+    "profile_unreadable", "profile_not_writable", "network_denied",
+    "policy_denied",
+))
 
 
-def _classify_cli_failure(
-    stderr: str,
-    payload: dict[str, Any] | None = None,
-) -> ErrorType | None:
-    """Return an allowlisted final failure class without exposing diagnostics."""
-    parts = [stderr]
-    if payload is not None:
-        for key in ("error_type", "error", "message", "final_status"):
-            value = payload.get(key)
-            if isinstance(value, str):
-                parts.append(value)
-            elif isinstance(value, dict):
-                try:
-                    parts.append(json.dumps(value, ensure_ascii=False, default=str))
-                except (TypeError, ValueError):
-                    pass
-    diagnostic = "\n".join(parts).lower()
+def _classify_cli_diagnostic(diagnostic: str) -> ErrorType | None:
+    diagnostic = diagnostic.lower()
     auth_succeeded = any(marker in diagnostic for marker in (
         "authenticated via keyring", "oauth: authenticated successfully",
         "keyringauth: loaded token", "streamgeneratecontent", "responseid",
@@ -2140,13 +2209,12 @@ def _classify_cli_failure(
     )):
         return "network_denied"
     if any(marker in diagnostic for marker in (
-        "soft-denying tool confirmation", "permission_denied", "permission denied",
+        "soft-denying tool confirmation", "permission_denied",
         "tool permission was denied", "denied tool",
     )):
         return "permission_denied"
     if not auth_succeeded and any(marker in diagnostic for marker in (
         "oauth_timeout", "oauth timeout", "auth timed out",
-        "triggering interactive oauth",
     )):
         return "oauth_timeout"
     if not auth_succeeded and any(marker in diagnostic for marker in (
@@ -2155,6 +2223,40 @@ def _classify_cli_failure(
     )):
         return "auth_missing"
     return None
+
+
+def _classify_cli_failure(
+    stderr: str,
+    payload: dict[str, Any] | None = None,
+) -> ErrorType | None:
+    """Return an allowlisted final failure class without exposing diagnostics."""
+    stderr_classification = _classify_cli_diagnostic(stderr)
+    exact_error: ErrorType | None = None
+    parts: list[str] = []
+    if payload is not None:
+        raw_error = payload.get("error_type")
+        if isinstance(raw_error, str):
+            normalized = raw_error.strip().lower().replace("-", "_")
+            if normalized in _KNOWN_CLI_ERROR_TYPES:
+                exact_error = cast(ErrorType, normalized)
+        for key in ("error", "message", "final_status"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+            elif isinstance(value, dict):
+                try:
+                    parts.append(json.dumps(value, ensure_ascii=False, default=str))
+                except (TypeError, ValueError):
+                    pass
+    if exact_error is not None:
+        if (
+            stderr_classification in _DIAGNOSTIC_ROOT_CAUSES
+            or exact_error in _GENERIC_PAYLOAD_ERRORS
+            and stderr_classification is not None
+        ):
+            return stderr_classification
+        return exact_error
+    return _classify_cli_diagnostic("\n".join((stderr, *parts)))
 
 
 def _retryable(error_type: ErrorType | None, mode: str | None) -> bool:
@@ -2379,7 +2481,16 @@ async def execute_with_antigravity_cli(
     )
 
     if timed_out:
-        classified = _classify_cli_failure(stderr)
+        payload_for_classification: dict[str, Any] | None = None
+        try:
+            parsed_timeout = json.loads(stdout.strip())
+            if isinstance(parsed_timeout, dict):
+                payload_for_classification = parsed_timeout
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        classified = _classify_cli_failure(stderr, payload_for_classification)
+        if classified in ("no_content", "invalid_json", "invalid_payload"):
+            classified = None
         error_type = classified or "timeout"
         message = (
             _CLI_FAILURE_MESSAGES[classified]
@@ -2447,17 +2558,25 @@ async def execute_with_antigravity_cli(
     try:
         payload = json.loads(stdout.strip())
     except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning("Antigravity CLI returned invalid JSON")
+        classified = _classify_cli_failure(stderr)
+        error_type = classified or "invalid_json"
+        logger.warning("Antigravity CLI failed (%s)", error_type)
         return _empty_result(
-            "ERROR", "Antigravity CLI returned invalid JSON", thinking_level, mode,
-            error_type="invalid_json", run_info=run, cli_version=cli_version,
+            "ERROR", _CLI_FAILURE_MESSAGES.get(
+                error_type, "Antigravity CLI returned invalid JSON"
+            ), thinking_level, mode,
+            error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
             postflight=postflight,
         )
     if not isinstance(payload, dict):
+        classified = _classify_cli_failure(stderr)
+        error_type = classified or "invalid_payload"
         return _empty_result(
-            "ERROR", "Antigravity CLI returned an invalid response", thinking_level, mode,
-            error_type="invalid_payload", run_info=run, cli_version=cli_version,
+            "ERROR", _CLI_FAILURE_MESSAGES.get(
+                error_type, "Antigravity CLI returned an invalid response"
+            ), thinking_level, mode,
+            error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
             postflight=postflight,
         )
@@ -2481,7 +2600,7 @@ async def execute_with_antigravity_cli(
     return _success_result(
         payload, thinking_level, mode, run_info=run,
         cli_version=cli_version, exit_code=_safe_exit_code(returncode),
-        expected_marker=expected_marker,
+        expected_marker=expected_marker, stderr=stderr,
     ) | {
         "preexisting_dirty": postflight.preexisting_dirty,
         "worktree_changed": postflight.worktree_changed,
@@ -2748,6 +2867,10 @@ async def antigravity_agent_wait(
     last_signature: tuple[object, ...] | None = None
     last_notification = 0.0
     while snapshot.status not in _TERMINAL_AGENT_STATUSES:
+        now = asyncio.get_running_loop().time()
+        remaining = deadline - now
+        if remaining <= 0:
+            return _agent_operation_result(snapshot, wait_timed_out=True)
         progress = snapshot.progress or {}
         signature = (
             snapshot.status,
@@ -2755,7 +2878,6 @@ async def antigravity_agent_wait(
             progress.get("progress_percent"),
             progress.get("last_event_at"),
         )
-        now = asyncio.get_running_loop().time()
         if ctx is not None and (
             signature != last_signature or now - last_notification >= 5.0
         ):
@@ -2775,12 +2897,7 @@ async def antigravity_agent_wait(
                 message += f" blocker={blocker_code}"
             if isinstance(next_action, str):
                 message += f" next={next_action}"
-            try:
-                await ctx.report_progress(percent, 100, message)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.debug("MCP wait progress notification failed")
+            await _report_wait_progress(ctx, percent, message, remaining)
             last_signature = signature
             last_notification = now
         remaining = deadline - asyncio.get_running_loop().time()
@@ -2792,16 +2909,13 @@ async def antigravity_agent_wait(
             return error
         assert snapshot is not None
     if ctx is not None:
-        try:
-            await ctx.report_progress(
-                100,
-                100,
-                f"agent_id={snapshot.agent_id} status={snapshot.status} progress=100%",
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.debug("MCP wait progress notification failed")
+        remaining = deadline - asyncio.get_running_loop().time()
+        await _report_wait_progress(
+            ctx,
+            100,
+            f"agent_id={snapshot.agent_id} status={snapshot.status} progress=100%",
+            remaining,
+        )
     return _agent_operation_result(snapshot)
 
 
