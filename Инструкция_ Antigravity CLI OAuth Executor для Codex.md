@@ -62,7 +62,25 @@ Wrapper сначала учитывает точный машинный `error_t
 шум авторизации не перекрывает точный terminal code. Raw stdout/stderr при этом
 не возвращаются и не сохраняются.
 
-Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`, `payload_mode`, `file_scope_enforced`, `shell_denied`.
+Выход: `status`, `result`, `model`, `thinking_level`, `mode`, `usage`, `conversation_id`, `result_truncated`, `error_type`, `exit_code`, `retryable`, `run_id`, `started_at`, `finished_at`, `duration_seconds`, `cli_version`, `metadata_complete`, `usage_available`, `conversation_id_available`, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`, `payload_mode`, `file_scope_enforced`, `shell_denied`, `response_diagnostics`, `verification`, `runtime`.
+
+Для content-ответов используются ровно пять взаимоисключающих кодов:
+`empty_model_response`, `stream_closed_before_final`, `content_parse_failed`,
+`content_filtered`, `final_block_missing`. Непустой финальный текст успешен;
+ошибки промежуточных NDJSON-событий не вытесняют корректный финал. Retry
+разрешён только для `stream_closed_before_final` и `final_block_missing` в
+`mode=plan`; в `accept-edits` retry hint всегда false.
+
+`response_diagnostics` содержит только bounded structural evidence:
+`output_format`, `final_event_seen`, `last_safe_event_type`, безопасный
+`response_id`, `content_block_count`, `malformed_event_count`. При
+`expected_marker` `verification` содержит SHA-256 `rule_hash`, found/failure
+поля и ограниченный санитизированный `manual_review_content` с флагом
+`manual_review_truncated`; небезопасное содержимое отбрасывается fail-closed.
+`runtime` содержит pre/post CLI identity, process metadata и `drift_reasons`;
+изменение identity возвращает `stale_runtime_snapshot`. `finished_at`,
+`duration_seconds` и feedback-счётчики `elapsed_seconds`/`idle_seconds`
+фиксируются при terminal finish и больше не растут при последующих status/wait.
 
 Execution имеет `payload_mode=workspace` и возвращает
 `file_scope_enforced=false`, `shell_denied=false`. CLI `1.1.24` не имеет
@@ -86,6 +104,16 @@ Persistent manager добавляет шесть tools:
 - `antigravity_agent_wait` — ждёт не более 60 секунд за один MCP call, не отменяя run при wait timeout;
 - `antigravity_agent_followup` — создаёт дочерний run через сохранённый `conversation_id`; безопасный default режима снова `plan`;
 - `antigravity_agent_interrupt` — идемпотентно выставляет cross-process cancel flag и отменяет локальное дерево процессов.
+
+Admission workspace durable и справедливый: `plan` получает `shared`, а
+`accept-edits` — `exclusive`. Сначала создаётся queued-запись admission, затем
+берётся межпроцессный lock. Snapshot сообщает `queue_position` и
+`blocking_owner_run_ids`; ранний writer блокирует последующих readers, а
+одновременные shared readers ограничены `WORKSPACE_ADMISSION_READER_LIMIT`
+(32). Запись привязана к owner/run, имеет heartbeat и lease; lease renew-ится
+во время ожидания и выполнения, освобождается при завершении/отмене и
+удаляется после истечения. Повторный request id допустим только при полном
+совпадении owner, run, workspace и access.
 
 Состояния: `queued`, `running`, `completed`, `failed`, `interrupted`; terminal state не перезаписывается. SQLite store использует stdlib, не требует новой зависимости и хранится в `%LOCALAPPDATA%\antiagent\agents.sqlite3` (`XDG_STATE_HOME`/`~/.local/state/antiagent` на POSIX). В БД нет исходных prompt/task/context/verification. Result ограничен 256 KiB, history — 1000 terminal rows, active runs — 32. Stale `queued|running` получает `failed` и `manager_error=manager_lost`.
 

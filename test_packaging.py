@@ -23,7 +23,10 @@ class PackagingTest(unittest.TestCase):
         )
         self.assertEqual(
             set(project["tool"]["setuptools"]["py-modules"]),
-            {"agy_server", "agent_manager", "antiagent_setup", "antiagent_upgrade"},
+            {
+                "agy_server", "agent_manager", "response_diagnostics",
+                "runtime_identity", "antiagent_setup", "antiagent_upgrade",
+            },
         )
         self.assertIn("mcp[cli]==2.0.0", project["project"]["dependencies"])
 

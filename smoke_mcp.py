@@ -55,6 +55,9 @@ EXPECTED_EXECUTION_OUTPUT_FIELDS = {
     "file_scope_enforced",
     "shell_denied",
     "feedback",
+    "response_diagnostics",
+    "verification",
+    "runtime",
 }
 
 EXPECTED_DOCTOR_FIELDS = {
@@ -68,6 +71,7 @@ EXPECTED_DOCTOR_FIELDS = {
     "network_probe",
     "oauth_ready",
     "error_type",
+    "runtime",
 }
 
 
@@ -130,6 +134,26 @@ def _validate_doctor(payload: object) -> dict[str, object]:
         payload["cli_version"], str
     ):
         raise SmokeError("installed MCP doctor returned an invalid cli_version")
+    runtime = payload["runtime"]
+    required_runtime = {
+        "schema_revision", "package_version", "mcp_process_pid",
+        "mcp_process_started_at", "cli_executable",
+        "cli_binary_identity_pre", "cli_binary_identity_post",
+        "cli_version_pre", "cli_version_post", "cli_process_pid",
+        "cli_process_started_at", "drift_reasons",
+    }
+    if not isinstance(runtime, dict) or set(runtime) != required_runtime:
+        raise SmokeError("installed MCP doctor returned malformed runtime identity")
+    if runtime["schema_revision"] != "2" or runtime["drift_reasons"] != []:
+        raise SmokeError("installed MCP doctor returned stale runtime identity")
+    if (
+        not isinstance(runtime["cli_executable"], str)
+        or not Path(runtime["cli_executable"]).is_absolute()
+        or runtime["cli_version_pre"] != payload["cli_version"]
+        or runtime["cli_version_post"] != payload["cli_version"]
+        or runtime["cli_binary_identity_pre"] != runtime["cli_binary_identity_post"]
+    ):
+        raise SmokeError("installed MCP doctor runtime does not match selected CLI")
     return payload
 
 

@@ -68,6 +68,13 @@ manager capacity allow.
 Use `antigravity_cli_execute` only as a compatibility fallback when durable
 lifecycle tools are unavailable.
 
+Workspace admission is durable and fair. `plan` requests `shared` access;
+`accept-edits` requests `exclusive` access. Admission is queued before the
+inter-process lock, reports `queue_position` and `blocking_owner_run_ids`,
+and uses an owner/run-bound heartbeat lease. Shared readers may batch up to the
+reader limit, while an earlier writer blocks later readers. Leases renew during
+execution and are released on completion/cancel; expired leases are reconciled.
+
 ## Retry and fallback
 
 - `capacity_reached`: wait for an existing run to finish; do not create a retry
@@ -103,7 +110,24 @@ complete relevant diff, and proportionate tests. Reject out-of-scope changes.
 semantic completion percentage. `indeterminate=true` means no honest ETA is
 available. Report the current phase, last safe activity, blocker and next action;
 never infer an ETA from elapsed time. Telemetry deliberately excludes prompts,
-context, argv, paths, raw stdout/stderr, tool arguments and model text.
+context, argv, workspace paths, raw stdout/stderr, tool arguments and model
+text. The declared `runtime.cli_executable` is the sole diagnostic path.
+
+Content classification has five mutually exclusive codes:
+`empty_model_response`, `stream_closed_before_final`, `content_parse_failed`,
+`content_filtered`, and `final_block_missing`. Only
+`stream_closed_before_final` and `final_block_missing` are retryable, and only
+in `plan`; filtering, parsing, and empty output are not retryable. A later valid
+final event takes precedence over malformed intermediate stream events.
+
+Verification returns the expected-marker SHA-256 `rule_hash`, found/failure
+fields, and a bounded sanitized `manual_review_content` suffix with
+`manual_review_truncated`; raw prompts, tool events, credentials, and stderr
+are never retained. Runtime output carries pre/post CLI identity and process
+metadata; drift fails closed as `stale_runtime_snapshot`. Terminal
+`finished_at`, `duration_seconds`, feedback `elapsed_seconds`, and
+`idle_seconds` are frozen on the first finish and are not rewritten by later
+polls or callbacks.
 
 When Antiagent runtime or its lifecycle contract changes, update this skill and
 the user guide in the same commit. A runtime change with stale instructions is

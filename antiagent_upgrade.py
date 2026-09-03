@@ -119,7 +119,13 @@ def _project_root(source: str | None = None) -> Path:
         raise UpgradeError(
             "Antiagent source pyproject.toml must name project antiagent-mcp"
         )
-    required = ("antiagent_setup.py", "agy_server.py", "agent_manager.py")
+    required = (
+        "antiagent_setup.py",
+        "agy_server.py",
+        "agent_manager.py",
+        "response_diagnostics.py",
+        "runtime_identity.py",
+    )
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
         raise UpgradeError(

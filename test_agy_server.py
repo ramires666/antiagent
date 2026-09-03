@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import agy_server as server
+import runtime_identity as runtime_identity_module
 from mcp.types import CallToolResult
 
 
@@ -28,12 +29,12 @@ OUTPUT_FIELDS = {
     "preexisting_dirty", "worktree_changed", "changed_paths",
     "postflight_complete", "requires_review",
     "payload_mode", "file_scope_enforced", "shell_denied",
-    "feedback",
+    "feedback", "response_diagnostics", "verification", "runtime",
 }
 DOCTOR_FIELDS = {
     "checks_passed", "cli_available", "cli_version",
     "execution_boundary_declared", "state_writable", "workspace_status",
-    "auth_probe", "network_probe", "oauth_ready", "error_type",
+    "auth_probe", "network_probe", "oauth_ready", "error_type", "runtime",
 }
 
 
@@ -88,6 +89,9 @@ class AgyServerTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        if server._AGENT_STORE is not None:
+            server._AGENT_STORE.close()
+            server._AGENT_STORE = None
         cls._state_patch.stop()
         cls._state_directory.cleanup()
 
@@ -204,6 +208,25 @@ class AgyServerTest(unittest.TestCase):
             with patch("agent_manager._STATE_DIRECTORY", state_root):
                 self.assertTrue(server._probe_state_writable())
             self.assertEqual(set(state_root.iterdir()), before)
+
+    def test_terminal_feedback_timing_is_frozen_at_finished_at(self):
+        progress = {
+            "recent_events": [],
+            "last_event_at": "2026-09-03T10:00:08.000Z",
+        }
+        kwargs = {
+            "started_at": "2026-09-03T10:00:00.000Z",
+            "finished_at": "2026-09-03T10:00:10.000Z",
+            "updated_at": None,
+            "manager_status": "terminal",
+        }
+        with patch("agy_server.time.time", return_value=1_900_000_000.0):
+            first = server._feedback_view(progress, **kwargs)
+        with patch("agy_server.time.time", return_value=2_000_000_000.0):
+            second = server._feedback_view(progress, **kwargs)
+        self.assertEqual(first["elapsed_seconds"], 10.0)
+        self.assertEqual(first["idle_seconds"], 2.0)
+        self.assertEqual(second, first)
 
     @staticmethod
     def _start_lock_worker(root, lock_directory, marker, *, mode="hold", hold=0, timeout=1):
@@ -362,6 +385,19 @@ class AgyServerTest(unittest.TestCase):
         self.assertNotIn(marker, json.dumps(result))
         self.assertEqual(result["usage"], {"total_tokens": 7})
         self.assertTrue(result["usage_available"])
+        self.assertEqual(result["verification"]["rule_name"], "expected_marker")
+        self.assertEqual(
+            result["verification"]["rule_hash"],
+            server.hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+        )
+        self.assertFalse(result["verification"]["expected_marker_found"])
+        self.assertEqual(
+            result["verification"]["failure_kind"], "marker_mismatch"
+        )
+        self.assertEqual(
+            result["verification"]["manual_review_content"],
+            "completed without the sentinel",
+        )
 
         accepted = server._success_result(
             {**payload, "response": f"done {marker}"}, "low", "plan",
@@ -369,6 +405,36 @@ class AgyServerTest(unittest.TestCase):
             expected_marker=marker,
         )
         self.assertEqual(accepted["status"], "SUCCESS")
+        self.assertTrue(accepted["verification"]["expected_marker_found"])
+        self.assertIsNone(accepted["verification"]["failure_kind"])
+
+    def test_runtime_version_change_fails_fast_with_safe_drift(self):
+        async def scenario(executable):
+            runtime_identity_module._reset_process_runtime_guard_for_tests()
+            payload = json.dumps({"status": "SUCCESS", "response": "ok"})
+            with patch(
+                "agy_server._resolve_cli", return_value=executable
+            ), patch(
+                "agy_server._probe_cli_version", side_effect=("1.1.25", "1.1.26")
+            ), patch(
+                "agy_server._run_cli", new=AsyncMock(return_value=(0, payload, False))
+            ):
+                return await server.execute_with_antigravity_cli(
+                    workspace=Path.cwd(), prompt="x",
+                    thinking_level="low", mode="plan",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="runtime-drift-") as directory:
+            executable = Path(directory) / "agy.exe"
+            executable.write_bytes(b"bounded identity")
+            try:
+                result = asyncio.run(scenario(executable))
+            finally:
+                runtime_identity_module._reset_process_runtime_guard_for_tests()
+        self.assertEqual(result["error_type"], "stale_runtime_snapshot")
+        self.assertEqual(result["runtime"]["cli_version_pre"], "1.1.25")
+        self.assertEqual(result["runtime"]["cli_version_post"], "1.1.26")
+        self.assertIn("cli_version_drift", result["runtime"]["drift_reasons"])
 
     def test_expected_marker_miss_is_failure_for_edit_review(self):
         missing = server.CliRunResult(
@@ -938,13 +1004,20 @@ class AgyServerTest(unittest.TestCase):
             "agy_server._probe_cli_version", return_value="1.1.22"
         ), patch(
             "agy_server._run_cli",
-            new=AsyncMock(return_value=server.CliRunResult(0, "", False, output_limit=True)),
+            new=AsyncMock(return_value=server.CliRunResult(
+                0, "", False, output_limit=True,
+                response_diagnostics=server.ResponseDiagnostics(
+                    output_format="stream-json", final_event_seen=True,
+                    last_safe_event_type="result", content_block_count=7,
+                ),
+            )),
         ):
             result = asyncio.run(server.execute_with_antigravity_cli(
                 workspace=Path("C:/repo"), prompt="x", thinking_level="low", mode="plan"
             ))
         self.assertEqual(result["error_type"], "output_limit")
         self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["response_diagnostics"]["content_block_count"], 7)
 
     def test_handler_rejects_explicit_invalid_working_directory_before_cli(self):
         working_directory = str(Path.cwd() / "missing-workspace")
@@ -1235,6 +1308,20 @@ class AgyServerTest(unittest.TestCase):
                 self.assertEqual(result_data(result)["status"], "ERROR")
                 self.assertEqual(result_data(result)["result"], expected)
 
+    def test_timeout_dominates_synthetic_content_failures(self):
+        for content_error in (
+            "empty_model_response", "stream_closed_before_final",
+            "content_parse_failed", "content_filtered", "final_block_missing",
+        ):
+            with self.subTest(content_error=content_error):
+                result, _ = self._execute(
+                    stdout={"status": "ERROR", "error_type": content_error},
+                    timed_out=True,
+                )
+                data = result_data(result)
+                self.assertEqual(data["error_type"], "timeout")
+                self.assertFalse(data["retryable"])
+
     def test_cli_unavailable_and_defensive_stdout_limit(self):
         with patch("agy_server._resolve_cli", return_value=None), patch(
             "agy_server._run_cli", new=AsyncMock()
@@ -1472,7 +1559,7 @@ class AgyServerTest(unittest.TestCase):
                 return 0, '{"status":"SUCCESS","response":"after timeout"}', False
 
             with patch("agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")), patch(
-                "agy_server._timeout_seconds", return_value=0.01
+                "agy_server._timeout_seconds", return_value=0.1
             ), patch("agy_server._run_cli", new=run):
                 first = await server.execute_with_antigravity_cli(
                     workspace=Path("C:/repo"), prompt="x",
@@ -1497,7 +1584,7 @@ class AgyServerTest(unittest.TestCase):
                 ))
                 with patch("agy_server._LOCK_DIRECTORY", Path(directory)), patch(
                     "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
-                ), patch("agy_server._timeout_seconds", return_value=0.01), patch(
+                ), patch("agy_server._timeout_seconds", return_value=0.1), patch(
                     "agy_server._run_cli", new=run
                 ):
                     lock = server.WorkspaceLock(Path("C:/repo"))
@@ -1574,7 +1661,7 @@ class AgyServerTest(unittest.TestCase):
                 pass
 
             with patch("agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")), patch(
-                "agy_server._timeout_seconds", return_value=0.01 if timeout else 1
+                "agy_server._timeout_seconds", return_value=0.1 if timeout else 1
             ), patch("agy_server._progress_heartbeat", new=heartbeat), patch(
                 "agy_server._run_cli", new=run
             ):
@@ -1595,8 +1682,8 @@ class AgyServerTest(unittest.TestCase):
 
     def test_json_shape_status_and_response_validation(self):
         cases = (
-            ([], "Antigravity CLI returned an invalid response"),
-            ("scalar", "Antigravity CLI returned an invalid response"),
+            ([], "Antigravity CLI content could not be parsed"),
+            ("scalar", "Antigravity CLI content could not be parsed"),
             ({"status": "FAIL", "response": "private"}, "Antigravity CLI task failed"),
             ({"response": "missing status"}, "Antigravity CLI task failed"),
             ({"status": "SUCCESS", "response": 7}, "Antigravity CLI returned an invalid response"),
@@ -1610,12 +1697,16 @@ class AgyServerTest(unittest.TestCase):
         missing_response, _ = self._execute(stdout={"status": "SUCCESS"})
         missing_data = result_data(missing_response)
         self.assertEqual(missing_data["status"], "ERROR")
-        self.assertEqual(missing_data["error_type"], "no_content")
-        self.assertEqual(missing_data["result"], "Antigravity CLI returned no content")
+        self.assertEqual(missing_data["error_type"], "final_block_missing")
+        self.assertEqual(
+            missing_data["result"], "Antigravity CLI final content block is missing"
+        )
         whitespace_response, _ = self._execute(stdout={
             "status": "SUCCESS", "response": " \r\n\t"
         })
-        self.assertEqual(result_data(whitespace_response)["error_type"], "no_content")
+        self.assertEqual(
+            result_data(whitespace_response)["error_type"], "empty_model_response"
+        )
 
     def test_malformed_and_nonzero_output_are_generic(self):
         with patch(
@@ -1625,7 +1716,10 @@ class AgyServerTest(unittest.TestCase):
             "agy_server._resolve_cli", return_value=Path("C:/bin/agy.exe")
         ), patch("agy_server._run_cli", new=AsyncMock(return_value=(0, "TOKEN=secret", False))):
             malformed = asyncio.run(server.antigravity_cli_execute("x", mode="plan"))
-        self.assertEqual(result_data(malformed)["result"], "Antigravity CLI returned invalid JSON")
+        self.assertEqual(
+            result_data(malformed)["result"],
+            "Antigravity CLI content could not be parsed",
+        )
         with patch(
             "agy_server._git_preflight",
             return_value=server.GitPreflight(Path("C:/repo"), None),
@@ -1835,7 +1929,9 @@ class AgyServerTest(unittest.TestCase):
         plain_empty_success = asyncio.run(run_raw(
             json.dumps({"status": "SUCCESS", "response": ""}), ""
         ))
-        self.assertEqual(plain_empty_success["error_type"], "no_content")
+        self.assertEqual(
+            plain_empty_success["error_type"], "empty_model_response"
+        )
 
         timed = asyncio.run(run_raw(
             json.dumps({"status": "FAIL", "error_type": "permission_denied"}),
@@ -1843,6 +1939,36 @@ class AgyServerTest(unittest.TestCase):
             timed_out=True,
         ))
         self.assertEqual(timed["error_type"], "permission_denied")
+
+    def test_success_payload_content_code_conflicts_use_observed_shape(self):
+        for claimed in (
+            "empty_model_response", "stream_closed_before_final",
+            "content_parse_failed", "final_block_missing",
+        ):
+            with self.subTest(claimed=claimed):
+                result = server._success_result(
+                    {
+                        "status": "SUCCESS", "response": "",
+                        "error_type": claimed,
+                        "usage": {"output_tokens": 0},
+                    },
+                    "low", "plan", run_info=server.RunInfo(),
+                    cli_version="1.1.25", exit_code=0,
+                    response_diagnostics=server.ResponseDiagnostics(
+                        output_format="json", final_event_seen=True,
+                        last_safe_event_type="result", content_block_count=0,
+                    ),
+                )
+                self.assertEqual(result["error_type"], "empty_model_response")
+        filtered = server._success_result(
+            {
+                "status": "SUCCESS", "response": "",
+                "error_type": "content_filtered",
+            },
+            "low", "plan", run_info=server.RunInfo(),
+            cli_version="1.1.25", exit_code=0,
+        )
+        self.assertEqual(filtered["error_type"], "content_filtered")
 
     def test_classified_stderr_is_not_persisted_in_agent_store(self):
         secret = "PERSISTED_STDERR_SECRET"
@@ -2941,16 +3067,18 @@ class AgyServerTest(unittest.TestCase):
             b'{"event":"step_update","step_update":'
             b'{"step_index":1,"state":"DONE","step_type":"tool"}}',
         ]))
-        self.assertEqual(valid_without_result["error_type"], "no_content")
+        self.assertEqual(
+            valid_without_result["error_type"], "stream_closed_before_final"
+        )
         self.assertEqual(valid_without_result["conversation_id"], "conv-safe")
 
         malformed = asyncio.run(collect([b"not-json"]))
-        self.assertEqual(malformed["error_type"], "invalid_json")
+        self.assertEqual(malformed["error_type"], "content_parse_failed")
 
         invalid_result = asyncio.run(collect([
             b'{"event":"result","result":["not","an","object"]}',
         ]))
-        self.assertEqual(invalid_result["error_type"], "invalid_payload")
+        self.assertEqual(invalid_result["error_type"], "content_parse_failed")
 
     def test_stream_init_conversation_id_replaces_invalid_final_value(self):
         async def collect(final_id):

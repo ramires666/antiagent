@@ -1,7 +1,7 @@
 # Финальный отчёт тестирования
 
-Дата отчёта: 2 сентября 2026 г.
-Code/config baseline: Antiagent `0.3.0`
+Дата отчёта: 3 сентября 2026 г.
+Code/config baseline: Antiagent `0.4.0`
 
 ## Среда
 
@@ -13,14 +13,25 @@ Code/config baseline: Antiagent `0.3.0`
 
 ## Итог
 
-После добавления live feedback deterministic suite содержит **134 теста**, включая **6 тестов MCP STDIO**. На Windows два POSIX-only permission test ожидаемо отмечены `skipped`. Полный discovery и отдельный прогон 118 lifecycle/protocol тестов завершились `OK`; также прошли AST parse, `pip check`, skill validation и `git diff --check`.
+После исправления ошибок из отчёта 2026-09-03 deterministic suite содержит
+**197 тестов**, включая **6 тестов MCP STDIO**. На Windows два POSIX-only
+permission test ожидаемо отмечены `skipped`. Полный discovery завершился `OK`;
+также проходят compile, packaging/smoke validation и `git diff --check`.
 
 Проверка не заявляет математическое 100% покрытие: тестируются reachable и критические error/lifecycle ветки.
 
 ## Что исправлено и проверено
 
 - Безопасное разрешение абсолютных executable-путей (`agy`, `git`, системный `taskkill`), запрет shell, Windows UTF-16 command-line budget, cleanup и exact-PID process-tree termination.
-- Межпроцессный workspace lock, общий deadline, восстановление после timeout/cancellation и отсутствие surviving descendants.
+- Shared `plan` / exclusive `accept-edits` workspace admission, честная очередь
+  с owner/position, renewable lease, writer fairness, stale cleanup и release
+  после cancellation. Стресс из 32 concurrent plan дошёл до mock CLI без lock timeout.
+- Пять отдельных content failure-кодов вместо неразличимого `no_content`,
+  bounded structural diagnostics и retry только для двух transient plan-ошибок.
+- Verification сообщает hash правила, marker mismatch/schema failure и только
+  безопасный manual-review suffix. Runtime identity сверяет binary/version до и
+  после запуска и fail-fast возвращает `stale_runtime_snapshot`.
+- Terminal feedback elapsed/idle больше не растёт после завершения.
 - MCP default `mode=plan`; typed diagnostics; runtime failures возвращаются как MCP `isError=true` при сохранении structured metadata; validation/redaction не раскрывают prompt, stdout, stderr или secrets.
 - `agy --output-format stream-json` читается во время выполнения; model text delta не сохраняется, наружу идут только allowlisted step index/state/type и ограниченный final result.
 - `run_id`, timestamps, duration, CLI version, retryability и completeness metadata; progress использует шкалу wrapper-этапов `0..100`, heartbeat, blocker, next action, elapsed/idle и manager status без выдуманного Gemini ETA.

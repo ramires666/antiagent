@@ -1,6 +1,6 @@
 # MCP test matrix
 
-Актуально для Antiagent `0.3.0` (2 сентября 2026 г.). Автоматические тесты offline, кроме отдельно отмеченного authenticated live smoke.
+Актуально для Antiagent `0.4.0` (3 сентября 2026 г.). Автоматические тесты offline, кроме отдельно отмеченного authenticated live smoke.
 
 ## MCP protocol — 6 тестов
 
@@ -27,6 +27,9 @@
 | Event ring | Не более 16 allowlisted событий; heartbeat coalescing; free-form telemetry и секреты отвергаются |
 | Capacity/history/output bounds | 32 active, 1000 terminal, 256 KiB result; безопасные typed errors |
 | SQLite schema | `progress_json` мигрируется additively; нет `task`, `context`, `verification`; `owner_id` и DB path не выдаются snapshot’ом |
+| 32 plan одного workspace | Все 32 одновременно доходят до mock CLI через shared admission; lock timeout отсутствует |
+| Writer fairness / stale lease | Ранний writer блокирует поздних readers; истёкший owner удаляется атомарно |
+| Interrupt в очереди | Admission waiter отменяется и durable ticket освобождается |
 
 ## Input/workspace
 
@@ -35,6 +38,10 @@
 ## Process and security
 
 Проверяются executable resolution, exact argv с `--output-format stream-json`, отсутствие shell и dangerous permission bypass, safe child environment, spawn/OSError, timeout, cancellation, bounded stdout/stderr, reader failure, Windows Job Object/exact PID tree kill и POSIX fallback. NDJSON parser сохраняет только final result и allowlisted step metadata; output/progress не включают text delta, raw stderr, prompt, environment или secrets.
+
+Отдельно проверяются пять content-кодов, 100 последовательных marker-results,
+safe verification suffix/hash, pre/post runtime identity/version drift с
+`stale_runtime_snapshot` и неизменность terminal elapsed/idle counters.
 
 ## Git postflight
 

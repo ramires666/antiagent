@@ -50,7 +50,10 @@ class ProjectRootValidationTest(unittest.TestCase):
         (root / "pyproject.toml").write_text(
             f'[project]\nname = "{name}"\n', encoding="utf-8"
         )
-        for filename in ("antiagent_setup.py", "agy_server.py", "agent_manager.py"):
+        for filename in (
+            "antiagent_setup.py", "agy_server.py", "agent_manager.py",
+            "response_diagnostics.py", "runtime_identity.py",
+        ):
             (root / filename).touch()
 
     def test_accepts_complete_antiagent_source(self):

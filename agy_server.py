@@ -43,7 +43,21 @@ from agent_manager import (
     AgentCapacityError,
     AgentSnapshot,
     AgentStore,
+    WorkspaceAdmissionSnapshot,
     prepare_state_dir,
+)
+from response_diagnostics import (
+    ResponseDiagnostics,
+    classify_content_result,
+    safe_review_suffix,
+)
+from runtime_identity import (
+    RuntimeIdentity,
+    RuntimeProbes,
+    RuntimeSnapshot,
+    capture_runtime_identity,
+    compare_runtime_identities,
+    guard_process_runtime,
 )
 
 
@@ -127,7 +141,13 @@ ErrorType = Literal[
     "permission_denied",
     "policy_denied",
     "no_content",
+    "empty_model_response",
+    "stream_closed_before_final",
+    "content_parse_failed",
+    "content_filtered",
+    "final_block_missing",
     "verification_failed",
+    "stale_runtime_snapshot",
     "scope_enforcement_unavailable",
     "review_required",
     "review_state_unavailable",
@@ -162,7 +182,13 @@ AgentManagerErrorType = Literal[
     "permission_denied",
     "policy_denied",
     "no_content",
+    "empty_model_response",
+    "stream_closed_before_final",
+    "content_parse_failed",
+    "content_filtered",
+    "final_block_missing",
     "verification_failed",
+    "stale_runtime_snapshot",
     "scope_enforcement_unavailable",
     "review_required",
     "review_state_unavailable",
@@ -191,10 +217,14 @@ DoctorErrorType = Literal[
     "workspace_not_root",
     "git_trust_denied",
     "git_unavailable",
+    "stale_runtime_snapshot",
 ]
 _TERMINAL_AGENT_STATUSES = ("completed", "failed", "interrupted")
 MAX_AGENT_WAIT_SECONDS = 60.0
 MAX_WAIT_PROGRESS_SECONDS = 0.25
+WORKSPACE_ADMISSION_LEASE_SECONDS = 30.0
+WORKSPACE_ADMISSION_READER_LIMIT = 32
+RUNTIME_SCHEMA_REVISION = "2"
 _AGENT_STORE: AgentStore | None = None
 _AGENT_TASKS: dict[str, asyncio.Task[None]] = {}
 
@@ -228,6 +258,9 @@ class CliRunResult:
     command_line_too_long: bool = False
     output_limit: bool = False
     stderr: str = ""
+    response_diagnostics: ResponseDiagnostics | None = None
+    process_pid: int | None = None
+    process_started_at: str | None = None
 
     def __iter__(self):
         yield self.returncode
@@ -243,6 +276,20 @@ class CliRunResult:
 
 
 @dataclass(frozen=True)
+class CollectedOutput:
+    stdout: bytes
+    exceeded: bool
+    stderr: bytes
+    response_diagnostics: ResponseDiagnostics | None = None
+
+    def __iter__(self):
+        # Preserve the historical three-value collector interface.
+        yield self.stdout
+        yield self.exceeded
+        yield self.stderr
+
+
+@dataclass(frozen=True)
 class LifecycleUpdate:
     phase: str
     progress_percent: int
@@ -251,6 +298,7 @@ class LifecycleUpdate:
     next_action: str | None = None
     deadline_at: str | None = None
     step: dict[str, Any] | None = None
+    workspace_admission: dict[str, Any] | None = None
     heartbeat: bool = False
 
 
@@ -319,6 +367,16 @@ class WorkspaceLockTimeout(WorkspaceLockError):
     """The workspace lock was not acquired before the deadline."""
 
 
+class _Overlapped(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_size_t),
+        ("InternalHigh", ctypes.c_size_t),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
 def _workspace_lock_path(root: Path) -> Path:
     try:
         canonical = os.path.normcase(os.path.realpath(os.fspath(root)))
@@ -346,9 +404,13 @@ def _workspace_lock_path(root: Path) -> Path:
 
 
 class WorkspaceLock:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, access: Literal["shared", "exclusive"] = "exclusive"):
+        if access not in ("shared", "exclusive"):
+            raise ValueError("access must be shared or exclusive")
         self.path = _workspace_lock_path(root)
+        self.access = access
         self._fd: int | None = None
+        self._windows_overlapped: _Overlapped | None = None
 
     def _try_acquire(self) -> None:
         try:
@@ -369,7 +431,27 @@ class WorkspaceLock:
                 import msvcrt
 
                 try:
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                    lock_file = kernel32.LockFileEx
+                    lock_file.argtypes = [
+                        wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                        wintypes.DWORD, wintypes.DWORD,
+                        ctypes.POINTER(_Overlapped),
+                    ]
+                    lock_file.restype = wintypes.BOOL
+                    overlapped = _Overlapped()
+                    flags = 0x00000001  # LOCKFILE_FAIL_IMMEDIATELY
+                    if self.access == "exclusive":
+                        flags |= 0x00000002  # LOCKFILE_EXCLUSIVE_LOCK
+                    handle = wintypes.HANDLE(msvcrt.get_osfhandle(fd))
+                    if not lock_file(
+                        handle, flags, 0, 1, 0, ctypes.byref(overlapped)
+                    ):
+                        error = ctypes.get_last_error()
+                        if error in (32, 33, 158):
+                            raise WorkspaceLockBusy
+                        raise WorkspaceLockError
+                    self._windows_overlapped = overlapped
                 except OSError as exc:
                     if exc.errno in (errno.EACCES, errno.EAGAIN):
                         raise WorkspaceLockBusy from exc
@@ -378,7 +460,10 @@ class WorkspaceLock:
                 import fcntl
 
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    operation = (
+                        fcntl.LOCK_SH if self.access == "shared" else fcntl.LOCK_EX
+                    )
+                    fcntl.flock(fd, operation | fcntl.LOCK_NB)
                 except OSError as exc:
                     if exc.errno not in (errno.EACCES, errno.EAGAIN):
                         raise WorkspaceLockError from exc
@@ -414,8 +499,19 @@ class WorkspaceLock:
                 os.lseek(fd, 0, os.SEEK_SET)
                 if os.name == "nt":
                     import msvcrt
-
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    if self._windows_overlapped is not None:
+                        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                        unlock_file = kernel32.UnlockFileEx
+                        unlock_file.argtypes = [
+                            wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.DWORD, ctypes.POINTER(_Overlapped),
+                        ]
+                        unlock_file.restype = wintypes.BOOL
+                        unlock_file(
+                            wintypes.HANDLE(msvcrt.get_osfhandle(fd)), 0, 1, 0,
+                            ctypes.byref(self._windows_overlapped),
+                        )
+                        self._windows_overlapped = None
                 else:
                     import fcntl
 
@@ -430,13 +526,148 @@ class WorkspaceLock:
 
 
 @asynccontextmanager
-async def locked_workspace(root: Path, timeout: float):
-    lock = WorkspaceLock(root)
+async def locked_workspace(
+    root: Path,
+    timeout: float,
+    access: Literal["shared", "exclusive"] = "exclusive",
+):
+    lock = WorkspaceLock(root, access)
     await lock.acquire(timeout)
     try:
         yield
     finally:
         lock.release()
+
+
+def _epoch_timestamp(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value, timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+
+
+def _admission_view(value: WorkspaceAdmissionSnapshot) -> dict[str, Any]:
+    return {
+        "access": value.access,
+        "state": value.state,
+        "queue_position": value.queue_position,
+        "blocking_owner_run_ids": list(value.blocking_owner_run_ids),
+        "enqueued_at": _epoch_timestamp(value.enqueued_at),
+        "acquired_at": _epoch_timestamp(value.acquired_at),
+        "heartbeat_at": _epoch_timestamp(value.heartbeat_at),
+        "lease_expires_at": _epoch_timestamp(value.lease_expires_at),
+    }
+
+
+async def _renew_workspace_admission(store: AgentStore, request_id: str) -> None:
+    try:
+        while True:
+            await asyncio.sleep(WORKSPACE_ADMISSION_LEASE_SECONDS / 3)
+            renewed = store.renew_workspace_admission(
+                request_id, lease_seconds=WORKSPACE_ADMISSION_LEASE_SECONDS
+            )
+            if renewed is None:
+                return
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.warning("Workspace admission lease could not be renewed")
+
+
+@asynccontextmanager
+async def admitted_workspace(
+    root: Path,
+    *,
+    access: Literal["shared", "exclusive"],
+    deadline: float,
+    deadline_at: str,
+    run: RunInfo,
+    lifecycle: LifecycleCallback | None,
+    owner_run_id: str,
+):
+    """Acquire a fair durable admission and the matching inter-process lock."""
+    store = _get_agent_store()
+    request_id = run.run_id
+    admission: WorkspaceAdmissionSnapshot | None = None
+    renew_task: asyncio.Task[None] | None = None
+    lock: WorkspaceLock | None = None
+    last_queue_state: tuple[object, ...] | None = None
+    try:
+        admission = store.enqueue_workspace_admission(
+            root,
+            request_id,
+            owner_run_id,
+            access,
+            WORKSPACE_ADMISSION_LEASE_SECONDS,
+        )
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise WorkspaceLockTimeout
+            admission = store.try_acquire_workspace_admission(
+                request_id,
+                reader_limit=WORKSPACE_ADMISSION_READER_LIMIT,
+                lease_seconds=WORKSPACE_ADMISSION_LEASE_SECONDS,
+            )
+            if admission is None:
+                raise WorkspaceLockError
+            if admission.state == "acquired":
+                break
+            queue_state = (
+                admission.queue_position,
+                admission.blocking_owner_run_ids,
+                admission.lease_expires_at,
+            )
+            if last_queue_state is None or queue_state[:2] != last_queue_state[:2]:
+                await _emit_lifecycle(
+                    run,
+                    lifecycle,
+                    LifecycleUpdate(
+                        phase="waiting_for_workspace",
+                        progress_percent=20,
+                        code="waiting_for_workspace",
+                        blocker_code="waiting_for_workspace",
+                        next_action="workspace_acquired",
+                        deadline_at=deadline_at,
+                        workspace_admission=_admission_view(admission),
+                    ),
+                )
+            last_queue_state = queue_state
+            await asyncio.sleep(min(0.1, remaining))
+
+        renew_task = asyncio.create_task(
+            _renew_workspace_admission(store, request_id)
+        )
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise WorkspaceLockTimeout
+        lock = WorkspaceLock(root, access)
+        await lock.acquire(remaining)
+        await _emit_lifecycle(
+            run,
+            lifecycle,
+            LifecycleUpdate(
+                phase="preflight",
+                progress_percent=30,
+                code="workspace_acquired",
+                next_action="cli_started",
+                deadline_at=deadline_at,
+                workspace_admission=_admission_view(admission),
+            ),
+        )
+        yield admission
+    finally:
+        if lock is not None:
+            lock.release()
+        if renew_task is not None:
+            renew_task.cancel()
+            await asyncio.gather(renew_task, return_exceptions=True)
+        if admission is not None:
+            try:
+                store.release_workspace_admission(request_id)
+            except Exception:
+                logger.warning("Workspace admission could not be released")
 
 
 class _IoCounters(ctypes.Structure):
@@ -501,6 +732,19 @@ class ProgressStepOutput(BaseModel):
     type: str
 
 
+class WorkspaceAdmissionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    access: Literal["shared", "exclusive"]
+    state: Literal["queued", "acquired"]
+    queue_position: int | None
+    blocking_owner_run_ids: list[str]
+    enqueued_at: str
+    acquired_at: str | None
+    heartbeat_at: str
+    lease_expires_at: str
+
+
 class AgentProgressOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -516,9 +760,49 @@ class AgentProgressOutput(BaseModel):
     blocker: ProgressBlockerOutput | None
     next_action: str | None
     step: ProgressStepOutput | None
+    workspace_admission: WorkspaceAdmissionOutput | None
     elapsed_seconds: float
     idle_seconds: float | None
     manager_status: str
+
+
+class ResponseDiagnosticsOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    output_format: Literal["json", "stream-json"] | None
+    final_event_seen: bool | None
+    last_safe_event_type: Literal["init", "step_update", "result", "unknown"] | None
+    response_id: str | None
+    content_block_count: int | None
+    malformed_event_count: int
+
+
+class VerificationOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rule_name: Literal["expected_marker"]
+    rule_hash: str
+    expected_marker_found: bool
+    failure_kind: Literal["marker_mismatch", "response_schema_invalid"] | None
+    manual_review_content: str | None
+    manual_review_truncated: bool
+
+
+class RuntimeOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_revision: str
+    package_version: str | None
+    mcp_process_pid: int
+    mcp_process_started_at: str
+    cli_executable: str | None
+    cli_binary_identity_pre: str | None
+    cli_binary_identity_post: str | None
+    cli_version_pre: str | None
+    cli_version_post: str | None
+    cli_process_pid: int | None
+    cli_process_started_at: str | None
+    drift_reasons: list[str]
 
 
 class AntigravityCliOutput(BaseModel):
@@ -552,6 +836,9 @@ class AntigravityCliOutput(BaseModel):
     file_scope_enforced: bool
     shell_denied: bool
     feedback: AgentProgressOutput | None
+    response_diagnostics: ResponseDiagnosticsOutput
+    verification: VerificationOutput | None
+    runtime: RuntimeOutput | None
 
 
 class AntigravityDoctorOutput(BaseModel):
@@ -567,6 +854,7 @@ class AntigravityDoctorOutput(BaseModel):
     network_probe: Literal["not_run"]
     oauth_ready: Literal["unknown"]
     error_type: DoctorErrorType | None
+    runtime: RuntimeOutput | None
 
 
 class AgentSnapshotOutput(BaseModel):
@@ -693,6 +981,11 @@ def _apply_run_update(run: RunInfo, update: LifecycleUpdate) -> None:
         "blocker": blocker,
         "next_action": update.next_action,
         "step": update.step,
+        "workspace_admission": (
+            update.workspace_admission
+            if update.workspace_admission is not None
+            else current.get("workspace_admission")
+        ),
     }
 
 
@@ -730,6 +1023,7 @@ def _feedback_view(
     progress: dict[str, Any] | None,
     *,
     started_at: str | None,
+    finished_at: str | None = None,
     updated_at: float | None,
     manager_status: str,
     event_limit: int = 16,
@@ -743,7 +1037,10 @@ def _feedback_view(
         if isinstance(events, list)
         else []
     )
-    now = time.time()
+    value.setdefault("workspace_admission", None)
+    # Terminal snapshots are immutable.  Using wall-clock ``now`` here made
+    # elapsed/idle counters keep growing every time a completed agent was read.
+    now = _parse_timestamp(finished_at) or time.time()
     started = _parse_timestamp(started_at)
     last_event = _parse_timestamp(value.get("last_event_at")) or updated_at
     value["elapsed_seconds"] = round(max(0.0, now - (started or now)), 3)
@@ -767,6 +1064,7 @@ def _snapshot_output(snapshot: AgentSnapshot, *, event_limit: int = 16) -> dict[
     value["progress"] = _feedback_view(
         snapshot.progress,
         started_at=snapshot.started_at or snapshot.created_at,
+        finished_at=snapshot.finished_at,
         updated_at=snapshot.updated_at,
         manager_status=_snapshot_manager_status(snapshot),
         event_limit=event_limit,
@@ -858,6 +1156,81 @@ def _model_for(level: str) -> str:
     return f"gemini-3.7-flash-{level}"
 
 
+def _capture_runtime_identity(
+    cli: Path | None, cli_version: str | None,
+) -> RuntimeIdentity | None:
+    if cli is None:
+        return None
+    return capture_runtime_identity(
+        RuntimeProbes(
+            resolve_cli=lambda: cli,
+            probe_cli_version=lambda _path: cli_version,
+        ),
+        schema_revision=RUNTIME_SCHEMA_REVISION,
+    )
+
+
+def _binary_identity_fingerprint(identity: RuntimeIdentity | None) -> str | None:
+    if identity is None or identity.cli_binary_identity is None:
+        return None
+    value = identity.cli_binary_identity
+    canonical = ":".join(str(item) for item in (
+        value.device, value.inode, value.size_bytes, value.mtime_ns, value.ctime_ns,
+    ))
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def _runtime_view(
+    before: RuntimeIdentity | None,
+    after: RuntimeIdentity | None = None,
+    *,
+    cli_result: CliRunResult | None = None,
+    drift_reasons: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    identity = after or before
+    if identity is None:
+        return None
+    return {
+        "schema_revision": identity.schema_revision,
+        "package_version": identity.package_version,
+        "mcp_process_pid": identity.mcp_process_pid,
+        "mcp_process_started_at": identity.mcp_process_started_at,
+        "cli_executable": identity.cli_executable,
+        "cli_binary_identity_pre": _binary_identity_fingerprint(before),
+        "cli_binary_identity_post": _binary_identity_fingerprint(after or before),
+        "cli_version_pre": before.cli_version if before is not None else None,
+        "cli_version_post": (after or before).cli_version if (after or before) else None,
+        "cli_process_pid": cli_result.process_pid if cli_result is not None else None,
+        "cli_process_started_at": (
+            cli_result.process_started_at if cli_result is not None else None
+        ),
+        "drift_reasons": list(dict.fromkeys(drift_reasons)),
+    }
+
+
+def _verification_view(
+    expected_marker: str | None,
+    *,
+    response: object = None,
+    failure_kind: Literal["marker_mismatch", "response_schema_invalid"] | None = None,
+) -> dict[str, Any] | None:
+    if expected_marker is None:
+        return None
+    review = safe_review_suffix(response) if isinstance(response, str) else None
+    return {
+        "rule_name": "expected_marker",
+        "rule_hash": hashlib.sha256(expected_marker.encode("utf-8")).hexdigest(),
+        "expected_marker_found": (
+            isinstance(response, str) and expected_marker in response
+        ),
+        "failure_kind": failure_kind,
+        "manual_review_content": review,
+        "manual_review_truncated": (
+            review is not None and isinstance(response, str) and len(response) > len(review)
+        ),
+    }
+
+
 def _empty_result(
     status: str,
     result: str,
@@ -876,6 +1249,9 @@ def _empty_result(
     conversation_id_available: bool = False,
     postflight: PostflightInfo | None = None,
     payload_mode: PayloadMode = "workspace",
+    response_diagnostics: ResponseDiagnostics | None = None,
+    verification: dict[str, Any] | None = None,
+    runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     run = run_info or RunInfo()
     terminal_phase = "completed" if status == "SUCCESS" else "failed"
@@ -933,9 +1309,15 @@ def _empty_result(
         "feedback": _feedback_view(
             run.feedback,
             started_at=run.started_at,
+            finished_at=run.finished_at,
             updated_at=None,
             manager_status="inline",
         ),
+        "response_diagnostics": (
+            response_diagnostics or ResponseDiagnostics()
+        ).as_dict(),
+        "verification": verification,
+        "runtime": runtime,
     }
 
 
@@ -1725,40 +2107,54 @@ def _safe_stream_step(value: object) -> dict[str, Any] | None:
 
 async def _collect_stream_output(
     process: asyncio.subprocess.Process,
-) -> tuple[bytes, bool, bytes]:
+) -> CollectedOutput:
     """Consume agy's NDJSON stream and retain only its bounded final result."""
     if process.stdout is None:
-        return b"", False, b""
+        return CollectedOutput(
+            b"", False, b"",
+            ResponseDiagnostics(output_format="stream-json", final_event_seen=False),
+        )
     stderr_task = asyncio.create_task(_drain_bounded(process.stderr, MAX_STDERR_CHARS))
     buffer = b""
     result_payload: dict[str, Any] | None = None
     conversation_id: str | None = None
     saw_valid_event = False
     saw_malformed_event = False
+    malformed_event_count = 0
     saw_result_event = False
+    last_safe_event_type: str | None = None
+    response_id: str | None = None
     callback = _LIFECYCLE_CALLBACK.get()
 
     async def consume(line: bytes) -> None:
         nonlocal result_payload, conversation_id, saw_valid_event
-        nonlocal saw_malformed_event, saw_result_event
+        nonlocal saw_malformed_event, saw_result_event, malformed_event_count
+        nonlocal last_safe_event_type, response_id
         if not line.strip():
             return
         try:
             event = json.loads(line.decode("utf-8", errors="strict"))
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
             saw_malformed_event = True
+            malformed_event_count += 1
             return
         if not isinstance(event, dict):
             saw_malformed_event = True
+            malformed_event_count += 1
             return
         saw_valid_event = True
         event_name = event.get("event")
         if event_name == "init":
+            last_safe_event_type = "init"
             init = event.get("init")
             if isinstance(init, dict):
                 conversation_id = _conversation_id(init)
+                candidate_id = init.get("response_id", init.get("responseId"))
+                if isinstance(candidate_id, str):
+                    response_id = candidate_id
             return
         if event_name == "step_update":
+            last_safe_event_type = "step_update"
             step = _safe_stream_step(event.get("step_update"))
             if step is not None and callback is not None:
                 await _emit_lifecycle_callback(
@@ -1773,12 +2169,18 @@ async def _collect_stream_output(
                 )
             return
         if event_name == "result":
+            last_safe_event_type = "result"
             saw_result_event = True
             value = event.get("result")
             if isinstance(value, dict):
                 result_payload = dict(value)
+                candidate_id = value.get("response_id", value.get("responseId"))
+                if isinstance(candidate_id, str):
+                    response_id = candidate_id
             else:
                 result_payload = None
+            return
+        last_safe_event_type = "unknown"
 
     try:
         while True:
@@ -1791,34 +2193,49 @@ async def _collect_stream_output(
                 if len(line) > MAX_STDOUT_CHARS:
                     stderr_task.cancel()
                     await asyncio.gather(stderr_task, return_exceptions=True)
-                    return b"", True, b""
+                    return CollectedOutput(b"", True, b"")
                 await consume(line)
             if len(buffer) > MAX_STDOUT_CHARS:
                 stderr_task.cancel()
                 await asyncio.gather(stderr_task, return_exceptions=True)
-                return b"", True, b""
+                return CollectedOutput(b"", True, b"")
         if buffer:
             await consume(buffer)
         await process.wait()
         stderr, _stderr_exceeded = await stderr_task
         if result_payload is None:
             if saw_result_event:
-                error_type = "invalid_payload"
+                error_type = "content_parse_failed"
             elif saw_valid_event:
-                error_type = "no_content"
+                error_type = "stream_closed_before_final"
             elif saw_malformed_event:
-                error_type = "invalid_json"
+                error_type = "content_parse_failed"
             else:
-                return b"", False, stderr
+                error_type = "stream_closed_before_final"
             result_payload = {"status": "ERROR", "error_type": error_type}
         if conversation_id is not None and _conversation_id(result_payload) is None:
             result_payload["conversation_id"] = conversation_id
         encoded = json.dumps(
             result_payload, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
+        response = result_payload.get("response")
+        raw_content = result_payload.get("content")
+        content_block_count = (
+            len(raw_content)
+            if isinstance(raw_content, list)
+            else (1 if isinstance(response, str) and response.strip() else 0)
+        )
+        diagnostics = ResponseDiagnostics(
+            output_format="stream-json",
+            final_event_seen=saw_result_event,
+            last_safe_event_type=last_safe_event_type,
+            response_id=response_id,
+            content_block_count=content_block_count,
+            malformed_event_count=malformed_event_count,
+        )
         if len(encoded) > MAX_STDOUT_CHARS:
-            return b"", True, b""
-        return encoded, False, stderr
+            return CollectedOutput(b"", True, b"", diagnostics)
+        return CollectedOutput(encoded, False, stderr, diagnostics)
     finally:
         if not stderr_task.done():
             stderr_task.cancel()
@@ -1849,6 +2266,7 @@ async def _run_cli(
     except (OSError, ValueError):
         return CliRunResult(None, "", False)
 
+    process_started_at = _timestamp()
     job = _create_windows_job(process.pid)
     stream_json = any(
         argv[index:index + 2] == ["--output-format", "stream-json"]
@@ -1860,8 +2278,14 @@ async def _run_cli(
     try:
         # Shield the pipe-draining task: cancelling it on Windows can leave
         # Proactor pipe transports behind after taskkill.
-        stdout, exceeded, stderr = await asyncio.wait_for(
+        collected = await asyncio.wait_for(
             asyncio.shield(communication), timeout=timeout_seconds or _timeout_seconds()
+        )
+        stdout, exceeded, stderr = collected
+        diagnostics = (
+            collected.response_diagnostics
+            if isinstance(collected, CollectedOutput)
+            else None
         )
         if exceeded:
             _close_windows_job(job)
@@ -1870,20 +2294,34 @@ async def _run_cli(
             await _finish_killed_process(process, communication)
             # A pipe exceeded its bound. Discard both raw streams instead of
             # retaining an incomplete diagnostic that may contain secrets.
-            return CliRunResult(process.returncode, "", False, output_limit=True)
+            return CliRunResult(
+                process.returncode, "", False, output_limit=True,
+                response_diagnostics=diagnostics,
+                process_pid=process.pid,
+                process_started_at=process_started_at,
+            )
         return CliRunResult(
             process.returncode,
             stdout.decode("utf-8", errors="replace"),
             False,
             stderr=stderr.decode("utf-8", errors="replace"),
+            response_diagnostics=diagnostics,
+            process_pid=process.pid,
+            process_started_at=process_started_at,
         )
     except asyncio.TimeoutError:
         _close_windows_job(job)
         job = None
         await asyncio.to_thread(_kill_process_tree, process)
         try:
-            stdout, _exceeded, stderr = await asyncio.wait_for(
+            collected = await asyncio.wait_for(
                 asyncio.shield(communication), timeout=10
+            )
+            stdout, _exceeded, stderr = collected
+            diagnostics = (
+                collected.response_diagnostics
+                if isinstance(collected, CollectedOutput)
+                else None
             )
         except Exception:
             try:
@@ -1893,13 +2331,20 @@ async def _run_cli(
             await _finish_killed_process(process, communication)
             # Reader failure means no trustworthy bounded diagnostic is
             # available; preserve the typed timeout and keep stderr empty.
-            return CliRunResult(process.returncode, "", True)
+            return CliRunResult(
+                process.returncode, "", True,
+                process_pid=process.pid,
+                process_started_at=process_started_at,
+            )
         await _finish_killed_process(process, communication)
         return CliRunResult(
             process.returncode,
             stdout.decode("utf-8", errors="replace"),
             True,
             stderr=stderr.decode("utf-8", errors="replace"),
+            response_diagnostics=diagnostics,
+            process_pid=process.pid,
+            process_started_at=process_started_at,
         )
     except asyncio.CancelledError:
         _close_windows_job(job)
@@ -1912,7 +2357,11 @@ async def _run_cli(
         job = None
         await asyncio.to_thread(_kill_process_tree, process)
         await _finish_killed_process(process, communication)
-        return CliRunResult(process.returncode, "", False)
+        return CliRunResult(
+            process.returncode, "", False,
+            process_pid=process.pid,
+            process_started_at=process_started_at,
+        )
     finally:
         _close_windows_job(job)
 
@@ -2052,22 +2501,45 @@ def _success_result(
     payload: dict[str, Any], level: str, mode: str, *,
     run_info: RunInfo, cli_version: str | None, exit_code: int | None,
     expected_marker: str | None = None, stderr: str = "",
+    response_diagnostics: ResponseDiagnostics | None = None,
+    runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     response = payload.get("response", "")
+    diagnostics = response_diagnostics or ResponseDiagnostics(
+        output_format="json",
+        final_event_seen=True,
+        last_safe_event_type="result",
+        content_block_count=(1 if isinstance(response, str) and response.strip() else 0),
+    )
     usage, usage_available = _usage_info(payload)
     conversation_id, conversation_id_available = _conversation_id_info(payload)
     if not isinstance(response, str):
         return _empty_result(
             "ERROR", "Antigravity CLI returned an invalid response", level, mode,
-            error_type="invalid_response", run_info=run_info,
+            error_type="content_parse_failed", run_info=run_info,
             cli_version=cli_version, exit_code=exit_code, usage=usage,
             usage_available=usage_available,
             conversation_id=conversation_id,
             conversation_id_available=conversation_id_available,
+            response_diagnostics=diagnostics,
+            verification=_verification_view(
+                expected_marker, response=response,
+                failure_kind="response_schema_invalid",
+            ),
+            runtime=runtime,
         )
     if not response.strip():
         classified = _classify_cli_failure(stderr, payload)
-        error_type = classified or "no_content"
+        if classified in (
+            "no_content", "invalid_json", "invalid_payload", "invalid_response",
+            "empty_model_response", "stream_closed_before_final",
+            "content_parse_failed", "content_filtered", "final_block_missing",
+        ):
+            classified = None
+        content = classify_content_result(payload, diagnostics, mode=mode)
+        error_type = classified or (
+            content.error_type if content is not None else "empty_model_response"
+        )
         return _empty_result(
             "ERROR", _CLI_FAILURE_MESSAGES.get(
                 error_type, "Antigravity CLI returned no content"
@@ -2077,6 +2549,13 @@ def _success_result(
             usage_available=usage_available,
             conversation_id=conversation_id,
             conversation_id_available=conversation_id_available,
+            retryable=(content.retryable if classified is None and content else False),
+            response_diagnostics=diagnostics,
+            verification=_verification_view(
+                expected_marker, response=response,
+                failure_kind="response_schema_invalid",
+            ),
+            runtime=runtime,
         )
     if expected_marker is not None and expected_marker not in response:
         return _empty_result(
@@ -2086,6 +2565,11 @@ def _success_result(
             usage_available=usage_available,
             conversation_id=conversation_id,
             conversation_id_available=conversation_id_available,
+            response_diagnostics=diagnostics,
+            verification=_verification_view(
+                expected_marker, response=response, failure_kind="marker_mismatch"
+            ),
+            runtime=runtime,
         )
     return _empty_result(
         "SUCCESS",
@@ -2105,6 +2589,9 @@ def _success_result(
         ),
         usage_available=usage_available,
         conversation_id_available=conversation_id_available,
+        response_diagnostics=diagnostics,
+        verification=_verification_view(expected_marker, response=response),
+        runtime=runtime,
     )
 
 
@@ -2159,10 +2646,17 @@ _CLI_FAILURE_MESSAGES: dict[ErrorType, str] = {
     "permission_denied": "Antigravity tool permission was denied",
     "policy_denied": "Antigravity payload was denied by policy",
     "no_content": "Antigravity CLI returned no content",
+    "empty_model_response": "Antigravity CLI returned an empty model response",
+    "stream_closed_before_final": "Antigravity CLI stream closed before the final event",
+    "content_parse_failed": "Antigravity CLI content could not be parsed",
+    "content_filtered": "Antigravity CLI content was filtered",
+    "final_block_missing": "Antigravity CLI final content block is missing",
+    "stale_runtime_snapshot": "Antigravity runtime identity changed during the MCP session",
 }
 _GENERIC_PAYLOAD_ERRORS = frozenset((
     "cli_error", "no_content", "invalid_json", "invalid_payload",
-    "invalid_response",
+    "invalid_response", "empty_model_response", "stream_closed_before_final",
+    "content_parse_failed", "final_block_missing",
 ))
 _DIAGNOSTIC_ROOT_CAUSES = frozenset((
     "profile_unreadable", "profile_not_writable", "network_denied",
@@ -2260,7 +2754,9 @@ def _classify_cli_failure(
 
 
 def _retryable(error_type: ErrorType | None, mode: str | None) -> bool:
-    return error_type == "workspace_lock_timeout" and mode == "plan"
+    return mode == "plan" and error_type in (
+        "workspace_lock_timeout", "stream_closed_before_final", "final_block_missing",
+    )
 
 
 async def execute_with_antigravity_cli(
@@ -2275,6 +2771,7 @@ async def execute_with_antigravity_cli(
     acknowledge_review: bool = False,
     conversation_id: str | None = None,
     expected_marker: str | None = None,
+    owner_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Execute one authenticated CLI process; also used by the live smoke."""
     run = run_info or RunInfo()
@@ -2298,6 +2795,30 @@ async def execute_with_antigravity_cli(
             error_type="cli_unavailable", run_info=run,
         )
     cli_version = await asyncio.to_thread(_probe_cli_version, cli)
+    runtime_before = await asyncio.to_thread(
+        _capture_runtime_identity, cli, cli_version
+    )
+    runtime_guard_before: RuntimeSnapshot | None = None
+    if runtime_before is not None:
+        runtime_guard_before = await asyncio.to_thread(
+            guard_process_runtime, lambda: runtime_before
+        )
+        if runtime_guard_before.stale:
+            runtime = _runtime_view(
+                runtime_guard_before.baseline,
+                runtime_guard_before.observed,
+                drift_reasons=runtime_guard_before.drift_reasons,
+            )
+            return _empty_result(
+                "ERROR",
+                _CLI_FAILURE_MESSAGES["stale_runtime_snapshot"],
+                thinking_level,
+                mode,
+                error_type="stale_runtime_snapshot",
+                run_info=run,
+                cli_version=cli_version,
+                runtime=runtime,
+            )
     timeout_seconds = _timeout_seconds()
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     deadline_at = datetime.fromtimestamp(
@@ -2312,31 +2833,23 @@ async def execute_with_antigravity_cli(
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise WorkspaceLockTimeout
-        await _emit_lifecycle(
-            run,
-            lifecycle,
-            LifecycleUpdate(
-                phase="waiting_for_workspace", progress_percent=20,
-                code="waiting_for_workspace",
-                blocker_code="waiting_for_workspace",
-                next_action="workspace_acquired", deadline_at=deadline_at,
-            ),
+        access: Literal["shared", "exclusive"] = (
+            "shared" if mode == "plan" else "exclusive"
         )
-        async with locked_workspace(workspace, remaining):
+        async with admitted_workspace(
+            workspace,
+            access=access,
+            deadline=deadline,
+            deadline_at=deadline_at,
+            run=run,
+            lifecycle=lifecycle,
+            owner_run_id=owner_run_id or run.run_id,
+        ):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise WorkspaceLockTimeout
             await _emit_progress(
                 progress, f"run_id={run.run_id} state=running"
-            )
-            await _emit_lifecycle(
-                run,
-                lifecycle,
-                LifecycleUpdate(
-                    phase="preflight", progress_percent=30,
-                    code="workspace_acquired", next_action="cli_started",
-                    deadline_at=deadline_at,
-                ),
             )
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -2423,12 +2936,14 @@ async def execute_with_antigravity_cli(
             stderr = cli_result.stderr
             command_line_too_long = cli_result.command_line_too_long
             output_limit = cli_result.output_limit
+            response_diagnostics = cli_result.response_diagnostics
         else:
             # Keep small test/integration fakes compatible with the old triple.
             returncode, stdout, timed_out = cli_result
             stderr = ""
             command_line_too_long = False
             output_limit = False
+            response_diagnostics = None
     except asyncio.TimeoutError:
         logger.warning("Antigravity CLI timed out")
         return _empty_result(
@@ -2468,7 +2983,48 @@ async def execute_with_antigravity_cli(
             heartbeat.cancel()
         if heartbeat_tasks:
             await asyncio.gather(*heartbeat_tasks, return_exceptions=True)
-        run.finish()
+
+    post_cli = _resolve_cli()
+    post_cli_version = (
+        await asyncio.to_thread(_probe_cli_version, post_cli)
+        if post_cli is not None
+        else None
+    )
+    runtime_after = await asyncio.to_thread(
+        _capture_runtime_identity, post_cli or cli, post_cli_version
+    )
+    runtime_reasons: tuple[str, ...] = ()
+    if runtime_before is not None and runtime_after is not None:
+        runtime_reasons = compare_runtime_identities(
+            runtime_before, runtime_after
+        ).drift_reasons
+        guarded_after = await asyncio.to_thread(
+            guard_process_runtime, lambda: runtime_after
+        )
+        runtime_reasons = tuple(dict.fromkeys(
+            (*runtime_reasons, *guarded_after.drift_reasons)
+        ))
+    concrete_cli_result = cli_result if isinstance(cli_result, CliRunResult) else None
+    runtime = _runtime_view(
+        runtime_before,
+        runtime_after,
+        cli_result=concrete_cli_result,
+        drift_reasons=runtime_reasons,
+    )
+    if runtime_reasons:
+        return _empty_result(
+            "ERROR",
+            _CLI_FAILURE_MESSAGES["stale_runtime_snapshot"],
+            thinking_level,
+            mode,
+            error_type="stale_runtime_snapshot",
+            run_info=run,
+            cli_version=cli_version,
+            exit_code=_safe_exit_code(returncode),
+            postflight=postflight,
+            response_diagnostics=response_diagnostics,
+            runtime=runtime,
+        )
 
     await _emit_lifecycle(
         run,
@@ -2489,7 +3045,11 @@ async def execute_with_antigravity_cli(
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
         classified = _classify_cli_failure(stderr, payload_for_classification)
-        if classified in ("no_content", "invalid_json", "invalid_payload"):
+        if classified in (
+            "no_content", "invalid_json", "invalid_payload", "invalid_response",
+            "empty_model_response", "stream_closed_before_final",
+            "content_parse_failed", "content_filtered", "final_block_missing",
+        ):
             classified = None
         error_type = classified or "timeout"
         message = (
@@ -2502,7 +3062,8 @@ async def execute_with_antigravity_cli(
             "ERROR", message, thinking_level, mode,
             error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
-            postflight=postflight,
+            postflight=postflight, response_diagnostics=response_diagnostics,
+            runtime=runtime,
         )
     if returncode is None:
         error_type: ErrorType = (
@@ -2518,6 +3079,7 @@ async def execute_with_antigravity_cli(
         return _empty_result(
             "ERROR", message, thinking_level, mode, error_type=error_type,
             run_info=run, cli_version=cli_version, postflight=postflight,
+            response_diagnostics=response_diagnostics, runtime=runtime,
         )
     if len(stdout) > MAX_STDOUT_CHARS or output_limit:
         logger.warning("Antigravity CLI response exceeded the wrapper limit")
@@ -2525,7 +3087,8 @@ async def execute_with_antigravity_cli(
             "ERROR", "Antigravity CLI response was too large", thinking_level, mode,
             error_type="output_limit", run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
-            postflight=postflight,
+            postflight=postflight, response_diagnostics=response_diagnostics,
+            runtime=runtime,
         )
     if returncode != 0:
         payload_for_classification: dict[str, Any] | None = None
@@ -2553,13 +3116,14 @@ async def execute_with_antigravity_cli(
             error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
             usage=usage, usage_available=usage_available,
-            postflight=postflight,
+            postflight=postflight, response_diagnostics=response_diagnostics,
+            runtime=runtime,
         )
     try:
         payload = json.loads(stdout.strip())
     except (json.JSONDecodeError, TypeError, ValueError):
         classified = _classify_cli_failure(stderr)
-        error_type = classified or "invalid_json"
+        error_type = classified or "content_parse_failed"
         logger.warning("Antigravity CLI failed (%s)", error_type)
         return _empty_result(
             "ERROR", _CLI_FAILURE_MESSAGES.get(
@@ -2567,18 +3131,23 @@ async def execute_with_antigravity_cli(
             ), thinking_level, mode,
             error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
-            postflight=postflight,
+            postflight=postflight, response_diagnostics=response_diagnostics,
+            runtime=runtime,
         )
     if not isinstance(payload, dict):
         classified = _classify_cli_failure(stderr)
-        error_type = classified or "invalid_payload"
+        error_type = classified or "content_parse_failed"
         return _empty_result(
             "ERROR", _CLI_FAILURE_MESSAGES.get(
                 error_type, "Antigravity CLI returned an invalid response"
             ), thinking_level, mode,
             error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
-            postflight=postflight,
+            postflight=postflight, response_diagnostics=response_diagnostics,
+            verification=_verification_view(
+                expected_marker, failure_kind="response_schema_invalid"
+            ),
+            runtime=runtime,
         )
     if payload.get("status") != "SUCCESS":
         usage, usage_available = _usage_info(payload)
@@ -2595,12 +3164,14 @@ async def execute_with_antigravity_cli(
             error_type=error_type, run_info=run, cli_version=cli_version,
             exit_code=_safe_exit_code(returncode),
             usage=usage, usage_available=usage_available,
-            postflight=postflight,
+            postflight=postflight, retryable=_retryable(error_type, mode),
+            response_diagnostics=response_diagnostics, runtime=runtime,
         )
     return _success_result(
         payload, thinking_level, mode, run_info=run,
         cli_version=cli_version, exit_code=_safe_exit_code(returncode),
         expected_marker=expected_marker, stderr=stderr,
+        response_diagnostics=response_diagnostics, runtime=runtime,
     ) | {
         "preexisting_dirty": postflight.preexisting_dirty,
         "worktree_changed": postflight.worktree_changed,
@@ -2625,6 +3196,7 @@ async def _run_managed_agent(agent_id: str, prepared: PreparedExecution) -> None
             next_action=update.next_action,
             deadline_at=update.deadline_at,
             step=update.step,
+            workspace_admission=update.workspace_admission,
             heartbeat=update.heartbeat,
         )
 
@@ -2636,7 +3208,12 @@ async def _run_managed_agent(agent_id: str, prepared: PreparedExecution) -> None
             store.finish(agent_id, "interrupted", manager_error="cancelled")
             return
         snapshot = store.mark_running(agent_id)
-        if snapshot is None or snapshot.status != "running":
+        if snapshot is None:
+            return
+        if snapshot.cancel_requested and snapshot.status == "queued":
+            store.finish(agent_id, "interrupted", manager_error="cancelled")
+            return
+        if snapshot.status != "running":
             return
         execution = asyncio.create_task(
             execute_with_antigravity_cli(
@@ -2648,6 +3225,7 @@ async def _run_managed_agent(agent_id: str, prepared: PreparedExecution) -> None
                 acknowledge_review=prepared.acknowledge_review,
                 conversation_id=prepared.conversation_id,
                 expected_marker=prepared.expected_marker,
+                owner_run_id=agent_id,
             )
         )
         while not execution.done():
@@ -2658,6 +3236,9 @@ async def _run_managed_agent(agent_id: str, prepared: PreparedExecution) -> None
                 store.finish(agent_id, "interrupted", manager_error="cancelled")
                 return
         result = await execution
+        if store.cancel_requested(agent_id):
+            store.finish(agent_id, "interrupted", manager_error="cancelled")
+            return
         status: AgentStatus = (
             "completed" if result.get("status") == "SUCCESS" else "failed"
         )
@@ -3127,6 +3708,7 @@ async def antigravity_doctor(
             network_probe="not_run",
             oauth_ready="unknown",
             error_type="invalid_request",
+            runtime=None,
         )
 
     preflight = _git_preflight(working_directory or None)
@@ -3141,11 +3723,28 @@ async def antigravity_doctor(
         await asyncio.to_thread(_probe_cli_version, cli) if cli is not None else None
     )
     cli_available = cli is not None and cli_version is not None
+    runtime_identity = await asyncio.to_thread(
+        _capture_runtime_identity, cli, cli_version
+    )
+    runtime_snapshot: RuntimeSnapshot | None = None
+    if runtime_identity is not None:
+        runtime_snapshot = await asyncio.to_thread(
+            guard_process_runtime, lambda: runtime_identity
+        )
+    runtime = _runtime_view(
+        runtime_snapshot.baseline if runtime_snapshot is not None else runtime_identity,
+        runtime_snapshot.observed if runtime_snapshot is not None else runtime_identity,
+        drift_reasons=(
+            runtime_snapshot.drift_reasons if runtime_snapshot is not None else ()
+        ),
+    )
     state_writable = await asyncio.to_thread(_probe_state_writable)
     boundary_declared = _execution_boundary_declared()
 
     error_type: DoctorErrorType | None = None
-    if not boundary_declared:
+    if runtime_snapshot is not None and runtime_snapshot.stale:
+        error_type = "stale_runtime_snapshot"
+    elif not boundary_declared:
         error_type = "boundary_unverified"
     elif not cli_available:
         error_type = "cli_unavailable"
@@ -3165,6 +3764,7 @@ async def antigravity_doctor(
         network_probe="not_run",
         oauth_ready="unknown",
         error_type=error_type,
+        runtime=runtime,
     )
 
 

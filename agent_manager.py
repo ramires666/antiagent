@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import getpass
 import json
+import math
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -17,6 +19,8 @@ from typing import Any, Literal
 
 
 AgentStatus = Literal["queued", "running", "completed", "failed", "interrupted"]
+WorkspaceAccess = Literal["shared", "exclusive"]
+WorkspaceAdmissionState = Literal["queued", "acquired"]
 TERMINAL_STATUSES = ("completed", "failed", "interrupted")
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_HISTORY = 1000
@@ -24,6 +28,7 @@ MAX_ACTIVE_AGENTS = 32
 MAX_PROGRESS_EVENTS = 16
 STATE_DIR_ENV = "ANTIAGENT_STATE_DIR"
 _STATE_DIRECTORY: Path | None = None
+_OPAQUE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 _PROGRESS_MESSAGES = {
     "scheduled": "Agent scheduled",
@@ -67,6 +72,21 @@ class AgentSnapshot:
     output: dict[str, Any] | None
     manager_error: str | None
     progress: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class WorkspaceAdmissionSnapshot:
+    request_id: str
+    owner_run_id: str
+    workspace: str
+    access: WorkspaceAccess
+    state: WorkspaceAdmissionState
+    queue_position: int | None
+    blocking_owner_run_ids: tuple[str, ...]
+    enqueued_at: float
+    acquired_at: float | None
+    heartbeat_at: float
+    lease_expires_at: float
 
 
 class AgentCapacityError(RuntimeError):
@@ -209,6 +229,25 @@ class AgentStore:
         }
         if "progress_json" not in columns:
             self._db.execute("ALTER TABLE agents ADD COLUMN progress_json TEXT")
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS workspace_admissions (
+                ticket INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                owner_id TEXT NOT NULL,
+                owner_run_id TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                access TEXT NOT NULL CHECK(access IN ('shared','exclusive')),
+                state TEXT NOT NULL CHECK(state IN ('queued','acquired')),
+                enqueued_at REAL NOT NULL,
+                acquired_at REAL,
+                heartbeat_at REAL NOT NULL,
+                lease_expires_at REAL NOT NULL
+            )"""
+        )
+        self._db.execute(
+            """CREATE INDEX IF NOT EXISTS workspace_admissions_queue
+               ON workspace_admissions(workspace,state,ticket)"""
+        )
         if os.name != "nt":
             os.chmod(self.path, 0o600)
 
@@ -268,6 +307,323 @@ class AgentStore:
 
     def _begin(self) -> None:
         self._db.execute("BEGIN IMMEDIATE")
+
+    @staticmethod
+    def _validate_opaque_id(value: str, field: str) -> str:
+        if not isinstance(value, str) or _OPAQUE_ID.fullmatch(value) is None:
+            raise ValueError(f"{field} must be an opaque 1..128 character ID")
+        return value
+
+    @staticmethod
+    def _validate_lease_seconds(value: float) -> float:
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError("lease_seconds must be a positive finite number")
+        return float(value)
+
+    @staticmethod
+    def _validate_reader_limit(value: int) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError("reader_limit must be a positive integer")
+        return value
+
+    def _admission_row(
+        self, request_id: str, *, now: float
+    ) -> sqlite3.Row | None:
+        return self._db.execute(
+            """SELECT * FROM workspace_admissions
+               WHERE request_id=? AND owner_id=? AND lease_expires_at>?""",
+            (request_id, self.owner_id, now),
+        ).fetchone()
+
+    def _admission_snapshot(
+        self,
+        row: sqlite3.Row | None,
+        *,
+        now: float,
+        reader_limit: int | None = None,
+    ) -> WorkspaceAdmissionSnapshot | None:
+        if row is None:
+            return None
+        queue_position: int | None = None
+        blockers: list[str] = []
+        if row["state"] == "queued":
+            queue_position = int(self._db.execute(
+                """SELECT COUNT(*) FROM workspace_admissions
+                   WHERE workspace=? AND state='queued' AND ticket<=?
+                     AND lease_expires_at>?""",
+                (row["workspace"], row["ticket"], now),
+            ).fetchone()[0])
+            if row["access"] == "exclusive":
+                blocking_rows = self._db.execute(
+                    """SELECT ticket,owner_run_id FROM workspace_admissions
+                       WHERE workspace=? AND request_id<>? AND lease_expires_at>?
+                         AND (state='acquired' OR (state='queued' AND ticket<?))
+                       ORDER BY ticket""",
+                    (row["workspace"], row["request_id"], now, row["ticket"]),
+                ).fetchall()
+                blockers.extend(item["owner_run_id"] for item in blocking_rows)
+            else:
+                blocking_rows = self._db.execute(
+                    """SELECT ticket,owner_run_id FROM workspace_admissions
+                       WHERE workspace=? AND request_id<>? AND lease_expires_at>?
+                         AND ((state='acquired' AND access='exclusive')
+                           OR (state='queued' AND access='exclusive' AND ticket<?))
+                       ORDER BY ticket""",
+                    (row["workspace"], row["request_id"], now, row["ticket"]),
+                ).fetchall()
+                blockers.extend(item["owner_run_id"] for item in blocking_rows)
+                if reader_limit is not None:
+                    shared_rows = self._db.execute(
+                        """SELECT ticket,owner_run_id FROM workspace_admissions
+                           WHERE workspace=? AND state='acquired' AND access='shared'
+                             AND request_id<>? AND lease_expires_at>?
+                           ORDER BY ticket""",
+                        (row["workspace"], row["request_id"], now),
+                    ).fetchall()
+                    if len(shared_rows) >= reader_limit:
+                        blockers.extend(item["owner_run_id"] for item in shared_rows)
+        return WorkspaceAdmissionSnapshot(
+            request_id=row["request_id"],
+            owner_run_id=row["owner_run_id"],
+            workspace=row["workspace"],
+            access=row["access"],
+            state=row["state"],
+            queue_position=queue_position,
+            blocking_owner_run_ids=tuple(dict.fromkeys(blockers)),
+            enqueued_at=float(row["enqueued_at"]),
+            acquired_at=(
+                float(row["acquired_at"])
+                if row["acquired_at"] is not None
+                else None
+            ),
+            heartbeat_at=float(row["heartbeat_at"]),
+            lease_expires_at=float(row["lease_expires_at"]),
+        )
+
+    def enqueue_workspace_admission(
+        self,
+        workspace: str | os.PathLike[str],
+        request_id: str,
+        owner_run_id: str,
+        access: WorkspaceAccess,
+        lease_seconds: float,
+    ) -> WorkspaceAdmissionSnapshot:
+        request_id = self._validate_opaque_id(request_id, "request_id")
+        owner_run_id = self._validate_opaque_id(owner_run_id, "owner_run_id")
+        if access not in ("shared", "exclusive"):
+            raise ValueError("access must be shared or exclusive")
+        lease_seconds = self._validate_lease_seconds(lease_seconds)
+        workspace = _canonical_workspace(workspace)
+        now = time.time()
+        with self._lock:
+            try:
+                self._begin()
+                self._db.execute(
+                    "DELETE FROM workspace_admissions WHERE lease_expires_at<=?",
+                    (now,),
+                )
+                existing = self._db.execute(
+                    "SELECT * FROM workspace_admissions WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["owner_id"] != self.owner_id
+                        or existing["owner_run_id"] != owner_run_id
+                        or existing["workspace"] != workspace
+                        or existing["access"] != access
+                    ):
+                        raise ValueError("request_id is already in use")
+                else:
+                    self._db.execute(
+                        """INSERT INTO workspace_admissions (
+                            request_id,owner_id,owner_run_id,workspace,access,state,
+                            enqueued_at,heartbeat_at,lease_expires_at
+                        ) VALUES (?,?,?,?,?,'queued',?,?,?)""",
+                        (
+                            request_id, self.owner_id, owner_run_id, workspace,
+                            access, now, now, now + lease_seconds,
+                        ),
+                    )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            row = self._admission_row(request_id, now=now)
+            snapshot = self._admission_snapshot(row, now=now)
+            assert snapshot is not None
+            return snapshot
+
+    def inspect_workspace_admission(
+        self, request_id: str, *, reader_limit: int | None = None
+    ) -> WorkspaceAdmissionSnapshot | None:
+        request_id = self._validate_opaque_id(request_id, "request_id")
+        if reader_limit is not None:
+            reader_limit = self._validate_reader_limit(reader_limit)
+        now = time.time()
+        with self._lock:
+            row = self._admission_row(request_id, now=now)
+            return self._admission_snapshot(
+                row, now=now, reader_limit=reader_limit
+            )
+
+    def try_acquire_workspace_admission(
+        self,
+        request_id: str,
+        *,
+        reader_limit: int,
+        lease_seconds: float,
+    ) -> WorkspaceAdmissionSnapshot | None:
+        request_id = self._validate_opaque_id(request_id, "request_id")
+        reader_limit = self._validate_reader_limit(reader_limit)
+        lease_seconds = self._validate_lease_seconds(lease_seconds)
+        now = time.time()
+        with self._lock:
+            try:
+                self._begin()
+                self._db.execute(
+                    "DELETE FROM workspace_admissions WHERE lease_expires_at<=?",
+                    (now,),
+                )
+                row = self._db.execute(
+                    """SELECT * FROM workspace_admissions
+                       WHERE request_id=? AND owner_id=?""",
+                    (request_id, self.owner_id),
+                ).fetchone()
+                if row is not None and row["state"] == "queued":
+                    if row["access"] == "shared":
+                        exclusive_blockers = int(self._db.execute(
+                            """SELECT COUNT(*) FROM workspace_admissions
+                               WHERE workspace=? AND lease_expires_at>?
+                                 AND ((state='acquired' AND access='exclusive')
+                                   OR (state='queued' AND access='exclusive'
+                                       AND ticket<?))""",
+                            (row["workspace"], now, row["ticket"]),
+                        ).fetchone()[0])
+                        active_readers = int(self._db.execute(
+                            """SELECT COUNT(*) FROM workspace_admissions
+                               WHERE workspace=? AND state='acquired'
+                                 AND access='shared' AND lease_expires_at>?""",
+                            (row["workspace"], now),
+                        ).fetchone()[0])
+                        eligible = (
+                            exclusive_blockers == 0
+                            and active_readers < reader_limit
+                        )
+                    else:
+                        blockers = int(self._db.execute(
+                            """SELECT COUNT(*) FROM workspace_admissions
+                               WHERE workspace=? AND request_id<>?
+                                 AND lease_expires_at>?
+                                 AND (state='acquired'
+                                   OR (state='queued' AND ticket<?))""",
+                            (
+                                row["workspace"], row["request_id"], now,
+                                row["ticket"],
+                            ),
+                        ).fetchone()[0])
+                        eligible = blockers == 0
+                    if eligible:
+                        self._db.execute(
+                            """UPDATE workspace_admissions
+                               SET state='acquired',acquired_at=?,heartbeat_at=?,
+                                   lease_expires_at=?
+                               WHERE request_id=? AND owner_id=? AND state='queued'""",
+                            (
+                                now, now, now + lease_seconds, request_id,
+                                self.owner_id,
+                            ),
+                        )
+                    else:
+                        self._db.execute(
+                            """UPDATE workspace_admissions
+                               SET heartbeat_at=?,lease_expires_at=?
+                               WHERE request_id=? AND owner_id=? AND state='queued'""",
+                            (now, now + lease_seconds, request_id, self.owner_id),
+                        )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            row = self._admission_row(request_id, now=now)
+            return self._admission_snapshot(
+                row, now=now, reader_limit=reader_limit
+            )
+
+    def renew_workspace_admission(
+        self, request_id: str, *, lease_seconds: float
+    ) -> WorkspaceAdmissionSnapshot | None:
+        request_id = self._validate_opaque_id(request_id, "request_id")
+        lease_seconds = self._validate_lease_seconds(lease_seconds)
+        now = time.time()
+        with self._lock:
+            try:
+                self._begin()
+                self._db.execute(
+                    "DELETE FROM workspace_admissions WHERE lease_expires_at<=?",
+                    (now,),
+                )
+                self._db.execute(
+                    """UPDATE workspace_admissions
+                       SET heartbeat_at=?,lease_expires_at=?
+                       WHERE request_id=? AND owner_id=?""",
+                    (now, now + lease_seconds, request_id, self.owner_id),
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            row = self._admission_row(request_id, now=now)
+            return self._admission_snapshot(row, now=now)
+
+    def _remove_workspace_admission(self, request_id: str) -> bool:
+        request_id = self._validate_opaque_id(request_id, "request_id")
+        with self._lock:
+            try:
+                self._begin()
+                cursor = self._db.execute(
+                    """DELETE FROM workspace_admissions
+                       WHERE request_id=? AND owner_id=?""",
+                    (request_id, self.owner_id),
+                )
+                self._db.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def release_workspace_admission(self, request_id: str) -> bool:
+        return self._remove_workspace_admission(request_id)
+
+    def cancel_workspace_admission(self, request_id: str) -> bool:
+        return self._remove_workspace_admission(request_id)
+
+    def reconcile_expired_admissions(self) -> int:
+        now = time.time()
+        with self._lock:
+            candidate = self._db.execute(
+                """SELECT 1 FROM workspace_admissions
+                   WHERE lease_expires_at<=? LIMIT 1""",
+                (now,),
+            ).fetchone()
+            if candidate is None:
+                return 0
+            try:
+                self._begin()
+                cursor = self._db.execute(
+                    "DELETE FROM workspace_admissions WHERE lease_expires_at<=?",
+                    (now,),
+                )
+                self._db.commit()
+                return cursor.rowcount
+            except Exception:
+                self._db.rollback()
+                raise
 
     def create(
         self,
@@ -371,7 +727,8 @@ class AgentStore:
                 )
                 self._db.execute(
                     """UPDATE agents SET status='running',started_at=?,updated_at=?,
-                       progress_json=? WHERE agent_id=? AND owner_id=? AND status='queued'""",
+                       progress_json=? WHERE agent_id=? AND owner_id=?
+                       AND status='queued' AND cancel_requested=0""",
                     (started_at, updated_at, progress_json, agent_id, self.owner_id),
                 )
                 self._db.commit()
@@ -399,6 +756,7 @@ class AgentStore:
             "blocker": None,
             "next_action": "preflight_started",
             "step": None,
+            "workspace_admission": None,
         }, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
@@ -424,6 +782,7 @@ class AgentStore:
         next_action: str | None = None,
         deadline_at: str | None = None,
         step: dict[str, Any] | None = None,
+        workspace_admission: dict[str, Any] | None = None,
         heartbeat: bool = False,
     ) -> str:
         if code not in _PROGRESS_MESSAGES:
@@ -442,6 +801,48 @@ class AgentStore:
                     "index": index,
                     "state": state if state in _STEP_STATES else "UNKNOWN",
                     "type": step_type if step_type in _STEP_TYPES else "unknown",
+                }
+        safe_admission = current_admission = cls._decode_progress(row).get(
+            "workspace_admission"
+        )
+        if not isinstance(current_admission, dict):
+            safe_admission = None
+        if isinstance(workspace_admission, dict):
+            access = workspace_admission.get("access")
+            state = workspace_admission.get("state")
+            position = workspace_admission.get("queue_position")
+            blockers = workspace_admission.get("blocking_owner_run_ids")
+            timestamps = {
+                key: workspace_admission.get(key)
+                for key in (
+                    "enqueued_at", "acquired_at", "heartbeat_at",
+                    "lease_expires_at",
+                )
+            }
+            if (
+                access in ("shared", "exclusive")
+                and state in ("queued", "acquired")
+                and (position is None or (
+                    isinstance(position, int) and not isinstance(position, bool)
+                    and position >= 1
+                ))
+                and isinstance(blockers, list)
+                and len(blockers) <= MAX_ACTIVE_AGENTS
+                and all(
+                    isinstance(item, str) and _OPAQUE_ID.fullmatch(item)
+                    for item in blockers
+                )
+                and all(
+                    value is None or isinstance(value, str)
+                    for value in timestamps.values()
+                )
+            ):
+                safe_admission = {
+                    "access": access,
+                    "state": state,
+                    "queue_position": position,
+                    "blocking_owner_run_ids": blockers,
+                    **timestamps,
                 }
         current = cls._decode_progress(row)
         old_percent = current.get("progress_percent", 0)
@@ -487,6 +888,7 @@ class AgentStore:
             "blocker": blocker,
             "next_action": next_action,
             "step": safe_step,
+            "workspace_admission": safe_admission,
         }
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -501,6 +903,7 @@ class AgentStore:
         next_action: str | None = None,
         deadline_at: str | None = None,
         step: dict[str, Any] | None = None,
+        workspace_admission: dict[str, Any] | None = None,
         heartbeat: bool = False,
     ) -> AgentSnapshot | None:
         at, updated_at = _now()
@@ -516,7 +919,8 @@ class AgentStore:
                         row, phase=phase, progress_percent=progress_percent,
                         code=code, at=at, blocker_code=blocker_code,
                         next_action=next_action, deadline_at=deadline_at,
-                        step=step, heartbeat=heartbeat,
+                        step=step, workspace_admission=workspace_admission,
+                        heartbeat=heartbeat,
                     )
                     self._db.execute(
                         "UPDATE agents SET progress_json=?,updated_at=? WHERE agent_id=? AND owner_id=?",
@@ -561,6 +965,15 @@ class AgentStore:
                     "SELECT * FROM agents WHERE agent_id=? AND owner_id=?",
                     (agent_id, self.owner_id),
                 ).fetchone()
+                if (
+                    row is not None
+                    and bool(row["cancel_requested"])
+                    and status != "interrupted"
+                ):
+                    status = "interrupted"
+                    output_json = None
+                    conversation_id = None
+                    manager_error = "cancelled"
                 progress_json = self._updated_progress_json(
                     row, phase=status, progress_percent=100, code=status,
                     at=finished_at, next_action=None,
@@ -654,6 +1067,7 @@ class AgentStore:
 
 
 __all__ = [
-    "AgentCapacityError", "AgentSnapshot", "AgentStore", "default_db_path",
-    "default_state_dir", "prepare_state_dir",
+    "AgentCapacityError", "AgentSnapshot", "AgentStore",
+    "WorkspaceAdmissionSnapshot", "default_db_path", "default_state_dir",
+    "prepare_state_dir",
 ]

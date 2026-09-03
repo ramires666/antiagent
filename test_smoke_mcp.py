@@ -21,6 +21,20 @@ def valid_doctor() -> dict[str, object]:
         "network_probe": "not_run",
         "oauth_ready": "unknown",
         "error_type": None,
+        "runtime": {
+            "schema_revision": "2",
+            "package_version": "0.4.0",
+            "mcp_process_pid": 42,
+            "mcp_process_started_at": "2026-09-03T00:00:00.000Z",
+            "cli_executable": str(Path.cwd() / "agy.exe"),
+            "cli_binary_identity_pre": "a" * 64,
+            "cli_binary_identity_post": "a" * 64,
+            "cli_version_pre": "1.1.24",
+            "cli_version_post": "1.1.24",
+            "cli_process_pid": None,
+            "cli_process_started_at": None,
+            "drift_reasons": [],
+        },
     }
 
 
