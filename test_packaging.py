@@ -25,7 +25,7 @@ class PackagingTest(unittest.TestCase):
             set(project["tool"]["setuptools"]["py-modules"]),
             {
                 "agy_server", "agent_manager", "response_diagnostics",
-                "runtime_identity", "antiagent_setup", "antiagent_upgrade",
+                "runtime_identity", "antiagent_setup", "antiagent_upgrade", "antiagent_browser",
             },
         )
         self.assertIn("mcp[cli]==2.0.0", project["project"]["dependencies"])

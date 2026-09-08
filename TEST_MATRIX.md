@@ -1,13 +1,29 @@
 # MCP test matrix
 
-Актуально для Antiagent `0.4.0` (3 сентября 2026 г.). Автоматические тесты offline, кроме отдельно отмеченного authenticated live smoke.
+## Браузер — дополнение 0.5.0 (8 сентября 2026)
+
+| Сценарий | Проверка |
+| --- | --- |
+| Browser mode MCP contract | Три режима, default disabled у execute/spawn/followup; invalid types до preflight |
+| Дочерний процесс | Режим явно передаётся в env; родительский opt-in не наследуется |
+| Admission | Browser-enabled plan получает exclusive workspace access |
+| User session | Межпроцессная блокировка; взаимное исключение и release на временном тестовом профиле путей |
+| Proxy | Whitelist, блокировки evaluation/network/initScript/file paths/non-HTTP URL; unit + real MCP rejection smoke |
+| Disabled | Реальный MCP tools/list возвращает пустой список без Node/Chrome |
+| Isolated live | Локальная страница, уникальный маркер через snapshot, закрытие вкладки; пройдено с backend 1.8.0 |
+| User session live | Не выполнено: требуется предоставление пользовательской сессии и Chrome consent |
+| Installed full chain | После restart/upgrade, регистрации bridge и точечных permissions по POST_UPDATE_ACTIVATION.md |
+
+Ниже сохранена матрица базовой реализации.
+
+Актуально для Antiagent `0.4.1` (3 сентября 2026 г.). Автоматические тесты offline, кроме отдельно отмеченного authenticated live smoke.
 
 ## MCP protocol — 6 тестов
 
 | Сценарий | Ожидаемый результат |
 |---|---|
 | STDIO initialize и `tools/list` | Согласованный MCP и восемь documented tools |
-| Schema и valid call | `task` обязателен, defaults `thinking_level=medium`, `mode=plan`, единственный `payload_mode=workspace`; structured output валиден |
+| Schema и valid call | `task` обязателен, единственный/default `thinking_level=high`, `mode=plan`, единственный `payload_mode=workspace`; structured output валиден |
 | Unknown/missing/wrong/invalid arguments | Без падения process, без запуска Git/CLI и без утечки входных данных |
 | Runtime error | MCP `isError=true`, structured metadata сохранена, stderr/secrets redacted |
 | Progress/cancellation/sequential call | Числовая шкала `0..100`, safe phase/activity, cleanup завершён, следующая операция работает |
@@ -37,7 +53,7 @@
 
 ## Process and security
 
-Проверяются executable resolution, exact argv с `--output-format stream-json`, отсутствие shell и dangerous permission bypass, safe child environment, spawn/OSError, timeout, cancellation, bounded stdout/stderr, reader failure, Windows Job Object/exact PID tree kill и POSIX fallback. NDJSON parser сохраняет только final result и allowlisted step metadata; output/progress не включают text delta, raw stderr, prompt, environment или secrets.
+Проверяются executable resolution, exact argv с `--model gemini-3.8-flash-high`, `--effort high` и `--output-format stream-json`, high-only input schema, отсутствие shell и dangerous permission bypass, safe child environment, spawn/OSError, timeout, cancellation, bounded stdout/stderr, reader failure, Windows Job Object/exact PID tree kill и POSIX fallback. NDJSON parser отдаёт terminal response либо bounded recovery только из `agent_response.text_delta`; thinking/tool deltas, raw event envelopes, raw stderr, prompt, environment и secrets не попадают в diagnostics/progress.
 
 Отдельно проверяются пять content-кодов, 100 последовательных marker-results,
 safe verification suffix/hash, pre/post runtime identity/version drift с

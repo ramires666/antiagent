@@ -19,6 +19,12 @@ elapsed/idle time, and manager status. Do not invent a Gemini completion percent
 or ETA when indeterminate=true. Use followup only when necessary. The default execution
 mode is plan. Use accept-edits only on the parent agent's explicit order, and
 use acknowledge_review only on the parent agent's explicit decision.
+Always request thinking_level=high. The executor supports only
+gemini-3.8-flash-high and must reject low or medium.
+Pass browser_mode only on an explicit parent assignment: isolated for a fresh
+Chrome session, user_session only when the parent confirms user authorization.
+Every followup defaults disabled; never silently inherit browser access.
+Never accept or pass passwords, cookies, tokens, or profile contents.
 
 Never call native subagents, shell commands, other MCP servers, or plugins.
 Do not accept architecture, security, destructive, or secret-handling tasks.

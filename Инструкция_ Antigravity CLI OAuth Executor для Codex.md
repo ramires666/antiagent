@@ -1,6 +1,6 @@
 # Antigravity CLI OAuth Executor для Codex
 
-`agy_server.py` — единственный production MCP executor. Он запускает официальный Antigravity CLI (`agy`) как subprocess с OAuth-сессией браузера; API-key/SDK-ветки в проекте нет.
+`agy_server.py` — единственный production MCP executor. Он запускает официальный Antigravity CLI (`agy`) как subprocess с OAuth-сессией браузера; API-key/SDK-ветки в проекте нет. Runtime зафиксирован на доступном slug `gemini-3.8-flash-high` и reasoning effort `high`.
 
 ## Официальные источники
 
@@ -18,7 +18,7 @@ API keys в executor не используются. OAuth выполняется
 
 ## Установка и OAuth
 
-В Windows PowerShell установите актуальную официальную версию CLI инструкцией из документации (в текущем checkout проверена версия `1.1.24`):
+В Windows PowerShell установите актуальную официальную версию CLI инструкцией из документации (в текущем checkout проверена версия `1.1.25`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://antigravity.google/cli/install.ps1 | iex"
@@ -39,7 +39,7 @@ py -m venv .venv
 
 ## Режимы
 
-Поддерживаются только `thinking_level`: `low`, `medium`, `high`; default — `medium`. Выбирается модель `gemini-3.7-flash-{level}`. Поддерживаются режимы `plan` (анализ без изменений) и `accept-edits` (явно разрешённые изменения); default режима — `plan`.
+Поддерживается только `thinking_level=high`, он же default. Выбирается ровно модель `gemini-3.8-flash-high`, а CLI дополнительно получает `--effort high`. Значения `low` и `medium` отклоняются до запуска CLI. Поддерживаются режимы `plan` (анализ без изменений) и `accept-edits` (явно разрешённые изменения); default режима — `plan`.
 
 В unattended MCP adapter всегда передаёт `--sandbox` и `--disable-slash-commands`. `--dangerously-skip-permissions` никогда не используется. `accept-edits` разрешает штатные изменения файлов внутри workspace; shell-команды и операции, требующие подтверждения, в headless режиме soft-denied, если пользователь отдельно не добавил узкое allow-правило в настройках CLI. Проверки результата независимо запускает основной агент.
 
@@ -53,7 +53,7 @@ Allow rules минимальны: чтение workspace, необходимые
 
 ## MCP-контракт
 
-Совместимый синхронный tool `antigravity_cli_execute` принимает `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (`low|medium|high`, default `medium`), `mode` (`plan|accept-edits`, default `plan`), `acknowledge_review` (boolean, default `false`), optional UUID `conversation_id`, optional `expected_marker` (непустая строка до 256 символов) и единственный поддерживаемый `payload_mode=workspace`. Для каждого editing-вызова оператор должен явно выбрать `mode=accept-edits`. `acknowledge_review=true` нужен только после ручной проверки partial/unknown результата, когда wrapper вернул `review_required`. Если непустой успешный ответ не содержит marker, wrapper возвращает `verification_failed`, не повторяя marker в ошибке или логах. Structured failed/no-content результаты сохраняют только allowlisted usage counters.
+Совместимый синхронный tool `antigravity_cli_execute` принимает `task`, необязательные `context`, `verification` и `working_directory` (default — пустая строка), `thinking_level` (только `high`, default `high`), `mode` (`plan|accept-edits`, default `plan`), `acknowledge_review` (boolean, default `false`), optional UUID `conversation_id`, optional `expected_marker` (непустая строка до 256 символов) и единственный поддерживаемый `payload_mode=workspace`. Для каждого editing-вызова оператор должен явно выбрать `mode=accept-edits`. `acknowledge_review=true` нужен только после ручной проверки partial/unknown результата, когда wrapper вернул `review_required`. Если непустой успешный ответ не содержит marker, wrapper возвращает `verification_failed`, не повторяя marker в ошибке или логах. Structured failed/no-content результаты сохраняют только allowlisted usage counters.
 
 Wrapper сначала учитывает точный машинный `error_type` CLI, затем применяет
 ограниченную классификацию bounded diagnostics. Поэтому сетевой запрет, проблема
@@ -73,7 +73,13 @@ Wrapper сначала учитывает точный машинный `error_t
 
 `response_diagnostics` содержит только bounded structural evidence:
 `output_format`, `final_event_seen`, `last_safe_event_type`, безопасный
-`response_id`, `content_block_count`, `malformed_event_count`. При
+`response_id`, `content_block_count`, сырой `terminal_content_block_count`,
+`stream_text_delta_count`, `response_source`, `malformed_event_count`. Если
+terminal `result` CLI 1.1.25 не содержит `response`, wrapper безопасно
+восстанавливает финальный текст только из bounded `agent_response.text_delta`;
+`thinking` и `tool` никогда не используются. Приоритет источников:
+непустой `result.response`, typed text blocks в `result.content`, затем stream
+deltas. При
 `expected_marker` `verification` содержит SHA-256 `rule_hash`, found/failure
 поля и ограниченный санитизированный `manual_review_content` с флагом
 `manual_review_truncated`; небезопасное содержимое отбрасывается fail-closed.
@@ -83,7 +89,7 @@ Wrapper сначала учитывает точный машинный `error_t
 фиксируются при terminal finish и больше не растут при последующих status/wait.
 
 Execution имеет `payload_mode=workspace` и возвращает
-`file_scope_enforced=false`, `shell_denied=false`. CLI `1.1.24` не имеет
+`file_scope_enforced=false`, `shell_denied=false`. CLI `1.1.25` не имеет
 официальных file allowlist/mandatory deny-shell primitives, поэтому
 неподдерживаемые `prompt_only` и `scoped_files` удалены из публичной MCP-схемы.
 Относительный `@file` и запрет shell в prompt уменьшают вероятность лишних
@@ -91,7 +97,7 @@ tool-запросов, но не являются технической гра�
 
 `antigravity_doctor` выполняет только локальный preflight: bounded
 `agy --version`, boundary declaration, пробную запись wrapper state и Git
-preflight. В проверенном Antigravity CLI `1.1.24` нет официальных `auth`/`doctor`
+preflight. В проверенном Antigravity CLI `1.1.25` нет официальных `auth`/`doctor`
 subcommands, поэтому tool честно возвращает `auth_probe=unsupported`,
 `network_probe=not_run`, `oauth_ready=unknown`. Он не читает профиль/keyring и
 не может запустить browser OAuth.
@@ -195,7 +201,7 @@ smoke.
 
 Acceptance criteria:
 
-1. `tools/list` возвращает восемь tools; schema валидирует `low|medium|high`, default `medium`, `plan`, `accept-edits`, boolean `acknowledge_review` (default `false`), optional UUID `conversation_id`, bounded `expected_marker` и строковый `working_directory`; doctor schema не содержит credentials или profile path.
+1. `tools/list` возвращает восемь tools; schema валидирует только `thinking_level=high` с default `high`, `plan`, `accept-edits`, boolean `acknowledge_review` (default `false`), optional UUID `conversation_id`, bounded `expected_marker` и строковый `working_directory`; doctor schema не содержит credentials или profile path.
 2. `working_directory` разрешается как абсолютный путь или относительно process cwd; пустой default использует process cwd. После canonical resolve путь обязан быть process cwd или его descendant и точным Git-root; выход через `..`, symlink или junction и остальные каталоги отклоняются. Subprocess получает этот абсолютный Git-root в `cwd`.
 3. Adapter передаёт `--sandbox` и `--disable-slash-commands`.
 4. stdout JSON, malformed JSON, non-zero exit и timeout дают безопасный структурированный ответ.
@@ -210,3 +216,11 @@ Acceptance criteria:
 Тесты используют subprocess injection/mock и не требуют сети или browser login. Реальный OAuth smoke выполняется отдельно после ручного входа.
 
 В проекте намеренно оставлен один поддерживаемый путь: `agy_server.py` + OAuth CLI. Старую несовместимую SDK/API-key реализацию следует хранить только в истории Git или отдельном архивном репозитории.
+# Дополнение 0.5.0: браузер
+
+`antigravity_agent_spawn`, `antigravity_agent_followup`, `antigravity_cli_execute`
+принимают `browser_mode`: `disabled` (по умолчанию для каждого вызова),
+`isolated`, `user_session`. Браузерный сервер регистрируется отдельно в agy.
+Установка и точные правила работы с опциональной пользовательской сессией:
+[BROWSER.md](BROWSER.md). Credentials не передаются в MCP-аргументах.
+После обновления обязательна активация по [POST_UPDATE_ACTIVATION.md](POST_UPDATE_ACTIVATION.md).

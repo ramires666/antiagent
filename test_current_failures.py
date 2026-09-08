@@ -51,7 +51,7 @@ class CurrentFailureRegressionTest(unittest.TestCase):
                 return await server.execute_with_antigravity_cli(
                     workspace=Path.cwd(),
                     prompt=f"task-{index}",
-                    thinking_level="low",
+                    thinking_level="high",
                     mode="plan",
                     lifecycle=lifecycle,
                     owner_run_id=f"agent-{index}",
@@ -228,7 +228,7 @@ class CurrentFailureRegressionTest(unittest.TestCase):
                     "response": f"result-{index} {marker}",
                     "usage": {"output_tokens": 2},
                 },
-                "low",
+                "high",
                 "plan",
                 run_info=server.RunInfo(),
                 cli_version="1.1.25",
@@ -244,7 +244,7 @@ class CurrentFailureRegressionTest(unittest.TestCase):
                 "response": "",
                 "usage": {"output_tokens": 99},
             },
-            "low",
+            "high",
             "plan",
             run_info=server.RunInfo(),
             cli_version="1.1.25",
@@ -252,7 +252,7 @@ class CurrentFailureRegressionTest(unittest.TestCase):
         )
         mismatch = server._success_result(
             {"status": "SUCCESS", "response": "safe review body"},
-            "low",
+            "high",
             "plan",
             run_info=server.RunInfo(),
             cli_version="1.1.25",

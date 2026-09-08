@@ -22,8 +22,8 @@ def valid_doctor() -> dict[str, object]:
         "oauth_ready": "unknown",
         "error_type": None,
         "runtime": {
-            "schema_revision": "2",
-            "package_version": "0.4.0",
+            "schema_revision": "4",
+            "package_version": "0.4.1",
             "mcp_process_pid": 42,
             "mcp_process_started_at": "2026-09-03T00:00:00.000Z",
             "cli_executable": str(Path.cwd() / "agy.exe"),
@@ -70,6 +70,9 @@ class SchemaValidationTest(unittest.TestCase):
     def test_accepts_current_execution_output_fields(self):
         tool = SimpleNamespace(
             name="antigravity_cli_execute",
+            input_schema={"properties": {
+                "thinking_level": {"const": "high", "default": "high"}
+            }},
             output_schema={
                 "properties": {
                     field: {} for field in smoke_mcp.EXPECTED_EXECUTION_OUTPUT_FIELDS
@@ -77,16 +80,50 @@ class SchemaValidationTest(unittest.TestCase):
             },
         )
 
-        smoke_mcp._validate_loaded_schema([tool])
+        tool.input_schema["properties"]["browser_mode"] = {
+            "enum": ["disabled", "isolated", "user_session"], "default": "disabled"
+        }
+        tools = [tool] + [SimpleNamespace(name=name, input_schema=tool.input_schema) for name in (
+            "antigravity_agent_spawn", "antigravity_agent_followup"
+        )]
+        smoke_mcp._validate_loaded_schema(tools)
+
+    def test_rejects_missing_browser_schema(self):
+        tool = SimpleNamespace(
+            name="antigravity_cli_execute",
+            input_schema={"properties": {"thinking_level": {"const": "high", "default": "high"}}},
+            output_schema={"properties": {field: {} for field in smoke_mcp.EXPECTED_EXECUTION_OUTPUT_FIELDS}},
+        )
+        with self.assertRaisesRegex(smoke_mcp.SmokeError, "browser schema is stale"):
+            smoke_mcp._validate_loaded_schema([tool])
 
     def test_rejects_stale_execution_output_fields_with_diagnostic(self):
         fields = smoke_mcp.EXPECTED_EXECUTION_OUTPUT_FIELDS - {"feedback"}
         tool = SimpleNamespace(
             name="antigravity_cli_execute",
+            input_schema={"properties": {
+                "thinking_level": {"const": "high", "default": "high"}
+            }},
             output_schema={"properties": {field: {} for field in fields}},
         )
 
         with self.assertRaisesRegex(smoke_mcp.SmokeError, "stale.*feedback"):
+            smoke_mcp._validate_loaded_schema([tool])
+
+    def test_rejects_stale_thinking_schema(self):
+        tool = SimpleNamespace(
+            name="antigravity_cli_execute",
+            input_schema={"properties": {
+                "thinking_level": {
+                    "enum": ["low", "medium", "high"], "default": "medium"
+                }
+            }},
+            output_schema={"properties": {
+                field: {} for field in smoke_mcp.EXPECTED_EXECUTION_OUTPUT_FIELDS
+            }},
+        )
+
+        with self.assertRaisesRegex(smoke_mcp.SmokeError, "high-only"):
             smoke_mcp._validate_loaded_schema([tool])
 
 

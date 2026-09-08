@@ -50,7 +50,7 @@ async def run_smoke() -> dict[str, object]:
             spawned = await agy_server.antigravity_agent_spawn(
                 task,
                 working_directory=str(root),
-                thinking_level="low",
+                thinking_level="high",
                 mode="plan",
             )
             agent_id = spawned["agent"]["agent_id"]
@@ -65,14 +65,32 @@ async def run_smoke() -> dict[str, object]:
             store.close()
     after = git_status(root)
     text = result.get("result", "") if isinstance(result, dict) else ""
-    completed = isinstance(result, dict) and result.get("status") == "SUCCESS"
+    model = result.get("model") if isinstance(result, dict) else None
+    diagnostics = (
+        result.get("response_diagnostics") if isinstance(result, dict) else None
+    )
+    response_source = (
+        diagnostics.get("response_source")
+        if isinstance(diagnostics, dict)
+        else None
+    )
+    completed = (
+        isinstance(result, dict)
+        and result.get("status") == "SUCCESS"
+        and model == "gemini-3.8-flash-high"
+        and response_source in (
+            "result_response", "result_content", "step_update_text_delta"
+        )
+    )
     return {
         "status": "ok" if completed and MARKER in text and before == after else "error",
         "marker_found": MARKER in text,
         "git_status_unchanged": before == after,
         "workspace_is_git_root": True,
         "managed_lifecycle": True,
-        "thinking_level": "low",
+        "model": model,
+        "thinking_level": "high",
+        "response_source": response_source,
         "mode": "plan",
     }
 

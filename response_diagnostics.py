@@ -25,6 +25,11 @@ ContentErrorCode: TypeAlias = Literal[
 ]
 OutputFormat: TypeAlias = Literal["json", "stream-json"]
 SafeEventType: TypeAlias = Literal["init", "step_update", "result", "unknown"]
+ResponseSource: TypeAlias = Literal[
+    "result_response",
+    "result_content",
+    "step_update_text_delta",
+]
 
 CONTENT_ERROR_CODES: tuple[ContentErrorCode, ...] = (
     "empty_model_response",
@@ -40,6 +45,11 @@ MAX_REVIEW_SCAN_CHARS = 65_536
 
 _SAFE_RESPONSE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _SAFE_EVENT_TYPES = frozenset(("init", "step_update", "result"))
+_SAFE_RESPONSE_SOURCES = frozenset((
+    "result_response",
+    "result_content",
+    "step_update_text_delta",
+))
 _FILTER_REASONS = frozenset((
     "blocked",
     "content_filter",
@@ -77,6 +87,9 @@ class ResponseDiagnostics:
     last_safe_event_type: SafeEventType | None = None
     response_id: str | None = None
     content_block_count: int | None = None
+    terminal_content_block_count: int | None = None
+    stream_text_delta_count: int = 0
+    response_source: ResponseSource | None = None
     malformed_event_count: int = 0
 
     def __post_init__(self) -> None:
@@ -103,6 +116,23 @@ class ResponseDiagnostics:
         object.__setattr__(self, "response_id", safe_response_id(self.response_id))
         object.__setattr__(
             self, "content_block_count", _safe_optional_count(self.content_block_count)
+        )
+        object.__setattr__(
+            self,
+            "terminal_content_block_count",
+            _safe_optional_count(self.terminal_content_block_count),
+        )
+        object.__setattr__(
+            self,
+            "stream_text_delta_count",
+            _safe_required_count(self.stream_text_delta_count),
+        )
+        object.__setattr__(
+            self,
+            "response_source",
+            self.response_source
+            if self.response_source in _SAFE_RESPONSE_SOURCES
+            else None,
         )
         object.__setattr__(
             self, "malformed_event_count", _safe_required_count(self.malformed_event_count)

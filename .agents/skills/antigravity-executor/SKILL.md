@@ -30,6 +30,16 @@ manager capacity allow.
 
 ## Prepare a run
 
+- Browser tasks explicitly authorized by the user may set `browser_mode` to
+  `isolated` (fresh Chrome) or `user_session` (existing Chrome login with user
+  connection approval). Default is `disabled`, including every followup; never
+  inherit browser consent. Use only the registered `antiagent_browser` tools.
+  Never send raw credentials or cookies. See [browser setup](../../../BROWSER.md).
+  Browser-enabled plan runs can change web state and take exclusive workspace
+  admission. The bridge serializes user-session access across workspaces.
+  Source changes require the full post-update handoff and an actual browser
+  smoke; doctor alone cannot prove browser readiness.
+
 - Give one concrete outcome, exact relative paths, preserved invariants, and
   observable verification. Never include credentials, tokens, private keys,
   passwords, cookies, keyring data, or unrelated file contents.
@@ -40,8 +50,8 @@ manager capacity allow.
   facts in `context` and say: "Use only CONTEXT; do not call read_file or shell;
   if insufficient, return NEEDS_CONTEXT with relative paths." Relative
   `@file` references are best effort, not an access boundary.
-- Use `low` for lookup, `medium` for ordinary implementation/test work, and
-  `high` for ambiguous cross-file debugging. Choose the needed level directly.
+- Use only `thinking_level=high`. The runtime pins every execution to
+  `gemini-3.8-flash-high` and rejects `low`/`medium` before starting the CLI.
 
 ## Run the lifecycle
 
@@ -74,8 +84,24 @@ inter-process lock, reports `queue_position` and `blocking_owner_run_ids`,
 and uses an owner/run-bound heartbeat lease. Shared readers may batch up to the
 reader limit, while an earlier writer blocks later readers. Leases renew during
 execution and are released on completion/cancel; expired leases are reconciled.
+Queue wait duration is governed by `ANTIAGENT_QUEUE_TIMEOUT_SECONDS` (default 60s,
+valid bounds 1..300s, invalid values default to 60s). Durable admission and the
+inter-process OS lock share this queue wait budget, capped by the remaining task
+deadline (`min(queue_budget, remaining_deadline)`), without restarting or resetting
+the overall timeout upon execution. Timeout during queue wait or OS lock acquisition
+returns unchanged `workspace_lock_timeout`. Public lease telemetry refresh is
+deferred; do not infer current lease expiry from an old progress snapshot.
+No claim is made that lease loss triggers automatic cancellation; OS locks continue
+protecting against conflicting edits, while lease-loss lifecycle handling is tracked
+in [WORK_PLAN.md](../../../WORK_PLAN.md).
 
 ## Retry and fallback
+
+A Codex host auto-review denial before MCP delivery may contain `isError` and
+text without a structured agent snapshot. It is not a CLI/provider failure;
+do not retry it in a loop or try to bypass it through another transport.
+Use the explicit project/source/destination consent recorded in AGENTS.md;
+that consent does not override host policy. Ask only for missing authorization.
 
 - `capacity_reached`: wait for an existing run to finish; do not create a retry
   storm.
@@ -120,6 +146,13 @@ Content classification has five mutually exclusive codes:
 in `plan`; filtering, parsing, and empty output are not retryable. A later valid
 final event takes precedence over malformed intermediate stream events.
 
+For CLI 1.1.25 streams whose terminal `result` omits `response`, the wrapper
+may reconstruct the final answer only from bounded `agent_response.text_delta`
+events. It never uses `thinking` or `tool` deltas. A valid terminal `response`
+has priority, followed by typed final `content`, then streamed answer deltas.
+Diagnostics preserve the selected `response_source`, the raw terminal block
+count, and the number of observed answer deltas.
+
 Verification returns the expected-marker SHA-256 `rule_hash`, found/failure
 fields, and a bounded sanitized `manual_review_content` suffix with
 `manual_review_truncated`; raw prompts, tool events, credentials, and stderr
@@ -140,5 +173,6 @@ For Windows install/upgrade, exact MCP contracts, and failure diagnosis, read
 [the executor guide](<../../../Инструкция_ Antigravity CLI OAuth Executor для Codex.md>).
 For the exact steps required after changing or upgrading Antiagent, read
 [the post-update activation runbook](../../../POST_UPDATE_ACTIVATION.md).
+For operational improvements and staged deliverables, consult [WORK_PLAN.md](../../../WORK_PLAN.md).
 Use `py -m antiagent_upgrade` only from the Antiagent checkout after fully
 closing Codex; its process guard fails before `pipx` if MCP is still active.

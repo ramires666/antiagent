@@ -1,20 +1,53 @@
 # Финальный отчёт тестирования
 
+## Проверка перед push, 8 сентября 2026
+
+- `.venv/Scripts/python.exe -m unittest discover -q`: 225 тестов за 41.666 s,
+  `OK (skipped=2)`. Включены 8 новых регрессий queue budget: config, blocked
+  admission, остаток бюджета для OS lock, общий deadline и cleanup.
+- Root просмотрел изменения кода и документации; `git diff --check`: OK.
+- Antigravity подготовил queue patch и тесты; после явного проектного согласия
+  передача исходников прошла host auto-review. Это не отключение защиты Codex.
+- Обновление публичной lease-телеметрии и обработка потери lease ещё не выполнены.
+- Установка 0.5.0/schema 4 требует полного handoff по POST_UPDATE_ACTIVATION.md.
+
+## Дополнение 8 сентября 2026: браузер, 0.5.0
+
+- Полный `python -m unittest discover -q`: 217 тестов, `OK (skipped=2)`,
+  36.073 s, после завершения сборки и стабилизации package metadata.
+- 36 целевых тестов wiring/bridge/MCP protocol/smoke/packaging: OK.
+- Реальный `smoke_browser.py --mode isolated ... --live` с Chrome DevTools MCP
+  1.8.0: 16 инструментов, `live=true`, `marker_found=true`; создана и закрыта
+  синтетическая локальная вкладка в временном профиле.
+- Проверены MCP initialize/tools-list, пустой список в `disabled`, реальные
+  отказы evaluation/JavaScript URL/initScript в proxy.
+- Wheel `antiagent_mcp-0.5.0-py3-none-any.whl` собран; модуль
+  `antiagent_browser.py` и console script включены. `git diff --check`: OK.
+- Не выполнены: подключение к реальной пользовательской сессии и полная цепочка
+  через установленный обновлённый MCP. Нужны регистрация browser bridge,
+  настройки разрешений, полный restart/upgrade по POST_UPDATE_ACTIVATION.md;
+  для user_session — явное предоставление сессии и подтверждение Chrome.
+- Промежуточный полный прогон во время сборки поймал два
+  `stale_runtime_snapshot`: metadata изменились в процессе тестов. Повторный
+  полный прогон без изменений окружения прошёл.
+
+Далее сохранён предыдущий отчёт как история базовой реализации.
+
 Дата отчёта: 3 сентября 2026 г.
-Code/config baseline: Antiagent `0.4.0`
+Code/config baseline: Antiagent `0.4.1`
 
 ## Среда
 
 - Windows 11, build `26200`.
 - Python `3.14.6` из `.venv`.
 - MCP `2.0.0`, Pydantic `2.13.5`.
-- Antigravity CLI (`agy`) `1.1.24`.
+- Antigravity CLI (`agy`) `1.1.25`.
 - Git `2.55.0.windows.3`.
 
 ## Итог
 
 После исправления ошибок из отчёта 2026-09-03 deterministic suite содержит
-**197 тестов**, включая **6 тестов MCP STDIO**. На Windows два POSIX-only
+**201 тест**, включая **6 тестов MCP STDIO**. На Windows два POSIX-only
 permission test ожидаемо отмечены `skipped`. Полный discovery завершился `OK`;
 также проходят compile, packaging/smoke validation и `git diff --check`.
 
@@ -32,8 +65,8 @@ permission test ожидаемо отмечены `skipped`. Полный discov
   безопасный manual-review suffix. Runtime identity сверяет binary/version до и
   после запуска и fail-fast возвращает `stale_runtime_snapshot`.
 - Terminal feedback elapsed/idle больше не растёт после завершения.
-- MCP default `mode=plan`; typed diagnostics; runtime failures возвращаются как MCP `isError=true` при сохранении structured metadata; validation/redaction не раскрывают prompt, stdout, stderr или secrets.
-- `agy --output-format stream-json` читается во время выполнения; model text delta не сохраняется, наружу идут только allowlisted step index/state/type и ограниченный final result.
+- MCP default `mode=plan`; единственный/default `thinking_level=high`; CLI всегда получает `gemini-3.8-flash-high` и `--effort high`; typed diagnostics; runtime failures возвращаются как MCP `isError=true` при сохранении structured metadata; validation/redaction не раскрывают prompt, stdout, stderr или secrets.
+- `agy --output-format stream-json` читается во время выполнения. Непустой terminal response имеет приоритет; при его отсутствии bounded recovery использует только `agent_response.text_delta`, никогда thinking/tool. Diagnostics сохраняют источник ответа и сырые структурные счётчики без model text.
 - `run_id`, timestamps, duration, CLI version, retryability и completeness metadata; progress использует шкалу wrapper-этапов `0..100`, heartbeat, blocker, next action, elapsed/idle и manager status без выдуманного Gemini ETA.
 - Git preflight/postflight для `accept-edits`: bounded status snapshot, `preexisting_dirty`, `worktree_changed`, `changed_paths`, `postflight_complete`, `requires_review`; persistent review marker и явный `acknowledge_review`; destructive rollback не выполняется.
 - Codex MCP timeout настроен на `900` секунд при wrapper timeout `840` секунд.
@@ -49,10 +82,13 @@ permission test ожидаемо отмечены `skipped`. Полный discov
 
 ## Live smoke
 
-- Authenticated `agy` OAuth smoke в `plan`: **успешно**, контрольный marker найден в ответе, Git не изменён.
-- Изолированный `accept-edits` smoke: **SUCCESS**; изменён только `README.txt`, postflight complete, полный diff просмотрен; временный test repository удалён.
-- Новый managed lifecycle smoke был повторно запущен после реализации manager: lifecycle дошёл до terminal `failed`, Git остался неизменным; внешний Antigravity provider в это время вернул usage limit. Это внешний лимит, поэтому новый OAuth success не заявляется и повторный запрос автоматически не выполнялся.
-- Отдельный реальный `agy 1.1.24 --output-format stream-json` smoke подтвердил события `init`, `step_update` и `result`; MCP wrapper после обновления пакета и перезапуска Codex ещё требует повторного live smoke.
+- `agy models` через пользовательскую OAuth-сессию подтвердил доступность
+  `gemini-3.8-flash-high` (`Gemini 3.8 Flash (High)`).
+- Source-runtime managed smoke на `gemini-3.8-flash-high`, `--effort high`,
+  `mode=plan`: **успешно**; marker найден, `response_source=result_response`,
+  Git не изменён.
+- Установленный MCP после обновления пакета и полного перезапуска Codex ещё
+  требует обязательного `doctor` + strict `smoke_mcp.py` + live marker smoke.
 
 Это единственная проверка, зависящая от внешней OAuth-сессии и реального CLI; она не входит в deterministic count.
 

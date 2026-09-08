@@ -83,6 +83,9 @@ OUTPUT_FIELDS = {
     "file_scope_enforced",
     "shell_denied",
     "feedback",
+    "response_diagnostics",
+    "verification",
+    "runtime",
 }
 
 
@@ -125,6 +128,11 @@ class MCPProtocolTest(unittest.TestCase):
                         self.assertIsNotNone(initialized.capabilities.tools)
 
                         listed = await session.list_tools()
+                        for browser_tool in listed.tools:
+                            if browser_tool.name in (TOOL_NAME, "antigravity_agent_spawn", "antigravity_agent_followup"):
+                                browser_schema = browser_tool.input_schema["properties"]["browser_mode"]
+                                self.assertEqual(browser_schema["enum"], ["disabled", "isolated", "user_session"])
+                                self.assertEqual(browser_schema["default"], "disabled")
                         self.assertEqual(
                             {tool.name for tool in listed.tools},
                             LIFECYCLE_TOOLS | {TOOL_NAME, DOCTOR_NAME},
@@ -153,12 +161,12 @@ class MCPProtocolTest(unittest.TestCase):
                             schema["properties"]["working_directory"]["default"], ""
                         )
                         self.assertEqual(
-                            schema["properties"]["thinking_level"]["enum"],
-                            ["low", "medium", "high"],
+                            schema["properties"]["thinking_level"]["const"],
+                            "high",
                         )
                         self.assertEqual(
                             schema["properties"]["thinking_level"]["default"],
-                            "medium",
+                            "high",
                         )
                         self.assertEqual(
                             schema["properties"]["mode"]["enum"],
@@ -204,8 +212,8 @@ class MCPProtocolTest(unittest.TestCase):
                             ["SUCCESS", "ERROR"],
                         )
                         self.assertEqual(
-                            output_properties["thinking_level"]["anyOf"][0]["enum"],
-                            ["low", "medium", "high"],
+                            output_properties["thinking_level"]["anyOf"][0]["const"],
+                            "high",
                         )
                         self.assertEqual(
                             output_properties["mode"]["anyOf"][0]["enum"],
@@ -319,8 +327,6 @@ class MCPProtocolTest(unittest.TestCase):
                             {"task": "x", "thinking_level": "minimal"},
                         )
                         self.assertTrue(invalid_enum.is_error)
-                        self.assertIn("low", invalid_enum.content[0].text)
-                        self.assertIn("medium", invalid_enum.content[0].text)
                         self.assertIn("high", invalid_enum.content[0].text)
                         self.assertEqual(
                             set(invalid_enum.structured_content), OUTPUT_FIELDS

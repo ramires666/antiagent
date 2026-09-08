@@ -94,7 +94,7 @@ marker `ANTIAGENT_POST_RESTART_OAUTH_OK_20260902`, CLI `1.1.24`, run
 7. Вызовите `antigravity_doctor`: local checks должны пройти, но
    `oauth_ready=unknown` останется ожидаемым до live smoke.
 8. Выполните один live MCP smoke через `antigravity_cli_execute` или lifecycle
-   tools: `mode=plan`, `thinking_level=low`, точный marker, без файловых правок.
+   tools: `mode=plan`, `thinking_level=high`, точный marker, без файловых правок.
 9. Убедитесь, что marker непустой, Git не изменился и browser/re-auth не
    запускался. Только после этого boundary считается операционно подтверждённой.
 

@@ -101,6 +101,33 @@ def _validate_loaded_schema(tools: Sequence[Any]) -> None:
             "installed MCP schema is stale; run py -m antiagent_upgrade, "
             f"restart Codex completely, and retry{suffix}"
         )
+    input_schema = execute.input_schema
+    input_properties = (
+        input_schema.get("properties")
+        if isinstance(input_schema, Mapping)
+        else None
+    )
+    thinking = (
+        input_properties.get("thinking_level")
+        if isinstance(input_properties, Mapping)
+        else None
+    )
+    if not isinstance(thinking, Mapping) or (
+        thinking.get("const") != "high" or thinking.get("default") != "high"
+    ):
+        raise SmokeError(
+            "installed MCP thinking schema is stale; expected high-only"
+        )
+    for name in ("antigravity_cli_execute", "antigravity_agent_spawn", "antigravity_agent_followup"):
+        tool = next((item for item in tools if item.name == name), None)
+        schema = None if tool is None else tool.input_schema
+        fields = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
+        browser = fields.get("browser_mode")
+        if not isinstance(browser, Mapping) or (
+            browser.get("enum") != ["disabled", "isolated", "user_session"]
+            or browser.get("default") != "disabled"
+        ):
+            raise SmokeError(f"installed MCP browser schema is stale: {name}")
 
 
 def _validate_doctor(payload: object) -> dict[str, object]:
@@ -144,7 +171,7 @@ def _validate_doctor(payload: object) -> dict[str, object]:
     }
     if not isinstance(runtime, dict) or set(runtime) != required_runtime:
         raise SmokeError("installed MCP doctor returned malformed runtime identity")
-    if runtime["schema_revision"] != "2" or runtime["drift_reasons"] != []:
+    if runtime["schema_revision"] != "4" or runtime["drift_reasons"] != []:
         raise SmokeError("installed MCP doctor returned stale runtime identity")
     if (
         not isinstance(runtime["cli_executable"], str)

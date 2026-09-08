@@ -15,6 +15,9 @@ class ResponseDiagnosticsTests(unittest.TestCase):
             last_safe_event_type="TOKEN=event-secret",
             response_id="unsafe response/id TOKEN=secret",
             content_block_count=diagnostics.MAX_DIAGNOSTIC_COUNT + 99,
+            terminal_content_block_count=diagnostics.MAX_DIAGNOSTIC_COUNT + 99,
+            stream_text_delta_count=diagnostics.MAX_DIAGNOSTIC_COUNT + 99,
+            response_source="TOKEN=source-secret",  # type: ignore[arg-type]
             malformed_event_count=diagnostics.MAX_DIAGNOSTIC_COUNT + 99,
         )
         self.assertEqual(evidence.last_safe_event_type, "unknown")
@@ -23,11 +26,20 @@ class ResponseDiagnosticsTests(unittest.TestCase):
             evidence.content_block_count, diagnostics.MAX_DIAGNOSTIC_COUNT
         )
         self.assertEqual(
+            evidence.terminal_content_block_count,
+            diagnostics.MAX_DIAGNOSTIC_COUNT,
+        )
+        self.assertEqual(
+            evidence.stream_text_delta_count, diagnostics.MAX_DIAGNOSTIC_COUNT
+        )
+        self.assertIsNone(evidence.response_source)
+        self.assertEqual(
             evidence.malformed_event_count, diagnostics.MAX_DIAGNOSTIC_COUNT
         )
         encoded = json.dumps(evidence.as_dict())
         self.assertNotIn("event-secret", encoded)
         self.assertNotIn("TOKEN=secret", encoded)
+        self.assertNotIn("source-secret", encoded)
         with self.assertRaises(FrozenInstanceError):
             evidence.response_id = "replacement"  # type: ignore[misc]
 

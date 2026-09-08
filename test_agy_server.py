@@ -278,9 +278,9 @@ class AgyServerTest(unittest.TestCase):
 
     def test_model_mapping_and_git_root(self):
         self.assertEqual([server._model_for(x) for x in ("low", "medium", "high")], [
-            "gemini-3.7-flash-low",
-            "gemini-3.7-flash-medium",
-            "gemini-3.7-flash-high",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-high",
         ])
         with patch("agy_server.Path.cwd", return_value=Path("C:/repo")), patch(
             "agy_server._resolve_executable", return_value=Path("C:/Git/cmd/git.exe")
@@ -547,7 +547,7 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), b"missing")
 
     def _execute(
-        self, *, level="low", mode="plan", stdout=None, returncode=0,
+        self, *, level="high", mode="plan", stdout=None, returncode=0,
         timed_out=False, stderr="",
     ):
         captured = {}
@@ -1095,7 +1095,7 @@ class AgyServerTest(unittest.TestCase):
             for key in ("workspace", "prompt", "thinking_level", "mode")
         }, {
             "workspace": Path("C:/repo"), "prompt": expected_prompt,
-            "thinking_level": "medium", "mode": "plan",
+            "thinking_level": "high", "mode": "plan",
         })
 
     def test_runtime_error_result_is_mcp_error_without_input_echo(self):
@@ -1118,7 +1118,7 @@ class AgyServerTest(unittest.TestCase):
         workspace = Path("C:/repo")
         expected_argv = [
             str(cli), "-p", "PROMPT", "--mode", "plan", "--model",
-            "gemini-3.7-flash-high", "--effort", "high", "--output-format",
+            "gemini-3.8-flash-high", "--effort", "high", "--output-format",
             "stream-json", "--print-timeout", "5s", "--sandbox",
             "--disable-slash-commands", "--add-dir", str(workspace),
         ]
@@ -1204,14 +1204,21 @@ class AgyServerTest(unittest.TestCase):
         self.assertEqual(result, (None, "", False))
         create.assert_not_awaited()
 
-    def test_argv_has_sandbox_and_low_medium_high(self):
-        for level in ("low", "medium", "high"):
-            result, argv = self._execute(level=level)
-            self.assertEqual(result["status"], "SUCCESS")
-            self.assertEqual(argv[argv.index("--effort") + 1], level)
-            self.assertIn("--sandbox", argv)
-            self.assertIn("--disable-slash-commands", argv)
-            self.assertNotIn("--dangerously-skip-permissions", argv)
+    def test_argv_has_sandbox_and_high_only(self):
+        result, argv = self._execute(level="high")
+        self.assertEqual(result["status"], "SUCCESS")
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-high")
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+        self.assertIn("--sandbox", argv)
+        self.assertIn("--disable-slash-commands", argv)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        for level in ("low", "medium"):
+            with self.subTest(level=level), patch("agy_server._resolve_cli") as resolve:
+                rejected = asyncio.run(server.antigravity_cli_execute(
+                    "inspect only", thinking_level=level
+                ))
+            self.assertEqual(result_data(rejected)["error_type"], "invalid_request")
+            resolve.assert_not_called()
 
     def test_dangerous_flag_is_absent_in_both_modes(self):
         _, plan_argv = self._execute(mode="plan")
@@ -1252,8 +1259,8 @@ class AgyServerTest(unittest.TestCase):
         self.assertIn(server.TRUNCATION_MARKER, result["result"])
         self.assertTrue(result["result"].startswith("H"))
         self.assertTrue(result["result"].endswith("T"))
-        self.assertEqual(result["thinking_level"], "low")
-        self.assertEqual(result["model"], "gemini-3.7-flash-low")
+        self.assertEqual(result["thinking_level"], "high")
+        self.assertEqual(result["model"], "gemini-3.8-flash-high")
         self.assertEqual(result["mode"], "plan")
         self.assertEqual(result["conversation_id"], "safe-id_1")
         self.assertEqual(result["usage"], {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5})
@@ -2649,8 +2656,8 @@ class AgyServerTest(unittest.TestCase):
         tools = asyncio.run(server.mcp.list_tools())
         schema = next(tool.input_schema for tool in tools if tool.name == "antigravity_cli_execute")
         self.assertNotIn("ctx", schema["properties"])
-        self.assertEqual(schema["properties"]["thinking_level"]["enum"], ["low", "medium", "high"])
-        self.assertEqual(schema["properties"]["thinking_level"]["default"], "medium")
+        self.assertEqual(schema["properties"]["thinking_level"]["const"], "high")
+        self.assertEqual(schema["properties"]["thinking_level"]["default"], "high")
         self.assertEqual(schema["properties"]["mode"]["enum"], ["plan", "accept-edits"])
         self.assertEqual(schema["properties"]["mode"]["default"], "plan")
         doctor = next(tool for tool in tools if tool.name == "antigravity_doctor")
@@ -2679,7 +2686,7 @@ class AgyServerTest(unittest.TestCase):
                 "agy_server.execute_with_antigravity_cli", new=execute
             ):
                 spawned = await server.antigravity_agent_spawn(
-                    "managed task", thinking_level="low", mode="accept-edits"
+                    "managed task", thinking_level="high", mode="accept-edits"
                 )
                 agent_id = spawned["agent"]["agent_id"]
                 self.assertEqual(spawned["agent"]["status"], "queued")
@@ -2960,17 +2967,136 @@ class AgyServerTest(unittest.TestCase):
                 server._LIFECYCLE_CALLBACK.reset(token)
             return result, updates
 
-        (stdout, exceeded, stderr), updates = asyncio.run(scenario())
+        collected, updates = asyncio.run(scenario())
+        stdout, exceeded, stderr = collected
         self.assertFalse(exceeded)
         self.assertEqual(stderr, b"")
         payload = json.loads(stdout)
         self.assertEqual(payload["response"], "public")
         self.assertEqual(payload["conversation_id"], "conv-safe")
+        diagnostics = collected.response_diagnostics
+        self.assertIsNotNone(diagnostics)
+        self.assertEqual(diagnostics.response_source, "result_response")
+        self.assertEqual(diagnostics.content_block_count, 1)
+        self.assertEqual(diagnostics.terminal_content_block_count, 1)
+        self.assertEqual(diagnostics.stream_text_delta_count, 1)
         self.assertEqual(updates[0].step, {
             "index": 3, "state": "DONE", "type": "agent_response",
         })
         self.assertNotIn("stream-secret", repr(updates))
         self.assertNotIn("stream-secret", stdout.decode())
+
+    def test_stream_json_recovers_missing_final_response_from_text_deltas(self):
+        async def collect(marker):
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            events = (
+                {"event": "step_update", "step_update": {
+                    "step_index": 1, "state": "DONE",
+                    "step_type": "thinking", "text_delta": "PRIVATE-THOUGHT",
+                }},
+                {"event": "step_update", "step_update": {
+                    "step_index": 2, "state": "DONE",
+                    "step_type": "agent_response", "text_delta": "done ",
+                }},
+                {"event": "step_update", "step_update": {
+                    "step_index": 2, "state": "DONE",
+                    "step_type": "agent_response", "text_delta": marker,
+                }},
+                {"event": "result", "result": {
+                    "status": "SUCCESS", "content": [],
+                    "usage": {"output_tokens": 7},
+                }},
+            )
+            stdout.feed_data(
+                ("\n".join(json.dumps(event) for event in events) + "\n").encode()
+            )
+            stdout.feed_eof()
+            stderr.feed_eof()
+
+            class FakeProcess:
+                returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = FakeProcess()
+            process.stdout = stdout
+            process.stderr = stderr
+            return await server._collect_stream_output(process)
+
+        for index in range(100):
+            marker = f"RECOVERED_MARKER_{index:03d}"
+            collected = asyncio.run(collect(marker))
+            self.assertFalse(collected.exceeded)
+            payload = json.loads(collected.stdout)
+            self.assertEqual(payload["response"], f"done {marker}")
+            self.assertNotIn("PRIVATE-THOUGHT", collected.stdout.decode())
+            diagnostics = collected.response_diagnostics
+            self.assertIsNotNone(diagnostics)
+            self.assertTrue(diagnostics.final_event_seen)
+            self.assertEqual(diagnostics.last_safe_event_type, "result")
+            self.assertEqual(diagnostics.content_block_count, 1)
+            self.assertEqual(diagnostics.terminal_content_block_count, 0)
+            self.assertEqual(diagnostics.stream_text_delta_count, 2)
+            self.assertEqual(
+                diagnostics.response_source, "step_update_text_delta"
+            )
+            accepted = server._success_result(
+                payload,
+                "high",
+                "plan",
+                run_info=server.RunInfo(),
+                cli_version="1.1.25",
+                exit_code=0,
+                expected_marker=marker,
+                response_diagnostics=diagnostics,
+            )
+            self.assertEqual(accepted["status"], "SUCCESS")
+            self.assertTrue(accepted["verification"]["expected_marker_found"])
+
+    def test_stream_json_recovers_typed_final_content_before_deltas(self):
+        async def scenario():
+            stdout = asyncio.StreamReader()
+            stderr = asyncio.StreamReader()
+            events = (
+                {"event": "step_update", "step_update": {
+                    "step_index": 1, "state": "DONE",
+                    "step_type": "agent_response", "text_delta": "fallback",
+                }},
+                {"event": "result", "result": {
+                    "status": "SUCCESS",
+                    "content": [
+                        {"type": "thinking", "text": "private"},
+                        {"type": "text", "text": "canonical"},
+                    ],
+                }},
+            )
+            stdout.feed_data(
+                ("\n".join(json.dumps(event) for event in events) + "\n").encode()
+            )
+            stdout.feed_eof()
+            stderr.feed_eof()
+
+            class FakeProcess:
+                returncode = 0
+
+                async def wait(self):
+                    return self.returncode
+
+            process = FakeProcess()
+            process.stdout = stdout
+            process.stderr = stderr
+            return await server._collect_stream_output(process)
+
+        collected = asyncio.run(scenario())
+        payload = json.loads(collected.stdout)
+        self.assertEqual(payload["response"], "canonical")
+        diagnostics = collected.response_diagnostics
+        self.assertIsNotNone(diagnostics)
+        self.assertEqual(diagnostics.response_source, "result_content")
+        self.assertEqual(diagnostics.content_block_count, 1)
+        self.assertEqual(diagnostics.terminal_content_block_count, 2)
 
     def test_stream_json_bounds_individual_records_not_cumulative_traffic(self):
         async def scenario():

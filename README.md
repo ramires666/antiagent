@@ -1,8 +1,14 @@
 # Antiagent: Antigravity для Codex
 
+Версия 0.5.0 добавляет управление Chrome через `browser_mode`: `disabled`,
+`isolated`, `user_session`. Подключение, опциональная авторизованная сессия и
+проверки описаны в [BROWSER.md](BROWSER.md).
+
 Этот проект подключает OAuth-аутентифицированный Antigravity CLI к Codex через
 локальный stdio MCP process. Codex управляет задачей, разрешениями, review и
 тестами, а Gemini/Antigravity выполняет небольшую leaf coding-задачу.
+Все вызовы зафиксированы на `gemini-3.8-flash-high` с `thinking_level=high`;
+`low` и `medium` публичная MCP-схема не принимает.
 
 Исторические воспроизводимые сигнатуры отказов CLI, sandbox, OAuth и headless
 permissions собраны в
@@ -132,7 +138,12 @@ wrapper возвращает typed `verification_failed`; значение marke
 логах не повторяется. Structured failed runs сохраняют только allowlisted
 счётчики usage.
 
-Текущий CLI `1.1.24` не предоставляет строгий file allowlist/deny-shell.
+Если CLI 1.1.25 завершает stream пустым terminal `response`, wrapper может
+восстановить ответ только из bounded `agent_response.text_delta`. Thinking и
+tool deltas не принимаются за финальный ответ; источник явно отражается в
+`response_diagnostics.response_source`.
+
+Текущий CLI `1.1.25` не предоставляет строгий file allowlist/deny-shell.
 Поэтому публичная MCP-схема допускает только `payload_mode=workspace`, а
 результат честно сообщает `file_scope_enforced=false` и `shell_denied=false`.
 Передавайте минимальный контекст и относительные `@file`-ссылки; это уменьшает
@@ -147,6 +158,18 @@ elapsed/idle и принадлежность manager process. Процент о�
 оболочки (`progress_basis=wrapper_phase`), а `indeterminate=true` честно означает,
 что внутренний процент и ETA Gemini неизвестны. Из телеметрии исключены prompt,
 context, пути, argv, raw stdout/stderr, tool arguments и текст ответа модели.
+
+Ожидание workspace admission и файловой межпроцессной блокировки управляется
+переменной `ANTIAGENT_QUEUE_TIMEOUT_SECONDS`: значение по умолчанию — 60 секунд,
+допустимый диапазон — 1..300 секунд, невалидные значения безопасно используют 60.
+Ожидание в очереди durable admission и захват OS lock делят общий бюджет очереди,
+ограниченный остатком общего дедлайна задачи (`min(queue_budget, remaining_deadline)`),
+без перезапуска общего таймаута при переходе к выполнению. При истечении времени
+ожидания возвращается прежняя типизированная ошибка `workspace_lock_timeout`.
+Обновление публичной телеметрии lease пока отложено: snapshot в progress может
+содержать старые `heartbeat_at` и `lease_expires_at`. Потеря lease не заявляет автоматическую
+отмену (cancellation): защиту от конфликтующих изменений обеспечивает OS lock;
+этапы дальнейшего развития зафиксированы в [WORK_PLAN.md](WORK_PLAN.md).
 
 ## 6. Проверка проекта
 
@@ -164,4 +187,5 @@ Unit-тесты не требуют браузерного входа.
 
 - [краткое руководство](КАК_ПОЛЬЗОВАТЬСЯ.md);
 - [техническая инструкция](<Инструкция_ Antigravity CLI OAuth Executor для Codex.md>);
-- [отчёт тестирования](TEST_REPORT.md).
+- [отчёт тестирования](TEST_REPORT.md);
+- [план текущих доработок](WORK_PLAN.md).
